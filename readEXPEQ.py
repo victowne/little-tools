@@ -53,3 +53,11 @@ for fk in range(i,i+NPPF1):
 	Jtbar[n] = float(test[fk])
 	n +=1
 	i += 1
+plt.plot(rgrid,dpdpsi)
+plt.figure()
+plt.plot(rgrid,Jtbar)
+plt.figure()
+plt.scatter(pbdr[:,0],pbdr[:,1],s=.5)
+plt.scatter(wbdr[:,0],wbdr[:,1],s=.5)
+plt.axis('equal')
+plt.show()
