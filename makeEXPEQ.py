@@ -23,14 +23,14 @@ epsilon = rmax/rzero
 #Profiles
 s = np.linspace(0,1,NPPF1) # s = sqrt((psi-psi_axis)/(psi_edge-psi_axis))
 dpdr = -12*s*(1-s**2)**5
-q = s**3 + s**2 + 0.95
+q = 1.33 * (1 + (s/0.595)**8)**.25
 ds2 = (s[1] - s[0])*2
 dqdr = np.ones(NPPF1)
 for i in range(1,NPPF1-1):
     dqdr[i] = (q[i+1] - q[i-1])/ds2
 dqdr[0] = 1.33333333*dqdr[1] - 0.33333333*dqdr[2] 
 dqdr[NPPF1-1] = 1.33333333*dqdr[NPPF1-2] - 0.33333333*dqdr[NPPF1-3]
-dqdr = 3*s**2 + 2*s
+dqdr = 1.33 * .25 * (1 + (s/0.595)**8)**-.75 * 8 * (s/0.595)**7/0.595
 cur = (2-s/q*dqdr)/q
 
 #Write file
