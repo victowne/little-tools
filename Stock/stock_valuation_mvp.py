@@ -27,7 +27,7 @@ def _find_statement_row(statement: pd.DataFrame, candidates: tuple[str, ...]):
 
 
 def fetch_fcf_data(ticker: str, debug: bool = False) -> pd.Series:
-    """获取最近5个年度报告期的自由现金流，返回单位为百万美元。"""
+    """获取最近5个年度报告期的自由现金流，返回单位为十亿美元。"""
     try:
         ticker = ticker.strip().upper()
         if not ticker:
@@ -60,7 +60,7 @@ def fetch_fcf_data(ticker: str, debug: bool = False) -> pd.Series:
             return pd.Series(dtype=float)
 
         fcf = pd.to_numeric(fcf, errors="coerce").dropna().sort_index()
-        fcf = fcf / 1_000_000  # 与界面中的“百万美元”保持一致
+        fcf = fcf / 1_000_000_000  # 统一为十亿美元
 
         # 返回最近5个报告期（通常为年度，若为季度可后续加过滤逻辑）
         return fcf.iloc[-5:] if len(fcf) >= 5 else fcf
@@ -70,10 +70,27 @@ def fetch_fcf_data(ticker: str, debug: bool = False) -> pd.Series:
         return pd.Series(dtype=float)
 
 
-def fetch_market_data(ticker: str) -> tuple[float, float]:
-    """获取当前价格和总股本（百万股），字段缺失时返回 0。"""
+def _latest_statement_value(statement: pd.DataFrame,
+                            candidates: tuple[str, ...]) -> float:
+    """读取财务报表科目的最近一期有效数值。"""
+    row = _find_statement_row(statement, candidates)
+    if row is None:
+        return 0.0
+    values = pd.to_numeric(row, errors="coerce").dropna().sort_index()
+    return float(values.iloc[-1]) if not values.empty else 0.0
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_market_data(ticker: str) -> tuple[float, float, float]:
+    """获取股价、净债务（十亿美元）和总股本（十亿股）。"""
     ticker = ticker.strip().upper()
+    if not ticker:
+        return 0.0, 0.0, 0.0
+
     ticker_obj = yf.Ticker(ticker)
+    info = {}
+    balance_sheet = pd.DataFrame()
+
     try:
         fast_info = ticker_obj.fast_info
         price = float(
@@ -83,12 +100,48 @@ def fetch_market_data(ticker: str) -> tuple[float, float]:
         price = 0.0
 
     try:
-        info = ticker_obj.info
+        info = ticker_obj.info or {}
         if price <= 0:
             price = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
-        shares = float(info.get("sharesOutstanding") or 0) / 1_000_000
     except Exception:
-        shares = 0.0
+        info = {}
+
+    try:
+        balance_sheet = ticker_obj.get_balance_sheet(freq="yearly")
+        if balance_sheet is None:
+            balance_sheet = pd.DataFrame()
+    except Exception:
+        balance_sheet = pd.DataFrame()
+
+    # 当前流通股本优先使用 info；报表股本和市值推算作为回退。
+    shares_raw = float(
+        info.get("sharesOutstanding")
+        or info.get("impliedSharesOutstanding")
+        or 0
+    )
+    if shares_raw <= 0 and not balance_sheet.empty:
+        shares_raw = _latest_statement_value(
+            balance_sheet, ("Ordinary Shares Number", "Share Issued")
+        )
+    if shares_raw <= 0 and price > 0:
+        shares_raw = float(info.get("marketCap") or 0) / price
+
+    # 优先采用 yfinance 资产负债表中的 NetDebt。若缺失，则逐级计算。
+    net_debt_raw = 0.0
+    if not balance_sheet.empty:
+        net_debt_raw = _latest_statement_value(balance_sheet, ("Net Debt",))
+        if net_debt_raw == 0:
+            total_debt = _latest_statement_value(balance_sheet, ("Total Debt",))
+            cash = _latest_statement_value(
+                balance_sheet, ("Cash And Cash Equivalents",)
+            )
+            if total_debt or cash:
+                net_debt_raw = total_debt - cash
+    if net_debt_raw == 0:
+        total_debt = float(info.get("totalDebt") or 0)
+        total_cash = float(info.get("totalCash") or 0)
+        if total_debt or total_cash:
+            net_debt_raw = total_debt - total_cash
 
     if price <= 0:
         try:
@@ -96,7 +149,7 @@ def fetch_market_data(ticker: str) -> tuple[float, float]:
             price = float(closes.iloc[-1]) if not closes.empty else 0.0
         except Exception:
             price = 0.0
-    return price, shares
+    return price, net_debt_raw / 1_000_000_000, shares_raw / 1_000_000_000
 
 # ================= 2. 估值计算引擎 =================
 def calculate_dcf(historical_fcf: pd.Series,
@@ -107,7 +160,7 @@ def calculate_dcf(historical_fcf: pd.Series,
                   net_debt: float,
                   shares_outstanding: float) -> dict:
     """
-    计算DCF内在价值。参数单位需一致（如均为百万美元）。
+    计算DCF内在价值。现金流、净债务使用十亿美元，股本使用十亿股。
     返回：字典包含当前价、内在价值、安全边际、投影数据等
     """
     if len(historical_fcf) == 0 or shares_outstanding <= 0:
@@ -169,6 +222,12 @@ def main():
         st.header("⚙️ 参数设置")
         ticker = st.text_input("股票代码 (如 AAPL, MSFT)", "AAPL").strip().upper()
 
+        try:
+            current_price, fetched_net_debt, fetched_shares = fetch_market_data(ticker)
+        except Exception as exc:
+            current_price, fetched_net_debt, fetched_shares = 0.0, 0.0, 0.0
+            st.warning(f"yfinance 公司数据读取失败: {exc}")
+
         st.subheader("📈 增长假设")
         growth_rate = st.slider("未来N年增长率 (%)", 0.0, 20.0, 8.0, 0.1) / 100
         terminal_growth = st.slider("终值增长率 (%)", 0.0, 5.0, 2.5, 0.1) / 100
@@ -178,8 +237,22 @@ def main():
         wacc = st.slider("WACC (%)", 5.0, 15.0, 9.0, 0.1) / 100
 
         st.subheader("🏦 资产负债表")
-        net_debt = st.number_input("净债务 (百万美元)", 0.0, 100000.0, 0.0, 1.0)
-        shares = st.number_input("总股本 (百万股)", 0.0, 10000.0, 0.0, 0.1)
+        net_debt = st.number_input(
+            "净债务 (十亿美元)",
+            value=float(fetched_net_debt),
+            step=0.1,
+            format="%.3f",
+            key=f"net_debt_{ticker}",
+        )
+        shares = st.number_input(
+            "总股本 (十亿股)",
+            value=float(fetched_shares),
+            step=0.01,
+            format="%.3f",
+            key=f"shares_{ticker}",
+        )
+        if fetched_net_debt or fetched_shares:
+            st.caption("以上默认值已从 yfinance 自动获取，可手动覆盖。")
 
     # 主界面
     col1, col2 = st.columns([1, 2])
@@ -195,22 +268,14 @@ def main():
                 st.warning("无法获取该股票现金流数据，请检查代码或更换股票。")
                 return
 
-            # 获取当前价格；用户未填写股本时自动读取。
-            try:
-                current_price, fetched_shares = fetch_market_data(ticker)
-                shares_for_calc = shares if shares > 0 else fetched_shares
-            except Exception as exc:
-                st.warning(f"行情参数读取失败: {exc}")
-                current_price, shares_for_calc = 0.0, shares
-
-            if shares_for_calc <= 0:
-                st.error("无法自动读取总股本，请在左侧手动填写“总股本 (百万股)”。")
+            if shares <= 0:
+                st.error("无法自动读取总股本，请在左侧手动填写“总股本 (十亿股)”。")
                 return
 
             # 计算
             res = calculate_dcf(
                 fcf_data, growth_rate, wacc, terminal_growth,
-                forecast_years, net_debt, shares_for_calc
+                forecast_years, net_debt, shares
             )
 
             if "error" in res:
@@ -224,7 +289,12 @@ def main():
             st.metric("🎯 内在价值", f"${intrinsic:.2f}")
             st.metric("🛡️ 安全边际", f"{margin_safety:+.1f}%")
 
-            st.markdown(f"**核心假设**：FCF = {res['last_fcf']:.1f}M | 增长率={growth_rate*100:.1f}% | WACC={wacc*100:.1f}% | 终值g={terminal_growth*100:.1f}%")
+            st.markdown(
+                f"**核心假设**：FCF = ${res['last_fcf']:.2f}B | "
+                f"净债务 = ${net_debt:.2f}B | 股本 = {shares:.3f}B | "
+                f"增长率={growth_rate*100:.1f}% | WACC={wacc*100:.1f}% | "
+                f"终值g={terminal_growth*100:.1f}%"
+            )
 
             # 敏感性分析
             st.subheader("📊 参数敏感性热力图")
@@ -233,7 +303,7 @@ def main():
 
             grid_vals = sensitivity_grid(
                 fcf_data, wacc_grid, growth_grid, terminal_growth,
-                forecast_years, net_debt, shares_for_calc
+                forecast_years, net_debt, shares
             )
 
             fig_heat = go.Figure(data=go.Heatmap(
@@ -244,7 +314,7 @@ def main():
                 colorbar=dict(title="内在价值 ($)")
             ))
             fig_heat.update_layout(xaxis_title="增长率", yaxis_title="WACC", height=400)
-            st.plotly_chart(fig_heat, use_container_width=True)
+            st.plotly_chart(fig_heat, width="stretch")
 
         st.info("💡 提示：DCF对假设极度敏感。建议用滑块观察价值区间变化，类似物理系统的相变分析。")
 
@@ -273,7 +343,9 @@ def main():
             fig.add_trace(go.Scatter(x=proj_idx, y=disc_factors, name="折现因子", line=dict(color="red")), row=2, col=1)
 
             fig.update_layout(height=500, showlegend=True)
-            st.plotly_chart(fig, use_container_width=True)
+            fig.update_yaxes(title_text="十亿美元", row=1, col=1)
+            fig.update_yaxes(title_text="十亿美元", row=2, col=1)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("点击左侧「运行估值」查看图表")
 
