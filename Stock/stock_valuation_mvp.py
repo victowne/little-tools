@@ -135,9 +135,195 @@ def fetch_fcf_data(ticker: str, debug: bool = False) -> pd.Series:
     return data
 
 
+def _free_cash_flow_series(cashflow: pd.DataFrame) -> pd.Series:
+    """读取 FCF；若数据源未直接提供，则用 CFO + CapEx 计算。"""
+    free_cash_flow = _statement_series(cashflow, ("Free Cash Flow",))
+    if not free_cash_flow.empty:
+        return free_cash_flow
+    operating_cf = _statement_series(
+        cashflow,
+        ("Operating Cash Flow", "Total Cash From Operating Activities"),
+    )
+    capex = _statement_series(
+        cashflow, ("Capital Expenditure", "Capital Expenditures")
+    )
+    if operating_cf.empty or capex.empty:
+        return pd.Series(dtype=float)
+    return operating_cf.add(capex, fill_value=0).dropna().sort_index()
+
+
+def _financial_trend_frame(income: pd.DataFrame,
+                           cashflow: pd.DataFrame,
+                           balance: pd.DataFrame) -> pd.DataFrame:
+    """整理一组可直接绘图的财报指标，金额和股数统一为 billion。"""
+    series = {
+        "Revenue": _statement_series(
+            income, ("Total Revenue", "Operating Revenue", "Revenue")
+        ),
+        "Gross Profit": _statement_series(income, ("Gross Profit",)),
+        "Operating Income": _statement_series(
+            income, ("Operating Income", "Operating Profit")
+        ),
+        "Net Income": _statement_series(
+            income, ("Net Income", "Net Income Common Stockholders")
+        ),
+        "Free Cash Flow": _free_cash_flow_series(cashflow),
+        "Retained Earnings": _statement_series(balance, ("Retained Earnings",)),
+        "Shares Outstanding": _statement_series(
+            balance,
+            ("Ordinary Shares Number", "Share Issued", "Shares Issued"),
+        ),
+    }
+    available = {name: values for name, values in series.items() if not values.empty}
+    if not available:
+        return pd.DataFrame()
+    return pd.concat(available, axis=1).sort_index() / 1_000_000_000
+
+
+def _latest_flow_value(quarterly: pd.Series,
+                       annual: pd.Series) -> tuple[float | None, str]:
+    """流量指标优先取最新四季 TTM，否则回退到最近财年。"""
+    if len(quarterly) >= 4:
+        latest_four = quarterly.iloc[-4:]
+        return float(latest_four.sum()), f"TTM 截至 {latest_four.index[-1].date()}"
+    if not annual.empty:
+        return float(annual.iloc[-1]), f"财年截至 {annual.index[-1].date()}"
+    return None, "无可用数据"
+
+
+def _build_health_checks(annual_income: pd.DataFrame,
+                         annual_cashflow: pd.DataFrame,
+                         annual_balance: pd.DataFrame,
+                         quarterly_income: pd.DataFrame,
+                         quarterly_cashflow: pd.DataFrame,
+                         quarterly_balance: pd.DataFrame) -> list[dict]:
+    """基于最新资产负债表和 TTM/年度流量数据生成基础运营检查。"""
+    balance = quarterly_balance if quarterly_balance is not None and not quarterly_balance.empty else annual_balance
+    balance_basis = "无可用数据"
+    if balance is not None and not balance.empty:
+        balance_dates = pd.to_datetime(balance.columns, errors="coerce").dropna()
+        if len(balance_dates):
+            balance_basis = f"截至 {max(balance_dates).date()}"
+
+    assets = _latest_statement_value(balance, ("Total Assets",))
+    liabilities = _latest_statement_value(
+        balance,
+        ("Total Liabilities Net Minority Interest", "Total Liabilities"),
+    )
+    asset_status = assets > liabilities if assets and liabilities else None
+
+    long_term_debt = _latest_statement_value(
+        balance,
+        ("Long Term Debt And Capital Lease Obligation", "Long Term Debt"),
+    )
+    annual_net_income = _statement_series(
+        annual_income, ("Net Income", "Net Income Common Stockholders")
+    )
+    quarterly_net_income = _statement_series(
+        quarterly_income, ("Net Income", "Net Income Common Stockholders")
+    )
+    net_income, income_basis = _latest_flow_value(
+        quarterly_net_income, annual_net_income
+    )
+    debt_ratio = long_term_debt / net_income if net_income is not None and net_income > 0 else None
+    debt_status = debt_ratio < 4 if debt_ratio is not None else False if net_income is not None else None
+
+    def flow_pair(candidates: tuple[str, ...]) -> tuple[float | None, str]:
+        return _latest_flow_value(
+            _statement_series(quarterly_cashflow, candidates),
+            _statement_series(annual_cashflow, candidates),
+        )
+
+    operating_cf, cash_basis = flow_pair(
+        ("Operating Cash Flow", "Total Cash From Operating Activities")
+    )
+    investing_cf, _ = flow_pair(
+        ("Investing Cash Flow", "Total Cashflows From Investing Activities")
+    )
+    financing_cf, _ = flow_pair(
+        ("Financing Cash Flow", "Total Cash From Financing Activities")
+    )
+    cash_available = all(value is not None for value in (operating_cf, investing_cf, financing_cf))
+    cash_status = (
+        operating_cf > abs(investing_cf) and operating_cf > abs(financing_cf)
+        if cash_available else None
+    )
+
+    billion = 1_000_000_000
+    return [
+        {
+            "title": "资产覆盖负债",
+            "rule": "Total Assets > Total Liabilities",
+            "status": asset_status,
+            "detail": (
+                f"资产 {assets / billion:.2f}B · 负债 {liabilities / billion:.2f}B"
+                if assets and liabilities else "资产或负债数据缺失"
+            ),
+            "basis": balance_basis,
+        },
+        {
+            "title": "长期债务负担",
+            "rule": "Long-term Debt / Net Income < 4",
+            "status": debt_status,
+            "detail": (
+                f"长期债务 {long_term_debt / billion:.2f}B · 净利润 {net_income / billion:.2f}B · 比率 {debt_ratio:.2f}x"
+                if debt_ratio is not None else
+                "净利润为负或为零，无法形成有效覆盖" if net_income is not None else
+                "长期债务或净利润数据缺失"
+            ),
+            "basis": f"债务{balance_basis} · 净利润{income_basis}",
+        },
+        {
+            "title": "经营现金流覆盖",
+            "rule": "OCF > |Investing CF| 且 OCF > |Financing CF|",
+            "status": cash_status,
+            "detail": (
+                f"OCF {operating_cf / billion:.2f}B · ICF {investing_cf / billion:.2f}B · Financing CF {financing_cf / billion:.2f}B"
+                if cash_available else "经营、投资或融资现金流数据缺失"
+            ),
+            "basis": cash_basis,
+        },
+    ]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_financial_overview(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
+    """获取年度/季度财报趋势和基础运营检查。"""
+    ticker = ticker.strip().upper()
+    if not ticker:
+        return pd.DataFrame(), pd.DataFrame(), []
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        annual_income = ticker_obj.get_income_stmt(freq="yearly")
+        annual_cashflow = ticker_obj.get_cash_flow(freq="yearly")
+        annual_balance = ticker_obj.get_balance_sheet(freq="yearly")
+        quarterly_income = ticker_obj.get_income_stmt(freq="quarterly")
+        quarterly_cashflow = ticker_obj.get_cash_flow(freq="quarterly")
+        quarterly_balance = ticker_obj.get_balance_sheet(freq="quarterly")
+        annual = _financial_trend_frame(
+            annual_income, annual_cashflow, annual_balance
+        )
+        quarterly = _financial_trend_frame(
+            quarterly_income, quarterly_cashflow, quarterly_balance
+        )
+        checks = _build_health_checks(
+            annual_income,
+            annual_cashflow,
+            annual_balance,
+            quarterly_income,
+            quarterly_cashflow,
+            quarterly_balance,
+        )
+        return annual, quarterly, checks
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame(), []
+
+
 def _latest_statement_value(statement: pd.DataFrame,
                             candidates: tuple[str, ...]) -> float:
     """读取财务报表科目的最近一期有效数值。"""
+    if statement is None or statement.empty:
+        return 0.0
     row = _find_statement_row(statement, candidates)
     if row is None:
         return 0.0
@@ -500,11 +686,147 @@ def sensitivity_grid(historical_fcf, wacc_range, growth_range, terminal_growth, 
             grid[i, j] = res.get("intrinsic_value", np.nan)
     return grid
 
+
+def render_financial_trends(ticker: str,
+                            annual: pd.DataFrame,
+                            quarterly: pd.DataFrame) -> None:
+    """绘制年度/季度财报趋势面板。"""
+    st.header("📚 财报趋势")
+    st.caption("损益与现金流金额、留存收益均为十亿美元；股本为十亿股。")
+    period = st.radio(
+        "报告周期",
+        ("季度", "年度"),
+        horizontal=True,
+        key=f"financial_period_{ticker}",
+    )
+    frame = quarterly if period == "季度" else annual
+    limit = 8 if period == "季度" else 5
+    frame = frame.tail(limit)
+    if frame.empty:
+        st.warning(f"yfinance 暂无 {ticker} 的{period}财报趋势数据。")
+        return
+
+    operating_metrics = [
+        "Revenue",
+        "Gross Profit",
+        "Operating Income",
+        "Net Income",
+        "Free Cash Flow",
+    ]
+    metric_labels = {
+        "Revenue": "营业收入 Revenue",
+        "Gross Profit": "毛利润 Gross Profit",
+        "Operating Income": "营业利润 Operating Income",
+        "Net Income": "净利润 Net Income",
+        "Free Cash Flow": "自由现金流 Free Cash Flow",
+    }
+    colors = {
+        "Revenue": "#4C78A8",
+        "Gross Profit": "#72B7B2",
+        "Operating Income": "#F2CF5B",
+        "Net Income": "#59A14F",
+        "Free Cash Flow": "#E45756",
+    }
+    available_metrics = [metric for metric in operating_metrics if metric in frame]
+    if available_metrics:
+        fig = make_subplots(
+            rows=3,
+            cols=2,
+            vertical_spacing=0.12,
+            horizontal_spacing=0.10,
+            subplot_titles=[metric_labels[metric] for metric in available_metrics],
+        )
+        for index, metric in enumerate(available_metrics):
+            row, col = divmod(index, 2)
+            values = frame[metric].dropna()
+            fig.add_trace(
+                go.Bar(
+                    x=values.index,
+                    y=values.values,
+                    name=metric_labels[metric],
+                    marker_color=colors[metric],
+                    text=[f"{value:.1f}" for value in values.values],
+                    textposition="outside",
+                ),
+                row=row + 1,
+                col=col + 1,
+            )
+            fig.update_yaxes(title_text="B", row=row + 1, col=col + 1)
+        fig.update_layout(
+            height=800,
+            showlegend=False,
+            margin=dict(t=70, b=30),
+        )
+        st.plotly_chart(fig, width="stretch")
+    else:
+        st.warning("收入、利润和自由现金流指标暂不可用。")
+
+    balance_metrics = [
+        metric for metric in ("Retained Earnings", "Shares Outstanding")
+        if metric in frame
+    ]
+    if balance_metrics:
+        st.subheader("🏦 留存收益与股本变化")
+        balance_labels = {
+            "Retained Earnings": "留存收益 Retained Earnings",
+            "Shares Outstanding": "流通股本 Shares Outstanding",
+        }
+        fig_balance = make_subplots(
+            rows=1,
+            cols=len(balance_metrics),
+            subplot_titles=[balance_labels[metric] for metric in balance_metrics],
+        )
+        for index, metric in enumerate(balance_metrics):
+            values = frame[metric].dropna()
+            fig_balance.add_trace(
+                go.Scatter(
+                    x=values.index,
+                    y=values.values,
+                    mode="lines+markers",
+                    name=balance_labels[metric],
+                    line=dict(width=3),
+                ),
+                row=1,
+                col=index + 1,
+            )
+            fig_balance.update_yaxes(title_text="B", row=1, col=index + 1)
+        fig_balance.update_layout(height=360, showlegend=False)
+        st.plotly_chart(fig_balance, width="stretch")
+
+    with st.expander("查看财报数据表", expanded=False):
+        display = frame.copy()
+        display.index = pd.to_datetime(display.index).strftime("%Y-%m-%d")
+        st.dataframe(display.style.format("{:.2f}", na_rep="—"), width="stretch")
+
+
+def render_health_checks(ticker: str, checks: list[dict]) -> None:
+    """展示基础财务规则的通过、未通过或数据不足状态。"""
+    st.header("🩺 运营体检")
+    st.caption("这是快速筛查，不构成投资结论；行业特性、周期性和一次性项目仍需人工判断。")
+    if not checks:
+        st.warning(f"yfinance 暂无足够的 {ticker} 财务数据用于体检。")
+        return
+
+    columns = st.columns(len(checks))
+    for column, check in zip(columns, checks):
+        with column.container(border=True):
+            st.subheader(check["title"])
+            status = check["status"]
+            if status is True:
+                st.success("✅ 通过")
+            elif status is False:
+                st.warning("⚠️ 未通过")
+            else:
+                st.info("➖ 数据不足")
+            st.code(check["rule"], language=None)
+            st.write(check["detail"])
+            st.caption(check["basis"])
+
 # ================= 4. Streamlit UI =================
 def main():
-    st.set_page_config(page_title="美股估值分析器", layout="wide")
-    st.title("📊 美股 DCF 估值分析器 (MVP)")
-    st.markdown("> 结合数值模拟思维：参数投影 + 折现积分 + 敏感性网格")
+    st.set_page_config(page_title="美股基本面分析器", layout="wide")
+    st.title("📊 美股基本面与 DCF 分析器")
+    st.markdown("> 财报趋势 + 运营体检 + DCF 参数投影与敏感性分析")
 
     # 侧边栏：参数输入
     with st.sidebar:
@@ -515,10 +837,12 @@ def main():
             current_price, fetched_net_debt, fetched_shares = fetch_market_data(ticker)
             fcff_data, fcff_source = fetch_fcff_data(ticker)
             wacc_reference = fetch_wacc_reference(ticker)
+            annual_financials, quarterly_financials, health_checks = fetch_financial_overview(ticker)
         except Exception as exc:
             current_price, fetched_net_debt, fetched_shares = 0.0, 0.0, 0.0
             fcff_data, fcff_source = pd.Series(dtype=float), "无数据"
             wacc_reference = {"wacc": None, "error": str(exc)}
+            annual_financials, quarterly_financials, health_checks = pd.DataFrame(), pd.DataFrame(), []
             st.warning(f"yfinance 公司数据读取失败: {exc}")
 
         st.subheader("📈 增长假设")
@@ -666,6 +990,11 @@ def main():
             st.plotly_chart(fig, width="stretch")
         else:
             st.info("点击左侧「运行估值」查看图表")
+
+    st.divider()
+    render_financial_trends(ticker, annual_financials, quarterly_financials)
+    st.divider()
+    render_health_checks(ticker, health_checks)
 
 if __name__ == "__main__":
     main()
