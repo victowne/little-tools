@@ -831,7 +831,7 @@ def main():
     # 侧边栏：参数输入
     with st.sidebar:
         st.header("⚙️ 参数设置")
-        ticker = st.text_input("股票代码 (如 AAPL, MSFT)", "AAPL").strip().upper()
+        ticker = st.text_input("股票代码 Ticker (如 AAPL, MSFT)", "AAPL").strip().upper()
 
         try:
             current_price, fetched_net_debt, fetched_shares = fetch_market_data(ticker)
@@ -846,9 +846,9 @@ def main():
             st.warning(f"yfinance 公司数据读取失败: {exc}")
 
         st.subheader("📈 增长假设")
-        growth_rate = st.slider("未来N年增长率 (%)", 0.0, 100.0, 8.0, 0.1) / 100
-        terminal_growth = st.slider("终值增长率 (%)", 0.0, 5.0, 2.5, 0.1) / 100
-        forecast_years = st.slider("预测年限", 5, 15, 5)
+        growth_rate = st.slider("未来N年增长率 Future Growth (%)", 0.0, 100.0, 8.0, 0.1) / 100
+        terminal_growth = st.slider("终值增长率 Terminal Growth (%)", 0.0, 5.0, 2.5, 0.1) / 100
+        forecast_years = st.slider("预测年限 Forecast Years", 5, 15, 5)
 
         st.subheader("💰 资本成本")
         wacc = st.slider("WACC (%)", 5.0, 15.0, 9.0, 0.1) / 100
@@ -880,14 +880,14 @@ def main():
 
         st.subheader("🏦 资产负债表")
         net_debt = st.number_input(
-            "净债务 (十亿美元)",
+            "净债务 Net debt (B)",
             value=float(fetched_net_debt),
             step=0.1,
             format="%.3f",
             key=f"net_debt_{ticker}",
         )
         shares = st.number_input(
-            "总股本 (十亿股)",
+            "总股本 Shares Outstanding (B)",
             value=float(fetched_shares),
             step=0.01,
             format="%.3f",
@@ -900,7 +900,7 @@ def main():
     col1, col2 = st.columns([1, 2])
 
     with col1:
-        if st.button("🚀 运行估值", type="primary"):
+        if st.button("🚀 运行估值 Run Valuation", type="primary"):
             if not ticker:
                 st.error("请输入股票代码。")
                 return
@@ -926,9 +926,9 @@ def main():
             intrinsic = res["intrinsic_value"]
             margin_safety = (intrinsic - current_price) / current_price * 100 if current_price > 0 else 0
 
-            st.metric("📉 当前股价", f"${current_price:.2f}")
-            st.metric("🎯 内在价值", f"${intrinsic:.2f}")
-            st.metric("🛡️ 安全边际", f"{margin_safety:+.1f}%")
+            st.metric("📉 当前股价 Current Price", f"${current_price:.2f}")
+            st.metric("🎯 内在价值 Intrinsic Value", f"${intrinsic:.2f}")
+            st.metric("🛡️ 安全边际 Safety Margin", f"{margin_safety:+.1f}%")
 
             st.markdown(
                 f"**核心假设**：FCFF = ${res['last_fcf']:.2f}B | "
@@ -953,15 +953,15 @@ def main():
                 x=[f"{g*100:.1f}%" for g in growth_grid],
                 y=[f"{w*100:.1f}%" for w in wacc_grid],
                 colorscale="RdYlGn",
-                colorbar=dict(title="内在价值 ($)")
+                colorbar=dict(title="Intrinsic Value ($)")
             ))
-            fig_heat.update_layout(xaxis_title="增长率", yaxis_title="WACC", height=400)
+            fig_heat.update_layout(xaxis_title="Growth Rate", yaxis_title="WACC", height=400)
             st.plotly_chart(fig_heat, width="stretch")
 
         st.info("💡 提示：DCF对假设极度敏感。建议用滑块观察价值区间变化，类似物理系统的相变分析。")
 
     with col2:
-        st.subheader("📈 FCFF 投影与折现")
+        st.subheader("📈 FCFF 投影与折现 Projection & Discount")
         if "res" in locals() and "error" not in res:
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
                                 row_heights=[0.6, 0.4],
