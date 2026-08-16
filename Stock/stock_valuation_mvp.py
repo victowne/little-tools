@@ -6,57 +6,595 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
 import re
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from io import StringIO
 
 import requests
 
+from Stock.fundamentals import (
+    CAPEX,
+    CFO,
+    FCF,
+    FCF_MARGIN,
+    FUNDAMENTAL_GROWTH_CAPACITY,
+    GROSS_MARGIN,
+    GROSS_PROFIT,
+    NET_INVESTMENT,
+    NOPAT,
+    OPERATING_INCOME,
+    OPERATING_MARGIN,
+    OPERATING_TAX_RATE,
+    REVENUE,
+    REVENUE_GROWTH,
+    REINVESTMENT_RATE,
+    ROIC,
+    FundamentalHistory,
+    TTMResult,
+    build_fundamental_history,
+    build_period_fundamentals,
+    build_validated_ttm,
+)
+from Stock.assumption_diagnostics import build_assumption_diagnostics
+from Stock.forecast_anchors import (
+    align_dcf_and_consensus_period,
+    build_dcf_revenue_forecast_periods,
+    compare_aligned_forward_estimate,
+    load_revenue_forecast_anchors,
+    revenue_anchors_to_forward_estimate_set,
+)
+from Stock.multistage_integration import (
+    MultiStageDCFRunResult,
+    run_real_company_multistage_dcf,
+)
+from Stock.valuation import MultiStageDCFAssumptions
+from Stock.valuation_sensitivity import (
+    WACCTerminalGrowthSensitivity,
+    build_wacc_terminal_growth_sensitivity,
+)
+from Stock.valuation_scenarios import (
+    MultiScenarioDCFResult,
+    ScenarioRunResult,
+    create_scenario_from_base,
+    run_multi_scenario_dcf,
+)
+from Stock.wacc_audit import (
+    WACCAuditResult,
+    build_wacc_audit_result,
+    issuer_normalization_metadata,
+)
+from Stock.beta_audit import (
+    BetaRobustnessAudit,
+    BetaWACCContext,
+    build_beta_robustness_audit,
+    calculate_beta_estimate,
+    resample_adjusted_prices,
+)
+from Stock.bottom_up_beta import (
+    BottomUpBetaResult,
+    IndustryBetaReference,
+    PeerBetaInput,
+    build_beta_evidence_comparison,
+    build_bottom_up_beta_result,
+    peer_group_for_target,
+)
+from Stock.research_wacc import (
+    ResearchWACCDecision,
+    build_research_wacc_decision,
+)
+from Stock.valuation_support import (
+    FOREIGN_LISTING_NORMALIZATION_UNSUPPORTED,
+    assess_per_security_valuation_support,
+)
+
 warnings.filterwarnings("ignore")
 
 # ================= 1. 数据获取层 =================
-def _find_statement_row(statement: pd.DataFrame, candidates: tuple[str, ...]):
-    """按 yfinance 财务报表的行名查找科目，兼容名称的小幅变化。"""
-    def normalize(value: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", str(value).lower())
+@dataclass(frozen=True)
+class CompanySnapshot:
+    """一次页面运行所需的公司原始数据快照；金额保留报表原始币种。"""
+    ticker: str
+    price: float | None
+    market_cap: float | None
+    shares_outstanding: float | None
+    cash: float | None
+    total_debt: float | None
+    net_debt: float | None
+    sector: str | None
+    industry: str | None
+    beta: float | None
+    annual_income: pd.DataFrame
+    quarterly_income: pd.DataFrame
+    annual_balance: pd.DataFrame
+    quarterly_balance: pd.DataFrame
+    annual_cashflow: pd.DataFrame
+    quarterly_cashflow: pd.DataFrame
+    net_debt_source: str | None = None
+    net_debt_period: pd.Timestamp | None = None
+    ticker_shares_outstanding: float | None = None
+    implied_shares_outstanding: float | None = None
+    fast_info_shares: float | None = None
+    revenue_estimates: pd.DataFrame | None = None
+    revenue_estimates_as_of: pd.Timestamp | None = None
+    market_cap_source: str | None = None
+    market_cap_retrieved_at: pd.Timestamp | None = None
+    total_debt_source: str | None = None
+    total_debt_period: pd.Timestamp | None = None
+    financial_currency: str | None = None
+    price_currency: str | None = None
 
-    normalized = {normalize(label): label for label in statement.index}
-    for candidate in candidates:
-        normalized_candidate = normalize(candidate)
-        if normalized_candidate in normalized:
-            return statement.loc[normalized[normalized_candidate]]
-    for normalized_label, original_label in normalized.items():
-        if any(normalize(candidate) in normalized_label for candidate in candidates):
-            return statement.loc[original_label]
-    return None
+
+@dataclass(frozen=True)
+class FinancialFieldMatch:
+    """Explain which Yahoo row, if any, resolved a financial concept."""
+    concept: str
+    row: pd.Series | None
+    row_name: str | None
+    tier: int | None
+    reason: str | None
+
+
+FINANCIAL_FIELD_ALIASES = {
+    "revenue": {
+        "canonical": "Total Revenue",
+        "aliases": ("Operating Revenue", "Revenue"),
+    },
+    "gross_profit": {"canonical": "Gross Profit", "aliases": ()},
+    "operating_income": {
+        "canonical": "Operating Income",
+        "aliases": ("Operating Profit", "Total Operating Income As Reported"),
+    },
+    "ebit": {
+        "canonical": "EBIT",
+        "aliases": ("Operating Income", "Total Operating Income As Reported"),
+    },
+    "pretax_income": {
+        "canonical": "Pretax Income",
+        "aliases": ("Income Before Tax",),
+    },
+    "tax_provision": {
+        "canonical": "Tax Provision",
+        "aliases": ("Income Tax Expense",),
+    },
+    "effective_tax_rate": {
+        "canonical": "Tax Rate For Calcs",
+        "aliases": (),
+    },
+    "net_income": {
+        "canonical": "Net Income",
+        "aliases": ("Net Income Common Stockholders",),
+    },
+    "operating_cash_flow": {
+        "canonical": "Operating Cash Flow",
+        "aliases": ("Total Cash From Operating Activities",),
+    },
+    "investing_cash_flow": {
+        "canonical": "Investing Cash Flow",
+        "aliases": ("Total Cashflows From Investing Activities",),
+    },
+    "financing_cash_flow": {
+        "canonical": "Financing Cash Flow",
+        "aliases": ("Total Cash From Financing Activities",),
+    },
+    "capital_expenditure": {
+        "canonical": "Capital Expenditure",
+        "aliases": ("Capital Expenditures",),
+    },
+    "free_cash_flow": {"canonical": "Free Cash Flow", "aliases": ()},
+    "interest_expense": {
+        "canonical": "Interest Expense",
+        "aliases": ("Interest Expense Non Operating",),
+    },
+    "cash": {
+        "canonical": "Cash And Cash Equivalents",
+        "aliases": ("Cash Cash Equivalents And Short Term Investments",),
+    },
+    "roic_cash": {
+        "canonical": "Cash And Cash Equivalents",
+        "aliases": (),
+    },
+    "total_equity": {
+        "canonical": "Stockholders Equity",
+        "aliases": ("Common Stock Equity",),
+    },
+    "total_debt": {"canonical": "Total Debt", "aliases": ()},
+    "long_term_debt": {
+        "canonical": "Long Term Debt And Capital Lease Obligation",
+        "aliases": ("Long Term Debt",),
+    },
+    "net_debt": {"canonical": "Net Debt", "aliases": ()},
+    "total_assets": {"canonical": "Total Assets", "aliases": ()},
+    "total_liabilities": {
+        "canonical": "Total Liabilities Net Minority Interest",
+        "aliases": ("Total Liabilities",),
+    },
+    "shares_outstanding": {
+        "canonical": "Ordinary Shares Number",
+        "aliases": (),
+    },
+    "retained_earnings": {"canonical": "Retained Earnings", "aliases": ()},
+    "depreciation_amortization": {
+        "canonical": "Depreciation And Amortization",
+        "aliases": ("Depreciation Amortization Depletion",),
+    },
+}
+
+
+def _normalize_financial_field(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+
+def resolve_financial_field(
+    statement: pd.DataFrame,
+    concept: str | tuple[str, ...],
+) -> FinancialFieldMatch:
+    """Resolve only normalized canonical names and explicit ordered aliases.
+
+    Tier 1 is the concept's canonical name. Tier 2 contains concept-specific,
+    ordered aliases. There is deliberately no generic substring/fuzzy tier.
+    Duplicate rows with the same normalized accepted name are ambiguous.
+    """
+    concept_name = concept if isinstance(concept, str) else "explicit_candidates"
+    if statement is None or statement.empty:
+        return FinancialFieldMatch(str(concept_name), None, None, None, "empty_statement")
+
+    if isinstance(concept, str):
+        specification = FINANCIAL_FIELD_ALIASES.get(concept)
+        if specification is None:
+            return FinancialFieldMatch(concept, None, None, None, "unknown_concept")
+        canonical = specification["canonical"]
+        aliases = specification["aliases"]
+    else:
+        if not concept:
+            return FinancialFieldMatch(
+                concept_name, None, None, None, "no_approved_names"
+            )
+        canonical, *aliases = concept
+
+    normalized_rows: dict[str, list] = {}
+    for label in statement.index:
+        normalized_rows.setdefault(_normalize_financial_field(label), []).append(label)
+
+    for tier, approved_names in ((1, (canonical,)), (2, tuple(aliases))):
+        for approved_name in approved_names:
+            matches = normalized_rows.get(_normalize_financial_field(approved_name), [])
+            if len(matches) > 1:
+                return FinancialFieldMatch(
+                    str(concept_name), None, None, None, "ambiguous_normalized_match"
+                )
+            if len(matches) == 1:
+                row_name = matches[0]
+                row = statement.loc[row_name]
+                if not isinstance(row, pd.Series):
+                    return FinancialFieldMatch(
+                        str(concept_name), None, None, None, "ambiguous_row"
+                    )
+                return FinancialFieldMatch(
+                    str(concept_name), row, str(row_name), tier, None
+                )
+
+    return FinancialFieldMatch(str(concept_name), None, None, None, "not_found")
+
+
+def _find_statement_row(statement: pd.DataFrame,
+                        concept: str | tuple[str, ...]):
+    """Compatibility wrapper returning only the conservatively resolved row."""
+    return resolve_financial_field(statement, concept).row
 
 
 def _statement_series(statement: pd.DataFrame,
-                      candidates: tuple[str, ...]) -> pd.Series:
+                      concept: str | tuple[str, ...]) -> pd.Series:
     """读取财务报表科目并按日期升序返回数值序列。"""
     if statement is None or statement.empty:
         return pd.Series(dtype=float)
-    row = _find_statement_row(statement, candidates)
+    row = _find_statement_row(statement, concept)
     if row is None:
         return pd.Series(dtype=float)
     return pd.to_numeric(row, errors="coerce").dropna().sort_index()
 
 
+def _reported_statement_series(statement: pd.DataFrame,
+                               concept: str) -> pd.Series:
+    """Return the resolved reported row while preserving period-level NaN."""
+    if statement is None or statement.empty:
+        return pd.Series(dtype=float)
+    row = _find_statement_row(statement, concept)
+    if row is None:
+        return pd.Series(dtype=float)
+    dates = pd.to_datetime(pd.Index(row.index), errors="coerce")
+    frame = pd.DataFrame(
+        {
+            "date": dates,
+            "value": pd.to_numeric(
+                pd.Series(row).reset_index(drop=True), errors="coerce"
+            ),
+            "order": np.arange(len(row)),
+        }
+    ).dropna(subset=["date"])
+    frame = frame.sort_values(["date", "order"]).drop_duplicates(
+        "date", keep="last"
+    )
+    return pd.Series(
+        frame["value"].to_numpy(), index=pd.DatetimeIndex(frame["date"])
+    )
+
+
+def _optional_float(value) -> float | None:
+    """将元数据数值转成 float，同时保留缺失状态。"""
+    try:
+        result = float(value)
+        return result if np.isfinite(result) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _latest_statement_optional(statement: pd.DataFrame,
+                               concept: str | tuple[str, ...]) -> float | None:
+    """读取最近一期报表数值；字段缺失时返回 None 而不是零。"""
+    if statement is None or statement.empty:
+        return None
+    row = _find_statement_row(statement, concept)
+    if row is None:
+        return None
+    dates = pd.to_datetime(pd.Index(row.index), errors="coerce")
+    values = pd.to_numeric(pd.Series(row).reset_index(drop=True), errors="coerce")
+    dated_values = pd.DataFrame({"date": dates, "value": values}).dropna(
+        subset=["date"]
+    )
+    if dated_values.empty:
+        return None
+    latest = dated_values.sort_values("date").iloc[-1]["value"]
+    return _optional_float(latest)
+
+
+def _derive_net_debt(reported_net_debt: float | None,
+                     statement_debt: float | None,
+                     statement_cash: float | None,
+                     info_debt: float | None,
+                     info_cash: float | None) -> float | None:
+    """Preserve reported zero and derive net debt only from a complete pair."""
+    if reported_net_debt is not None:
+        return reported_net_debt
+    if statement_debt is not None and statement_cash is not None:
+        return statement_debt - statement_cash
+    if info_debt is not None and info_cash is not None:
+        return info_debt - info_cash
+    return None
+
+
+def _latest_statement_period(statement: pd.DataFrame) -> pd.Timestamp | None:
+    """Return the latest parseable statement column without inventing a date."""
+    if statement is None or statement.empty:
+        return None
+    periods = pd.to_datetime(pd.Index(statement.columns), errors="coerce")
+    periods = periods[~pd.isna(periods)]
+    return pd.Timestamp(periods.max()) if len(periods) else None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_company_snapshot(ticker: str) -> CompanySnapshot:
+    """集中获取公司元数据以及年度/季度三张财务报表。"""
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise ValueError("股票代码不能为空")
+
+    ticker_obj = yf.Ticker(ticker)
+
+    try:
+        fast_info = ticker_obj.fast_info
+    except Exception:
+        fast_info = {}
+    try:
+        info = ticker_obj.info or {}
+    except Exception:
+        info = {}
+
+    def statement(method_name: str, frequency: str) -> pd.DataFrame:
+        try:
+            value = getattr(ticker_obj, method_name)(freq=frequency)
+            return value if value is not None else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    annual_income = statement("get_income_stmt", "yearly")
+    quarterly_income = statement("get_income_stmt", "quarterly")
+    annual_balance = statement("get_balance_sheet", "yearly")
+    quarterly_balance = statement("get_balance_sheet", "quarterly")
+    annual_cashflow = statement("get_cash_flow", "yearly")
+    quarterly_cashflow = statement("get_cash_flow", "quarterly")
+    try:
+        revenue_estimates = ticker_obj.get_revenue_estimate()
+        if revenue_estimates is None:
+            revenue_estimates = pd.DataFrame()
+        revenue_estimates_as_of = pd.Timestamp.now(tz="UTC")
+    except Exception:
+        revenue_estimates = pd.DataFrame()
+        revenue_estimates_as_of = None
+
+    price = _optional_float(fast_info.get("last_price"))
+    if price is None:
+        price = _optional_float(fast_info.get("lastPrice"))
+    if price is None:
+        price = _optional_float(info.get("currentPrice"))
+    if price is None:
+        price = _optional_float(info.get("regularMarketPrice"))
+    if price is None:
+        try:
+            closes = ticker_obj.history(period="5d")["Close"].dropna()
+            price = float(closes.iloc[-1]) if not closes.empty else None
+        except Exception:
+            price = None
+
+    market_cap = _optional_float(info.get("marketCap"))
+    market_cap_source = "yfinance_info_market_cap" if market_cap is not None else None
+    ticker_shares = _optional_float(info.get("sharesOutstanding"))
+    implied_shares = _optional_float(info.get("impliedSharesOutstanding"))
+    fast_info_shares = _optional_float(fast_info.get("shares"))
+    shares = ticker_shares
+    if shares is None:
+        shares = implied_shares
+    if shares is None:
+        shares = fast_info_shares
+    if shares is None:
+        shares = _latest_statement_optional(
+            annual_balance, "shares_outstanding"
+        )
+    if shares is None and market_cap is not None and price is not None and price > 0:
+        shares = market_cap / price
+    if market_cap is None and price is not None and shares is not None:
+        market_cap = price * shares
+        market_cap_source = "derived_current_price_times_shares"
+    market_cap_retrieved_at = (
+        pd.Timestamp.now(tz="UTC") if market_cap is not None else None
+    )
+
+    statement_debt = _latest_statement_optional(annual_balance, "total_debt")
+    info_debt = _optional_float(info.get("totalDebt"))
+    total_debt = statement_debt if statement_debt is not None else info_debt
+    if statement_debt is not None:
+        total_debt_source = "annual_balance_total_debt"
+        total_debt_period = _latest_statement_period(annual_balance)
+    elif info_debt is not None:
+        total_debt_source = "yfinance_info_total_debt"
+        total_debt_period = None
+    else:
+        total_debt_source = None
+        total_debt_period = None
+
+    statement_cash = _latest_statement_optional(
+        annual_balance, "cash"
+    )
+    info_cash = _optional_float(info.get("totalCash"))
+    cash = statement_cash if statement_cash is not None else info_cash
+
+    reported_net_debt = _latest_statement_optional(annual_balance, "net_debt")
+    net_debt = _derive_net_debt(
+        reported_net_debt,
+        statement_debt,
+        statement_cash,
+        info_debt,
+        info_cash,
+    )
+    if reported_net_debt is not None:
+        net_debt_source = "annual_balance_reported_net_debt"
+        net_debt_period = _latest_statement_period(annual_balance)
+    elif statement_debt is not None and statement_cash is not None:
+        net_debt_source = "annual_balance_debt_minus_cash"
+        net_debt_period = _latest_statement_period(annual_balance)
+    elif info_debt is not None and info_cash is not None:
+        net_debt_source = "company_metadata_debt_minus_cash"
+        net_debt_period = None
+    else:
+        net_debt_source = None
+        net_debt_period = None
+
+    return CompanySnapshot(
+        ticker=ticker,
+        price=price,
+        market_cap=market_cap,
+        shares_outstanding=shares,
+        cash=cash,
+        total_debt=total_debt,
+        net_debt=net_debt,
+        sector=str(info.get("sector")) if info.get("sector") else None,
+        industry=str(info.get("industry")) if info.get("industry") else None,
+        beta=_optional_float(info.get("beta")),
+        annual_income=annual_income,
+        quarterly_income=quarterly_income,
+        annual_balance=annual_balance,
+        quarterly_balance=quarterly_balance,
+        annual_cashflow=annual_cashflow,
+        quarterly_cashflow=quarterly_cashflow,
+        net_debt_source=net_debt_source,
+        net_debt_period=net_debt_period,
+        ticker_shares_outstanding=ticker_shares,
+        implied_shares_outstanding=implied_shares,
+        fast_info_shares=fast_info_shares,
+        revenue_estimates=revenue_estimates,
+        revenue_estimates_as_of=revenue_estimates_as_of,
+        market_cap_source=market_cap_source,
+        market_cap_retrieved_at=market_cap_retrieved_at,
+        total_debt_source=total_debt_source,
+        total_debt_period=total_debt_period,
+        financial_currency=(
+            str(info.get("financialCurrency")).strip().upper()
+            if info.get("financialCurrency") else None
+        ),
+        price_currency=(
+            str(info.get("currency") or fast_info.get("currency")).strip().upper()
+            if (info.get("currency") or fast_info.get("currency")) else None
+        ),
+    )
+
+
+def build_company_fundamentals(snapshot: CompanySnapshot) -> FundamentalHistory:
+    """Adapt one normalized company snapshot to the pure fundamentals engine."""
+    annual_periods = list(snapshot.annual_income.columns) + list(
+        snapshot.annual_cashflow.columns
+    ) + list(snapshot.annual_balance.columns)
+    return build_fundamental_history(
+        annual_revenue=_reported_statement_series(
+            snapshot.annual_income, "revenue"
+        ),
+        annual_gross_profit=_reported_statement_series(
+            snapshot.annual_income, "gross_profit"
+        ),
+        annual_operating_income=_reported_statement_series(
+            snapshot.annual_income, "operating_income"
+        ),
+        annual_cfo=_reported_statement_series(
+            snapshot.annual_cashflow, "operating_cash_flow"
+        ),
+        annual_capex=_reported_statement_series(
+            snapshot.annual_cashflow, "capital_expenditure"
+        ),
+        annual_pretax_income=_reported_statement_series(
+            snapshot.annual_income, "pretax_income"
+        ),
+        annual_tax_provision=_reported_statement_series(
+            snapshot.annual_income, "tax_provision"
+        ),
+        annual_total_equity=_reported_statement_series(
+            snapshot.annual_balance, "total_equity"
+        ),
+        annual_total_debt=_reported_statement_series(
+            snapshot.annual_balance, "total_debt"
+        ),
+        annual_cash=_reported_statement_series(
+            snapshot.annual_balance, "roic_cash"
+        ),
+        annual_depreciation_amortization=_reported_statement_series(
+            snapshot.annual_cashflow, "depreciation_amortization"
+        ),
+        quarterly_revenue=_reported_statement_series(
+            snapshot.quarterly_income, "revenue"
+        ),
+        quarterly_gross_profit=_reported_statement_series(
+            snapshot.quarterly_income, "gross_profit"
+        ),
+        quarterly_operating_income=_reported_statement_series(
+            snapshot.quarterly_income, "operating_income"
+        ),
+        quarterly_cfo=_reported_statement_series(
+            snapshot.quarterly_cashflow, "operating_cash_flow"
+        ),
+        quarterly_capex=_reported_statement_series(
+            snapshot.quarterly_cashflow, "capital_expenditure"
+        ),
+        annual_periods=annual_periods,
+        quarterly_income_periods=snapshot.quarterly_income.columns,
+        quarterly_cashflow_periods=snapshot.quarterly_cashflow.columns,
+    )
+
+
 def _calculate_fcff_series(income: pd.DataFrame,
                            cashflow: pd.DataFrame) -> tuple[pd.Series, str]:
     """用 CFO 口径从年度或季度报表计算 FCFF 原始美元序列。"""
-    operating_cf = _statement_series(
-        cashflow,
-        ("Operating Cash Flow", "Total Cash From Operating Activities"),
-    )
-    interest_expense = _statement_series(
-        income,
-        ("Interest Expense", "Interest Expense Non Operating"),
-    )
-    pretax = _statement_series(income, ("Pretax Income", "Income Before Tax"))
-    tax = _statement_series(income, ("Tax Provision", "Income Tax Expense"))
-    capex = _statement_series(
-        cashflow, ("Capital Expenditure", "Capital Expenditures")
-    )
+    operating_cf = _statement_series(cashflow, "operating_cash_flow")
+    interest_expense = _statement_series(income, "interest_expense")
+    pretax = _statement_series(income, "pretax_income")
+    tax = _statement_series(income, "tax_provision")
+    capex = _statement_series(cashflow, "capital_expenditure")
 
     if not operating_cf.empty and not capex.empty:
         frame = pd.concat(
@@ -73,106 +611,135 @@ def _calculate_fcff_series(income: pd.DataFrame,
             [np.inf, -np.inf], np.nan
         )
         loss_period = frame["pretax"].notna() & (frame["pretax"] <= 0)
+        default_tax_assumption = (~loss_period) & (
+            frame["pretax"].isna()
+            | frame["tax"].isna()
+            | (frame["pretax"] == 0)
+        )
         effective_tax = effective_tax.where(frame["pretax"] > 0)
         effective_tax.loc[loss_period] = 0.0
         effective_tax = effective_tax.clip(lower=0.0, upper=0.35).fillna(0.21)
         valid_period = frame["operating_cf"].notna() & frame["capex"].notna()
+        # Compatibility assumptions are explicit here rather than changing the
+        # normalized statement values: absent interest is treated as zero and
+        # absent/undefined tax inputs use the existing 21% default.
+        interest_assumption_used = bool(
+            (frame["interest_expense"].isna() & valid_period).any()
+        )
+        tax_assumption_used = bool((default_tax_assumption & valid_period).any())
+        interest_for_fcff = frame["interest_expense"].abs().fillna(0.0)
         fcff = (
             frame["operating_cf"]
             + frame["capex"]
-            + frame["interest_expense"].abs().fillna(0) * (1 - effective_tax)
+            + interest_for_fcff * (1 - effective_tax)
         ).loc[valid_period].dropna()
         if not fcff.empty:
-            return fcff, "FCFF = CFO + CapEx + 税后利息"
+            assumptions = []
+            if interest_assumption_used:
+                assumptions.append("缺失利息按 0")
+            if tax_assumption_used:
+                assumptions.append("缺失税率按 21%")
+            suffix = f"（假设：{'；'.join(assumptions)}）" if assumptions else ""
+            return fcff, f"FCFF = CFO + CapEx + 税后利息{suffix}"
 
-    fallback = _statement_series(cashflow, ("Free Cash Flow",))
+    fallback = _statement_series(cashflow, "free_cash_flow")
     if fallback.empty:
         if not operating_cf.empty and not capex.empty:
-            fallback = operating_cf.add(capex, fill_value=0)
+            complete = pd.concat(
+                {"operating_cf": operating_cf, "capex": capex}, axis=1
+            ).dropna()
+            fallback = complete["operating_cf"] + complete["capex"]
     return fallback, "yfinance FCF 回退口径" if not fallback.empty else "无数据"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fcff_data(ticker: str) -> tuple[pd.Series, str]:
+def fetch_fcff_data(ticker: str,
+                    snapshot: CompanySnapshot | None = None) -> tuple[pd.Series, str]:
     """返回年度 FCFF，并用最近四个季度追加最新 TTM FCFF。"""
     ticker = ticker.strip().upper()
     if not ticker:
         return pd.Series(dtype=float), "无数据"
 
     try:
-        ticker_obj = yf.Ticker(ticker)
+        snapshot = snapshot or load_company_snapshot(ticker)
         annual, annual_source = _calculate_fcff_series(
-            ticker_obj.get_income_stmt(freq="yearly"),
-            ticker_obj.get_cash_flow(freq="yearly"),
+            snapshot.annual_income,
+            snapshot.annual_cashflow,
         )
         quarterly, quarterly_source = _calculate_fcff_series(
-            ticker_obj.get_income_stmt(freq="quarterly"),
-            ticker_obj.get_cash_flow(freq="quarterly"),
+            snapshot.quarterly_income,
+            snapshot.quarterly_cashflow,
         )
 
         result = annual.iloc[-5:] / 1_000_000_000
         source = annual_source
-        if len(quarterly) >= 4:
-            latest_four = quarterly.iloc[-4:]
-            ttm_end = pd.Timestamp(latest_four.index[-1])
-            ttm_fcff = float(latest_four.sum()) / 1_000_000_000
+        ttm = build_validated_ttm(
+            quarterly,
+            expected_periods=snapshot.quarterly_cashflow.columns,
+        )
+        if ttm.available:
+            ttm_end = ttm.periods_used[-1]
+            ttm_fcff = ttm.value / 1_000_000_000
             if result.empty or ttm_end > pd.Timestamp(result.index[-1]):
                 result.loc[ttm_end] = ttm_fcff
                 source = (
                     f"{annual_source}；最新值为截至 {ttm_end.date()} 的 TTM "
                     f"（季度口径：{quarterly_source}）"
                 )
+        else:
+            source = f"{annual_source}；TTM 不可用：{ttm.reason}"
         return result.sort_index(), source
     except Exception:
         return pd.Series(dtype=float), "无数据"
 
 
-def fetch_fcf_data(ticker: str, debug: bool = False) -> pd.Series:
+def fetch_fcf_data(ticker: str,
+                   debug: bool = False,
+                   snapshot: CompanySnapshot | None = None) -> pd.Series:
     """兼容旧调用；返回 FCFF/FCF 序列，单位为十亿美元。"""
-    data, source = fetch_fcff_data(ticker)
+    data, source = fetch_fcff_data(ticker, snapshot)
     if debug and data.empty:
         st.warning(f"⚠️ 无法获取现金流数据（{source}）。")
     return data
 
 
 def _free_cash_flow_series(cashflow: pd.DataFrame) -> pd.Series:
-    """读取 FCF；若数据源未直接提供，则用 CFO + CapEx 计算。"""
-    free_cash_flow = _statement_series(cashflow, ("Free Cash Flow",))
-    if not free_cash_flow.empty:
-        return free_cash_flow
-    operating_cf = _statement_series(
-        cashflow,
-        ("Operating Cash Flow", "Total Cash From Operating Activities"),
+    """Return operating FCF = CFO + CapEx, distinct from DCF FCFF."""
+    frame = build_period_fundamentals(
+        revenue=None,
+        gross_profit=None,
+        operating_income=None,
+        cfo=_reported_statement_series(cashflow, "operating_cash_flow"),
+        capex=_reported_statement_series(cashflow, "capital_expenditure"),
+        periods=cashflow.columns if cashflow is not None else None,
+        include_revenue_growth=False,
     )
-    capex = _statement_series(
-        cashflow, ("Capital Expenditure", "Capital Expenditures")
-    )
-    if operating_cf.empty or capex.empty:
-        return pd.Series(dtype=float)
-    return operating_cf.add(capex, fill_value=0).dropna().sort_index()
+    return frame[FCF].dropna()
 
 
 def _financial_trend_frame(income: pd.DataFrame,
                            cashflow: pd.DataFrame,
                            balance: pd.DataFrame) -> pd.DataFrame:
     """整理一组可直接绘图的财报指标，金额和股数统一为 billion。"""
+    periods = list(income.columns if income is not None else []) + list(
+        cashflow.columns if cashflow is not None else []
+    )
+    fundamentals = build_period_fundamentals(
+        revenue=_reported_statement_series(income, "revenue"),
+        gross_profit=_reported_statement_series(income, "gross_profit"),
+        operating_income=_reported_statement_series(income, "operating_income"),
+        cfo=_reported_statement_series(cashflow, "operating_cash_flow"),
+        capex=_reported_statement_series(cashflow, "capital_expenditure"),
+        periods=periods,
+        include_revenue_growth=False,
+    )
     series = {
-        "Revenue": _statement_series(
-            income, ("Total Revenue", "Operating Revenue", "Revenue")
-        ),
-        "Gross Profit": _statement_series(income, ("Gross Profit",)),
-        "Operating Income": _statement_series(
-            income, ("Operating Income", "Operating Profit")
-        ),
-        "Net Income": _statement_series(
-            income, ("Net Income", "Net Income Common Stockholders")
-        ),
-        "Free Cash Flow": _free_cash_flow_series(cashflow),
-        "Retained Earnings": _statement_series(balance, ("Retained Earnings",)),
-        "Shares Outstanding": _statement_series(
-            balance,
-            ("Ordinary Shares Number", "Share Issued", "Shares Issued"),
-        ),
+        "Revenue": fundamentals[REVENUE].dropna(),
+        "Gross Profit": fundamentals[GROSS_PROFIT].dropna(),
+        "Operating Income": fundamentals[OPERATING_INCOME].dropna(),
+        "Net Income": _statement_series(income, "net_income"),
+        "Free Cash Flow": fundamentals[FCF].dropna(),
+        "Retained Earnings": _statement_series(balance, "retained_earnings"),
+        "Shares Outstanding": _statement_series(balance, "shares_outstanding"),
     }
     available = {name: values for name, values in series.items() if not values.empty}
     if not available:
@@ -181,12 +748,20 @@ def _financial_trend_frame(income: pd.DataFrame,
 
 
 def _latest_flow_value(quarterly: pd.Series,
-                       annual: pd.Series) -> tuple[float | None, str]:
+                       annual: pd.Series,
+                       expected_periods=None,
+                       annual_expected_periods=None) -> tuple[float | None, str]:
     """流量指标优先取最新四季 TTM，否则回退到最近财年。"""
-    if len(quarterly) >= 4:
-        latest_four = quarterly.iloc[-4:]
-        return float(latest_four.sum()), f"TTM 截至 {latest_four.index[-1].date()}"
+    ttm = build_validated_ttm(quarterly, expected_periods)
+    if ttm.available:
+        return ttm.value, f"TTM 截至 {ttm.periods_used[-1].date()}"
     if not annual.empty:
+        if annual_expected_periods is not None:
+            annual_dates = pd.to_datetime(
+                pd.Index(annual_expected_periods), errors="coerce"
+            ).dropna()
+            if len(annual_dates) and pd.Timestamp(annual.index[-1]) < max(annual_dates):
+                return None, "最新财年数据缺失"
         return float(annual.iloc[-1]), f"财年截至 {annual.index[-1].date()}"
     return None, "无可用数据"
 
@@ -205,44 +780,49 @@ def _build_health_checks(annual_income: pd.DataFrame,
         if len(balance_dates):
             balance_basis = f"截至 {max(balance_dates).date()}"
 
-    assets = _latest_statement_value(balance, ("Total Assets",))
-    liabilities = _latest_statement_value(
-        balance,
-        ("Total Liabilities Net Minority Interest", "Total Liabilities"),
+    assets = _latest_statement_optional(balance, "total_assets")
+    liabilities = _latest_statement_optional(
+        balance, "total_liabilities"
     )
-    asset_status = assets > liabilities if assets and liabilities else None
+    asset_status = (
+        assets > liabilities
+        if assets is not None and liabilities is not None else None
+    )
 
-    long_term_debt = _latest_statement_value(
-        balance,
-        ("Long Term Debt And Capital Lease Obligation", "Long Term Debt"),
+    long_term_debt = _latest_statement_optional(
+        balance, "long_term_debt"
     )
-    annual_net_income = _statement_series(
-        annual_income, ("Net Income", "Net Income Common Stockholders")
-    )
-    quarterly_net_income = _statement_series(
-        quarterly_income, ("Net Income", "Net Income Common Stockholders")
-    )
+    annual_net_income = _statement_series(annual_income, "net_income")
+    quarterly_net_income = _statement_series(quarterly_income, "net_income")
     net_income, income_basis = _latest_flow_value(
-        quarterly_net_income, annual_net_income
+        quarterly_net_income,
+        annual_net_income,
+        expected_periods=quarterly_income.columns,
+        annual_expected_periods=annual_income.columns,
     )
-    debt_ratio = long_term_debt / net_income if net_income is not None and net_income > 0 else None
-    debt_status = debt_ratio < 4 if debt_ratio is not None else False if net_income is not None else None
+    debt_ratio = (
+        long_term_debt / net_income
+        if long_term_debt is not None and net_income is not None and net_income > 0
+        else None
+    )
+    debt_status = (
+        debt_ratio < 4
+        if debt_ratio is not None
+        else False if long_term_debt is not None and net_income is not None
+        else None
+    )
 
-    def flow_pair(candidates: tuple[str, ...]) -> tuple[float | None, str]:
+    def flow_pair(concept: str) -> tuple[float | None, str]:
         return _latest_flow_value(
-            _statement_series(quarterly_cashflow, candidates),
-            _statement_series(annual_cashflow, candidates),
+            _statement_series(quarterly_cashflow, concept),
+            _statement_series(annual_cashflow, concept),
+            expected_periods=quarterly_cashflow.columns,
+            annual_expected_periods=annual_cashflow.columns,
         )
 
-    operating_cf, cash_basis = flow_pair(
-        ("Operating Cash Flow", "Total Cash From Operating Activities")
-    )
-    investing_cf, _ = flow_pair(
-        ("Investing Cash Flow", "Total Cashflows From Investing Activities")
-    )
-    financing_cf, _ = flow_pair(
-        ("Financing Cash Flow", "Total Cash From Financing Activities")
-    )
+    operating_cf, cash_basis = flow_pair("operating_cash_flow")
+    investing_cf, _ = flow_pair("investing_cash_flow")
+    financing_cf, _ = flow_pair("financing_cash_flow")
     cash_available = all(value is not None for value in (operating_cf, investing_cf, financing_cf))
     cash_status = (
         operating_cf > abs(investing_cf) and operating_cf > abs(financing_cf)
@@ -257,7 +837,7 @@ def _build_health_checks(annual_income: pd.DataFrame,
             "status": asset_status,
             "detail": (
                 f"资产 {assets / billion:.2f}B · 负债 {liabilities / billion:.2f}B"
-                if assets and liabilities else "资产或负债数据缺失"
+                if assets is not None and liabilities is not None else "资产或负债数据缺失"
             ),
             "basis": balance_basis,
         },
@@ -268,8 +848,9 @@ def _build_health_checks(annual_income: pd.DataFrame,
             "detail": (
                 f"长期债务 {long_term_debt / billion:.2f}B · 净利润 {net_income / billion:.2f}B · 比率 {debt_ratio:.2f}x"
                 if debt_ratio is not None else
-                "净利润为负或为零，无法形成有效覆盖" if net_income is not None else
                 "长期债务或净利润数据缺失"
+                if long_term_debt is None or net_income is None else
+                "净利润为负或为零，无法形成有效覆盖"
             ),
             "basis": f"债务{balance_basis} · 净利润{income_basis}",
         },
@@ -286,20 +867,22 @@ def _build_health_checks(annual_income: pd.DataFrame,
     ]
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_financial_overview(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
+def fetch_financial_overview(
+    ticker: str,
+    snapshot: CompanySnapshot | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
     """获取年度/季度财报趋势和基础运营检查。"""
     ticker = ticker.strip().upper()
     if not ticker:
         return pd.DataFrame(), pd.DataFrame(), []
     try:
-        ticker_obj = yf.Ticker(ticker)
-        annual_income = ticker_obj.get_income_stmt(freq="yearly")
-        annual_cashflow = ticker_obj.get_cash_flow(freq="yearly")
-        annual_balance = ticker_obj.get_balance_sheet(freq="yearly")
-        quarterly_income = ticker_obj.get_income_stmt(freq="quarterly")
-        quarterly_cashflow = ticker_obj.get_cash_flow(freq="quarterly")
-        quarterly_balance = ticker_obj.get_balance_sheet(freq="quarterly")
+        snapshot = snapshot or load_company_snapshot(ticker)
+        annual_income = snapshot.annual_income
+        annual_cashflow = snapshot.annual_cashflow
+        annual_balance = snapshot.annual_balance
+        quarterly_income = snapshot.quarterly_income
+        quarterly_cashflow = snapshot.quarterly_cashflow
+        quarterly_balance = snapshot.quarterly_balance
         annual = _financial_trend_frame(
             annual_income, annual_cashflow, annual_balance
         )
@@ -320,87 +903,29 @@ def fetch_financial_overview(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame, l
 
 
 def _latest_statement_value(statement: pd.DataFrame,
-                            candidates: tuple[str, ...]) -> float:
-    """读取财务报表科目的最近一期有效数值。"""
-    if statement is None or statement.empty:
-        return 0.0
-    row = _find_statement_row(statement, candidates)
-    if row is None:
-        return 0.0
-    values = pd.to_numeric(row, errors="coerce").dropna().sort_index()
-    return float(values.iloc[-1]) if not values.empty else 0.0
+                            concept: str | tuple[str, ...]) -> float | None:
+    """兼容旧调用名；缺失字段和 NaN 均保留为 None。"""
+    return _latest_statement_optional(statement, concept)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_market_data(ticker: str) -> tuple[float, float, float]:
+def fetch_market_data(ticker: str,
+                      snapshot: CompanySnapshot | None = None
+                      ) -> tuple[float | None, float | None, float | None]:
     """获取股价、净债务（十亿美元）和总股本（十亿股）。"""
     ticker = ticker.strip().upper()
     if not ticker:
-        return 0.0, 0.0, 0.0
+        return None, None, None
 
-    ticker_obj = yf.Ticker(ticker)
-    info = {}
-    balance_sheet = pd.DataFrame()
-
-    try:
-        fast_info = ticker_obj.fast_info
-        price = float(
-            fast_info.get("last_price") or fast_info.get("lastPrice") or 0
-        )
-    except Exception:
-        price = 0.0
-
-    try:
-        info = ticker_obj.info or {}
-        if price <= 0:
-            price = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
-    except Exception:
-        info = {}
-
-    try:
-        balance_sheet = ticker_obj.get_balance_sheet(freq="yearly")
-        if balance_sheet is None:
-            balance_sheet = pd.DataFrame()
-    except Exception:
-        balance_sheet = pd.DataFrame()
-
-    # 当前流通股本优先使用 info；报表股本和市值推算作为回退。
-    shares_raw = float(
-        info.get("sharesOutstanding")
-        or info.get("impliedSharesOutstanding")
-        or 0
+    snapshot = snapshot or load_company_snapshot(ticker)
+    net_debt = (
+        snapshot.net_debt / 1_000_000_000
+        if snapshot.net_debt is not None else None
     )
-    if shares_raw <= 0 and not balance_sheet.empty:
-        shares_raw = _latest_statement_value(
-            balance_sheet, ("Ordinary Shares Number", "Share Issued")
-        )
-    if shares_raw <= 0 and price > 0:
-        shares_raw = float(info.get("marketCap") or 0) / price
-
-    # 优先采用 yfinance 资产负债表中的 NetDebt。若缺失，则逐级计算。
-    net_debt_raw = 0.0
-    if not balance_sheet.empty:
-        net_debt_raw = _latest_statement_value(balance_sheet, ("Net Debt",))
-        if net_debt_raw == 0:
-            total_debt = _latest_statement_value(balance_sheet, ("Total Debt",))
-            cash = _latest_statement_value(
-                balance_sheet, ("Cash And Cash Equivalents",)
-            )
-            if total_debt or cash:
-                net_debt_raw = total_debt - cash
-    if net_debt_raw == 0:
-        total_debt = float(info.get("totalDebt") or 0)
-        total_cash = float(info.get("totalCash") or 0)
-        if total_debt or total_cash:
-            net_debt_raw = total_debt - total_cash
-
-    if price <= 0:
-        try:
-            closes = ticker_obj.history(period="5d")["Close"].dropna()
-            price = float(closes.iloc[-1]) if not closes.empty else 0.0
-        except Exception:
-            price = 0.0
-    return price, net_debt_raw / 1_000_000_000, shares_raw / 1_000_000_000
+    shares = (
+        snapshot.shares_outstanding / 1_000_000_000
+        if snapshot.shares_outstanding is not None else None
+    )
+    return snapshot.price, net_debt, shares
 
 
 def _percent_value(value) -> float:
@@ -417,6 +942,10 @@ def fetch_macro_assumptions() -> dict:
     erp = 0.045
     treasury_date = "回退值"
     erp_date = "回退值"
+    risk_free_source = "static_fallback_4.5_percent"
+    erp_source = "static_fallback_4.5_percent"
+    risk_free_fallback_used = True
+    erp_fallback_used = True
 
     try:
         year = pd.Timestamp.now().year
@@ -437,12 +966,15 @@ def fetch_macro_assumptions() -> dict:
         latest = treasury.dropna(subset=["Date", "10 Yr"]).sort_values("Date").iloc[-1]
         risk_free = float(latest["10 Yr"]) / 100
         treasury_date = latest["Date"].strftime("%Y-%m-%d")
+        risk_free_source = "US_Treasury_daily_10_year_par_yield"
+        risk_free_fallback_used = False
     except Exception:
         try:
             treasury_yield = yf.Ticker("^TNX").history(period="5d")["Close"].dropna()
             if not treasury_yield.empty:
                 risk_free = float(treasury_yield.iloc[-1]) / 100
                 treasury_date = "^TNX 回退"
+                risk_free_source = "yfinance_^TNX_5d_close_fallback"
         except Exception:
             pass
 
@@ -461,6 +993,10 @@ def fetch_macro_assumptions() -> dict:
         # 使用美国 ERP 减美国主权违约利差，得到与完整美债利率匹配的成熟市场 ERP。
         erp = _percent_value(us_row.iloc[4]) - _percent_value(us_row.iloc[2])
         erp_date = "Damodaran 2026"
+        erp_source = (
+            "Damodaran_US_total_equity_risk_premium_minus_country_risk_premium"
+        )
+        erp_fallback_used = False
     except Exception:
         pass
 
@@ -469,6 +1005,10 @@ def fetch_macro_assumptions() -> dict:
         "erp": erp,
         "treasury_date": treasury_date,
         "erp_date": erp_date,
+        "risk_free_source": risk_free_source,
+        "erp_source": erp_source,
+        "risk_free_fallback_used": risk_free_fallback_used,
+        "erp_fallback_used": erp_fallback_used,
     }
 
 
@@ -501,6 +1041,7 @@ def _default_spread(coverage: float, financial: bool = False) -> tuple[float, st
     return 0.0040, "Aaa/AAA"
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def _regression_beta(ticker: str) -> tuple[float | None, int]:
     """用五年月度收益率相对标普500计算回归 Beta。"""
     try:
@@ -555,44 +1096,61 @@ def fetch_industry_wacc(industry: str) -> dict:
         return {"wacc": None, "matched_industry": None}
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_wacc_reference(ticker: str) -> dict:
+def fetch_wacc_reference(ticker: str,
+                         snapshot: CompanySnapshot | None = None) -> dict:
     """计算公司级 WACC，并返回可解释的各项输入。"""
     empty = {"wacc": None, "error": "数据不足"}
     ticker = ticker.strip().upper()
     if not ticker:
         return empty
     try:
-        ticker_obj = yf.Ticker(ticker)
-        info = ticker_obj.info or {}
-        income = ticker_obj.get_income_stmt(freq="yearly")
-        balance = ticker_obj.get_balance_sheet(freq="yearly")
-        price, _, shares_b = fetch_market_data(ticker)
+        snapshot = snapshot or load_company_snapshot(ticker)
+        income = snapshot.annual_income
+        price, _, shares_b = fetch_market_data(ticker, snapshot)
 
         beta, beta_months = _regression_beta(ticker)
+        beta_assumption_used = beta is None and snapshot.beta is None
+        beta_source = "five_year_monthly_regression_vs_sp500"
         if beta is None:
-            beta = float(info.get("beta") or 1.0)
+            if snapshot.beta is not None:
+                beta = snapshot.beta
+                beta_source = "yfinance_metadata_beta_fallback"
+            else:
+                beta = 1.0
+                beta_source = "static_beta_1.0_fallback"
         macro = fetch_macro_assumptions()
 
-        total_debt = _latest_statement_value(balance, ("Total Debt",))
-        if total_debt <= 0:
-            total_debt = float(info.get("totalDebt") or 0)
-        market_cap = float(info.get("marketCap") or 0)
-        if market_cap <= 0 and price > 0 and shares_b > 0:
+        total_debt = snapshot.total_debt
+        if total_debt is None:
+            return {"wacc": None, "error": "缺少总债务数据"}
+        market_cap = snapshot.market_cap
+        if (
+            market_cap is None
+            and price is not None and price > 0
+            and shares_b is not None and shares_b > 0
+        ):
             market_cap = price * shares_b * 1_000_000_000
-        if market_cap <= 0:
+        if market_cap is None or market_cap <= 0:
             return empty
 
-        ebit = _latest_statement_value(income, ("EBIT", "Operating Income"))
-        interest = abs(_latest_statement_value(
-            income, ("Interest Expense", "Interest Expense Non Operating")
-        ))
-        pretax = _latest_statement_value(income, ("Pretax Income", "Income Before Tax"))
-        tax = _latest_statement_value(income, ("Tax Provision", "Income Tax Expense"))
-        tax_rate = tax / pretax if pretax > 0 and tax >= 0 else 0.21
+        ebit = _latest_statement_optional(income, "ebit")
+        interest_reported = _latest_statement_optional(income, "interest_expense")
+        interest_assumption_used = interest_reported is None
+        interest = abs(interest_reported) if interest_reported is not None else 0.0
+        pretax = _latest_statement_optional(income, "pretax_income")
+        tax = _latest_statement_optional(income, "tax_provision")
+        tax_inputs_reported = (
+            pretax is not None and pretax > 0 and tax is not None and tax >= 0
+        )
+        tax_assumption_used = not tax_inputs_reported
+        raw_tax_rate = tax / pretax if tax_inputs_reported else 0.21
+        tax_rate = raw_tax_rate
         tax_rate = float(np.clip(tax_rate, 0.0, 0.35))
+        tax_rate_clipped = not np.isclose(tax_rate, raw_tax_rate)
+        if interest > 0 and ebit is None:
+            return {"wacc": None, "error": "缺少 EBIT，无法计算利息覆盖率"}
         coverage = ebit / interest if interest > 0 else np.inf
-        financial = info.get("sector") == "Financial Services"
+        financial = snapshot.sector == "Financial Services"
         spread, rating = _default_spread(coverage, financial)
 
         cost_equity = macro["risk_free"] + beta * macro["erp"]
@@ -601,7 +1159,7 @@ def fetch_wacc_reference(ticker: str) -> dict:
         equity_weight = market_cap / (market_cap + max(total_debt, 0))
         debt_weight = 1 - equity_weight
         wacc = cost_equity * equity_weight + after_tax_cost_debt * debt_weight
-        industry_ref = fetch_industry_wacc(str(info.get("industry") or ""))
+        industry_ref = fetch_industry_wacc(snapshot.industry or "")
         return {
             "wacc": float(wacc),
             "cost_equity": float(cost_equity),
@@ -611,19 +1169,246 @@ def fetch_wacc_reference(ticker: str) -> dict:
             "erp": macro["erp"],
             "beta": float(beta),
             "beta_months": beta_months,
+            "beta_assumption_used": beta_assumption_used,
+            "beta_source": beta_source,
             "tax_rate": tax_rate,
+            "raw_tax_rate": float(raw_tax_rate),
+            "tax_rate_clipped": tax_rate_clipped,
+            "tax_provision": tax,
+            "tax_assumption_used": tax_assumption_used,
+            "interest_expense": interest_reported,
+            "interest_assumption_used": interest_assumption_used,
             "coverage": float(coverage),
             "rating": rating,
             "equity_weight": float(equity_weight),
             "debt_weight": float(debt_weight),
+            "market_cap": float(market_cap),
+            "market_cap_source": snapshot.market_cap_source,
+            "market_cap_retrieved_at": snapshot.market_cap_retrieved_at,
+            "total_debt": float(total_debt),
+            "total_debt_source": snapshot.total_debt_source,
+            "total_debt_period": snapshot.total_debt_period,
+            "ebit": ebit,
+            "ebit_period": _latest_statement_period(income),
+            "interest_expense_period": _latest_statement_period(income),
+            "pretax_income": pretax,
+            "tax_period": _latest_statement_period(income),
+            "spread": float(spread),
             "industry_wacc": industry_ref["wacc"],
             "matched_industry": industry_ref["matched_industry"],
             "treasury_date": macro["treasury_date"],
             "erp_date": macro["erp_date"],
+            "risk_free_source": macro.get("risk_free_source", "unknown"),
+            "erp_source": macro.get("erp_source", "unknown"),
+            "risk_free_fallback_used": macro.get(
+                "risk_free_fallback_used", False
+            ),
+            "erp_fallback_used": macro.get("erp_fallback_used", False),
             "error": None,
         }
     except Exception as exc:
         return {"wacc": None, "error": str(exc)}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_beta_robustness_audit(
+    ticker: str,
+    risk_free_rate: float,
+    equity_risk_premium: float,
+    after_tax_cost_of_debt: float,
+    equity_weight: float,
+    debt_weight: float,
+    current_dcf_wacc: float,
+) -> BetaRobustnessAudit:
+    """Load adjusted prices once, then delegate all statistics to the pure audit."""
+    ticker = ticker.strip().upper()
+
+    def history(symbol: str, interval: str) -> pd.Series:
+        try:
+            result = yf.Ticker(symbol).history(
+                period="5y", interval=interval, auto_adjust=True
+            )["Close"]
+            return result.dropna()
+        except Exception:
+            return pd.Series(dtype=float)
+
+    monthly_stock = history(ticker, "1mo")
+    monthly_market = history("^GSPC", "1mo")
+    monthly_total_market = history("VTI", "1mo")
+    daily_stock = history(ticker, "1d")
+    daily_market = history("^GSPC", "1d")
+    weekly_stock = resample_adjusted_prices(daily_stock, "weekly")
+    weekly_market = resample_adjusted_prices(daily_market, "weekly")
+    return build_beta_robustness_audit(
+        ticker,
+        monthly_stock,
+        monthly_market,
+        weekly_stock,
+        weekly_market,
+        wacc_context=BetaWACCContext(
+            risk_free_rate=risk_free_rate,
+            equity_risk_premium=equity_risk_premium,
+            after_tax_cost_of_debt=after_tax_cost_of_debt,
+            equity_weight=equity_weight,
+            debt_weight=debt_weight,
+        ),
+        current_dcf_wacc=current_dcf_wacc,
+        alternative_benchmark_prices=(
+            monthly_total_market if not monthly_total_market.empty else None
+        ),
+        alternative_benchmark="VTI",
+    )
+
+
+def _latest_valid_effective_tax_rate(
+    income_statement: pd.DataFrame,
+) -> float | None:
+    """Return the latest reported, usable tax/pretax pair without a fallback."""
+    direct_rates = _statement_series(income_statement, "effective_tax_rate")
+    for value in direct_rates.sort_index(ascending=False):
+        rate = _optional_float(value)
+        if rate is not None and 0 <= rate <= 1:
+            return rate
+    pretax = _statement_series(income_statement, "pretax_income")
+    tax = _statement_series(income_statement, "tax_provision")
+    frame = pd.concat({"pretax": pretax, "tax": tax}, axis=1).sort_index(
+        ascending=False
+    )
+    for _, row in frame.iterrows():
+        if pd.notna(row["pretax"]) and row["pretax"] > 0 and pd.notna(row["tax"]):
+            rate = float(row["tax"] / row["pretax"])
+            if np.isfinite(rate) and 0 <= rate <= 1:
+                return rate
+    return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_damodaran_industry_beta_references(
+    ticker: str,
+) -> tuple[IndustryBetaReference, ...]:
+    """Load only explicitly mapped US industry rows; never fuzzy-match them."""
+    group = peer_group_for_target(ticker)
+    if group is None:
+        return ()
+    try:
+        response = requests.get(
+            "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/Betas.html",
+            timeout=15,
+        )
+        response.raise_for_status()
+        table = pd.read_html(StringIO(response.text))[0]
+        if not any(
+            _normalize_financial_field(column) == "industryname"
+            for column in table.columns
+        ):
+            table.columns = table.iloc[0]
+            table = table.iloc[1:].copy()
+        columns = {
+            _normalize_financial_field(column): column for column in table.columns
+        }
+        industry_column = columns["industryname"]
+        firms_column = columns["numberoffirms"]
+        beta_column = columns["beta"]
+        de_column = columns["deratio"]
+        unlevered_column = columns["unleveredbeta"]
+        date_match = re.search(
+            r"Date of Analysis.*?(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}",
+            response.text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        source_date = (
+            re.search(r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}", date_match.group(0), re.IGNORECASE).group(0)
+            if date_match else None
+        )
+        references = []
+        for industry, note in group.damodaran_industries:
+            normalized_industry = re.sub(r"\s+", " ", industry).strip()
+            normalized_rows = table[industry_column].astype(str).map(
+                lambda value: re.sub(r"\s+", " ", value).strip()
+            )
+            rows = table[normalized_rows.eq(normalized_industry)]
+            if rows.empty:
+                continue
+            row = rows.iloc[0]
+            references.append(IndustryBetaReference(
+                industry=industry,
+                number_of_firms=int(float(row[firms_column])) if pd.notna(row[firms_column]) else None,
+                levered_beta=_optional_float(row[beta_column]),
+                unlevered_beta=_optional_float(row[unlevered_column]),
+                debt_to_equity=_percent_value(row[de_column]),
+                source_date=source_date,
+                mapping_note=note,
+            ))
+        return tuple(references)
+    except Exception:
+        return ()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_bottom_up_beta_audit_for_issuer(
+    target_ticker: str,
+) -> BottomUpBetaResult | None:
+    """Fetch explicit peer inputs, then delegate all finance math to the pure module."""
+    target_ticker = target_ticker.strip().upper()
+    group = peer_group_for_target(target_ticker)
+    if group is None:
+        return None
+    target = load_company_snapshot(target_ticker)
+    market_prices = yf.Ticker("^GSPC").history(
+        period="5y", interval="1mo", auto_adjust=True
+    )["Close"].dropna()
+    peer_inputs = []
+    for definition in group.peers:
+        snapshot = load_company_snapshot(definition.ticker)
+        try:
+            peer_prices = yf.Ticker(definition.ticker).history(
+                period="5y", interval="1mo", auto_adjust=True
+            )["Close"].dropna()
+        except Exception:
+            peer_prices = pd.Series(dtype=float)
+        estimate = calculate_beta_estimate(
+            definition.ticker,
+            "^GSPC",
+            peer_prices,
+            market_prices,
+            lookback_years=5,
+            frequency="monthly",
+            minimum_observations=24,
+        )
+        peer_inputs.append(PeerBetaInput(
+            ticker=definition.ticker,
+            issuer=definition.issuer,
+            inclusion_rationale=definition.inclusion_rationale,
+            levered_beta=estimate.raw_beta if estimate.available else None,
+            adjusted_beta=estimate.adjusted_beta if estimate.available else None,
+            beta_method="5y_monthly_raw_regression_vs_sp500_adjusted_prices",
+            market_cap=snapshot.market_cap,
+            gross_debt=snapshot.total_debt,
+            tax_rate=_latest_valid_effective_tax_rate(snapshot.annual_income),
+            warnings=estimate.warnings if estimate.available else (estimate.reason,),
+        ))
+
+    canonical_beta, _ = _regression_beta(target_ticker)
+    return build_bottom_up_beta_result(
+        target_ticker=target_ticker,
+        issuer=group.issuer,
+        peer_group_name=group.name,
+        peer_inputs=tuple(peer_inputs),
+        target_market_cap=target.market_cap,
+        target_gross_debt=target.total_debt,
+        target_tax_rate=_latest_valid_effective_tax_rate(target.annual_income),
+        historical_raw_beta=canonical_beta,
+        exclusion_rationales=group.exclusions,
+        industry_references=load_damodaran_industry_beta_references(target_ticker),
+        industry_mapping_ambiguous=True,
+    )
+
+
+def load_bottom_up_beta_audit(ticker: str) -> BottomUpBetaResult | None:
+    """Normalize share classes before cache lookup for issuer-consistent results."""
+    normalized = ticker.strip().upper()
+    issuer_ticker = "GOOGL" if normalized in {"GOOG", "GOOGL"} else normalized
+    return _load_bottom_up_beta_audit_for_issuer(issuer_ticker)
 
 
 # ================= 2. 估值计算引擎 =================
@@ -632,13 +1417,18 @@ def calculate_dcf(historical_fcf: pd.Series,
                   wacc: float,
                   terminal_growth: float,
                   forecast_years: int,
-                  net_debt: float,
-                  shares_outstanding: float) -> dict:
+                  net_debt: float | None,
+                  shares_outstanding: float | None) -> dict:
     """
     计算DCF内在价值。现金流、净债务使用十亿美元，股本使用十亿股。
     返回：字典包含当前价、内在价值、安全边际、投影数据等
     """
-    if len(historical_fcf) == 0 or shares_outstanding <= 0:
+    if (
+        len(historical_fcf) == 0
+        or net_debt is None
+        or shares_outstanding is None
+        or shares_outstanding <= 0
+    ):
         return {"error": "数据不足或股本无效"}
 
     last_fcf = historical_fcf.iloc[-1]
@@ -687,12 +1477,24 @@ def sensitivity_grid(historical_fcf, wacc_range, growth_range, terminal_growth, 
     return grid
 
 
+def _margin_of_safety(intrinsic_value: float,
+                      current_price: float | None) -> float | None:
+    """Return margin of safety only when a real positive market price exists."""
+    if current_price is None or current_price <= 0:
+        return None
+    return (intrinsic_value - current_price) / current_price * 100
+
+
 def render_financial_trends(ticker: str,
                             annual: pd.DataFrame,
-                            quarterly: pd.DataFrame) -> None:
+                            quarterly: pd.DataFrame,
+                            statement_currency: str | None = "USD") -> None:
     """绘制年度/季度财报趋势面板。"""
     st.header("📚 财报趋势")
-    st.caption("损益与现金流金额、留存收益均为十亿美元；股本为十亿股。")
+    currency = statement_currency or "报表原始币种"
+    st.caption(
+        f"损益、现金流和留存收益均以 {currency} 十亿为单位；股本为十亿股。"
+    )
     period = st.radio(
         "报告周期",
         ("季度", "年度"),
@@ -799,6 +1601,195 @@ def render_financial_trends(ticker: str,
         st.dataframe(display.style.format("{:.2f}", na_rep="—"), width="stretch")
 
 
+def render_fundamental_quality(ticker: str,
+                               history: FundamentalHistory | None,
+                               statement_currency: str | None = "USD") -> None:
+    """Render existing fundamental-engine evidence without recalculation."""
+    st.header("🔎 Fundamental Quality 基本面质量")
+    if history is None or history.annual.empty:
+        st.warning(f"{ticker} 基本面质量指标数据不足。")
+        return
+
+    latest_period = pd.Timestamp(history.annual.index[-1])
+    latest = history.annual.iloc[-1]
+    st.caption(
+        f"金额指标以 {statement_currency or '报表原始币种'} 十亿为单位；"
+        "百分比和倍数不受币种显示影响。"
+    )
+
+    def display_value(metric: str, kind: str) -> str:
+        value = latest.get(metric, np.nan)
+        if pd.isna(value):
+            return "数据不足"
+        if kind == "amount":
+            return f"{float(value) / 1_000_000_000:.3f}B"
+        return f"{float(value) * 100:.2f}%"
+
+    st.subheader("最新年度 Latest Annual")
+    st.caption(f"财年截至 {latest_period.date()}")
+    annual_metrics = [
+        ("Revenue", REVENUE, "amount"),
+        ("Revenue Growth", REVENUE_GROWTH, "percent"),
+        ("Gross Margin", GROSS_MARGIN, "percent"),
+        ("Operating Margin", OPERATING_MARGIN, "percent"),
+        ("FCF", FCF, "amount"),
+        ("FCF Margin", FCF_MARGIN, "percent"),
+        ("NOPAT", NOPAT, "amount"),
+        ("ROIC", ROIC, "percent"),
+        ("简化净投资 Simplified Net Investment", NET_INVESTMENT, "amount"),
+        ("简化再投资率 Simplified Reinvestment Rate", REINVESTMENT_RATE, "percent"),
+        ("结构性增长能力 Fundamental Growth Capacity", FUNDAMENTAL_GROWTH_CAPACITY, "percent"),
+    ]
+    for start in range(0, len(annual_metrics), 4):
+        batch = annual_metrics[start:start + 4]
+        columns = st.columns(len(batch))
+        for column, (label, metric, kind) in zip(columns, batch):
+            column.metric(label, display_value(metric, kind))
+
+    st.subheader("DCF 历史锚点")
+    st.caption(
+        "3Y 指标是历史会计锚点，Latest Annual Sales-to-Capital 反映最近年度的"
+        "资本效率；两者都不是增长预测或建议参数。"
+    )
+    anchors = history.dcf_anchors
+    latest_sales_to_capital = anchors.annual_sales_to_capital.get(latest_period)
+
+    def anchor_value(result, kind: str) -> str:
+        if result is None or not result.available or result.value is None:
+            return "数据不足"
+        if kind == "percent":
+            return f"{result.value * 100:.2f}%"
+        return f"{result.value:.2f}x"
+
+    anchor_metrics = [
+        ("Revenue CAGR 3Y", anchors.revenue_cagr.get(3), "percent"),
+        (
+            "Sales-to-Capital 3Y",
+            anchors.normalized_sales_to_capital.get(3),
+            "multiple",
+        ),
+        ("Latest Annual Sales-to-Capital", latest_sales_to_capital, "multiple"),
+    ]
+    anchor_columns = st.columns(len(anchor_metrics))
+    for column, (label, result, kind) in zip(anchor_columns, anchor_metrics):
+        column.metric(label, anchor_value(result, kind))
+
+    observable_results = [
+        ("Latest Annual", latest_sales_to_capital),
+        ("3Y Normalized", anchors.normalized_sales_to_capital.get(3)),
+    ]
+    with st.expander("查看 Sales-to-Capital 计算明细", expanded=False):
+        for label, result in observable_results:
+            st.markdown(f"**{label}**")
+            if result is None or not result.available:
+                reason = result.reason if result is not None else "unavailable"
+                st.write(f"数据不足（{reason}）")
+                continue
+            st.write(
+                f"期间：{result.start_period.date()} → {result.end_period.date()}"
+            )
+            st.write(
+                f"Revenue：{result.start_revenue / 1_000_000_000:.3f}B → "
+                f"{result.end_revenue / 1_000_000_000:.3f}B；"
+                f"ΔRevenue：{result.delta_revenue / 1_000_000_000:.3f}B"
+            )
+            st.write(
+                "Invested Capital："
+                f"{result.start_invested_capital / 1_000_000_000:.3f}B → "
+                f"{result.end_invested_capital / 1_000_000_000:.3f}B；"
+                "ΔInvested Capital："
+                f"{result.delta_invested_capital / 1_000_000_000:.3f}B"
+            )
+            st.write(f"Sales-to-Capital：{result.value:.2f}x")
+    st.caption(
+        "Sales-to-Capital 是历史会计资本效率锚点，不是精确因果指标；全额扣除会计现金，"
+        "且可能受未资本化研发、收购与商誉、回购及营运资本时点影响。"
+    )
+
+    st.subheader("最近十二个月 TTM")
+    ttm_metrics = [
+        ("Revenue", REVENUE, "amount"),
+        ("Gross Margin", GROSS_MARGIN, "percent"),
+        ("Operating Margin", OPERATING_MARGIN, "percent"),
+        ("FCF", FCF, "amount"),
+        ("FCF Margin", FCF_MARGIN, "percent"),
+    ]
+    ttm_columns = st.columns(len(ttm_metrics))
+    period_groups: dict[tuple[pd.Timestamp, ...], list[str]] = {}
+    for column, (label, metric, kind) in zip(ttm_columns, ttm_metrics):
+        result = history.ttm.get(metric)
+        if result is None or not result.available or result.value is None:
+            formatted = "数据不足"
+        elif kind == "amount":
+            formatted = f"{result.value / 1_000_000_000:.3f}B"
+        else:
+            formatted = f"{result.value * 100:.2f}%"
+        column.metric(label, formatted)
+        if result is not None and result.available and result.periods_used:
+            period_groups.setdefault(result.periods_used, []).append(label)
+
+    if period_groups:
+        with st.expander("查看 TTM 报告期间", expanded=False):
+            for periods, labels in period_groups.items():
+                st.write(
+                    f"{', '.join(labels)}：{periods[0].date()} → "
+                    f"{periods[-1].date()}（{len(periods)} 个季度）"
+                )
+
+    chart_specs = [
+        (REVENUE_GROWTH, "Revenue Growth"),
+        (GROSS_MARGIN, "Gross Margin"),
+        (OPERATING_MARGIN, "Operating Margin"),
+        (FCF_MARGIN, "FCF Margin"),
+        (ROIC, "ROIC"),
+    ]
+    chart_data = []
+    for metric, label in chart_specs:
+        if metric in history.annual:
+            values = history.annual[metric].dropna()
+            if len(values) >= 2:
+                chart_data.append((metric, label, values))
+    if chart_data:
+        st.subheader("年度质量趋势 Annual Quality Trends")
+        rows = (len(chart_data) + 1) // 2
+        figure = make_subplots(
+            rows=rows,
+            cols=2,
+            subplot_titles=[label for _, label, _ in chart_data],
+            vertical_spacing=0.16,
+            horizontal_spacing=0.10,
+        )
+        for index, (_, label, values) in enumerate(chart_data):
+            row, col = divmod(index, 2)
+            figure.add_trace(
+                go.Scatter(
+                    x=values.index,
+                    y=values.values * 100,
+                    mode="lines+markers",
+                    name=label,
+                    line=dict(width=3),
+                ),
+                row=row + 1,
+                col=col + 1,
+            )
+            figure.update_yaxes(title_text="%", row=row + 1, col=col + 1)
+        figure.update_layout(
+            height=max(340, rows * 280),
+            showlegend=False,
+            margin=dict(t=70, b=30),
+        )
+        st.plotly_chart(figure, width="stretch")
+
+    st.caption(
+        "ROIC 为简化会计口径：全额扣除会计现金，未资本化研发，亦未单独估算超额现金；"
+        "资产轻型科技公司的 ROIC 可能显得异常高。"
+    )
+    st.caption(
+        "简化再投资率基于资本开支现金流出减 D&A，尚未包含营运资本变化或收购；"
+        "Fundamental Growth Capacity 是历史结构关系，不是增长预测。"
+    )
+
+
 def render_health_checks(ticker: str, checks: list[dict]) -> None:
     """展示基础财务规则的通过、未通过或数据不足状态。"""
     st.header("🩺 运营体检")
@@ -822,6 +1813,1652 @@ def render_health_checks(ticker: str, checks: list[dict]) -> None:
             st.write(check["detail"])
             st.caption(check["basis"])
 
+
+MULTISTAGE_GENERIC_DEFAULTS = {
+    "year_1_growth": 10.0,
+    "year_2_growth": 8.0,
+    "year_3_growth": 6.0,
+    "forecast_years": 10,
+    "fade_years": 7,
+    "terminal_growth": 3.0,
+    "mature_margin": 20.0,
+    "starting_sales_to_capital": 1.0,
+    "mature_sales_to_capital": 1.0,
+    "tax_rate": 21.0,
+    "wacc": 9.0,
+}
+
+
+def _valid_history_value(history: FundamentalHistory | None,
+                         metric: str,
+                         *,
+                         ttm: bool = False) -> float | None:
+    """Read one existing fundamental metric without calculating a replacement."""
+    if history is None:
+        return None
+    if ttm:
+        result = history.ttm.get(metric)
+        if result is None or not result.available or result.value is None:
+            return None
+        value = float(result.value)
+    else:
+        if history.annual.empty or metric not in history.annual:
+            return None
+        value = history.annual.iloc[-1].get(metric)
+        if pd.isna(value):
+            return None
+        value = float(value)
+    return value if np.isfinite(value) else None
+
+
+def multistage_initial_defaults(ticker: str,
+                                history: FundamentalHistory | None) -> dict:
+    """Return editable initial assumptions; never mutate history or forecasts."""
+    ticker = ticker.strip().upper()
+    values = dict(MULTISTAGE_GENERIC_DEFAULTS)
+    ttm_margin = _valid_history_value(history, OPERATING_MARGIN, ttm=True)
+    if ttm_margin is not None:
+        values["starting_margin"] = ttm_margin * 100
+    else:
+        annual_margin = _valid_history_value(history, OPERATING_MARGIN)
+        values["starting_margin"] = (
+            annual_margin * 100 if annual_margin is not None else 20.0
+        )
+    annual_tax = _valid_history_value(history, OPERATING_TAX_RATE)
+    if annual_tax is not None and 0 <= annual_tax <= 1:
+        values["tax_rate"] = annual_tax * 100
+
+    if ticker == "NVDA":
+        values.update({
+            "year_1_growth": 30.0, "year_2_growth": 25.0,
+            "year_3_growth": 20.0, "forecast_years": 10,
+            "fade_years": 7, "terminal_growth": 3.5,
+            "mature_margin": 40.0, "starting_sales_to_capital": 1.5,
+            "mature_sales_to_capital": 1.2, "tax_rate": 16.0,
+            "wacc": 9.0,
+        })
+    elif ticker in {"GOOG", "GOOGL"}:
+        values.update({
+            "year_1_growth": 15.0, "year_2_growth": 13.0,
+            "year_3_growth": 11.0, "forecast_years": 10,
+            "fade_years": 7, "terminal_growth": 3.5,
+            "mature_margin": 30.0, "starting_sales_to_capital": 0.8,
+            "mature_sales_to_capital": 0.7, "tax_rate": 17.0,
+            "wacc": 8.5,
+        })
+    return values
+
+
+def research_wacc_session_keys(ticker: str) -> dict[str, str]:
+    """Return minimal issuer-level keys for one user-controlled WACC decision."""
+    issuer_key, _ = issuer_normalization_metadata(ticker)
+    prefix = f"research_wacc_{issuer_key}_"
+    return {
+        "value": prefix + "value",
+        "status": prefix + "status",
+        "rationale": prefix + "rationale",
+        "created_at": prefix + "created_at",
+    }
+
+
+def mark_research_wacc_reviewed(
+    state,
+    ticker: str,
+    created_at: str | None = None,
+) -> None:
+    """Mark review only after an explicit widget change or confirmation action."""
+    keys = research_wacc_session_keys(ticker)
+    state[keys["status"]] = "user_reviewed"
+    state[keys["created_at"]] = created_at or pd.Timestamp.now(tz="UTC").isoformat()
+
+
+def initialize_multistage_session_state(state,
+                                        ticker: str,
+                                        history: FundamentalHistory | None) -> dict:
+    """Initialize ticker operating inputs and issuer-level Research WACC state."""
+    normalized_ticker = ticker.strip().upper()
+    defaults = multistage_initial_defaults(normalized_ticker, history)
+    prefix = f"multistage_{normalized_ticker}_"
+    for name, value in defaults.items():
+        if name != "wacc":
+            state.setdefault(prefix + name, value)
+
+    keys = research_wacc_session_keys(normalized_ticker)
+    legacy_wacc_key = prefix + "wacc"
+    if keys["value"] not in state:
+        legacy_value = state.get(legacy_wacc_key, defaults["wacc"])
+        state[keys["value"]] = legacy_value
+        # A non-default legacy value can only have arisen from an earlier edit.
+        legacy_was_edited = (
+            legacy_wacc_key in state
+            and not np.isclose(float(legacy_value), float(defaults["wacc"]))
+        )
+        state[keys["status"]] = (
+            "user_reviewed" if legacy_was_edited else "provisional_default"
+        )
+    else:
+        state.setdefault(keys["status"], "provisional_default")
+    state.setdefault(keys["rationale"], "")
+    state.setdefault(keys["created_at"], None)
+
+    values = {
+        name: state[prefix + name]
+        for name in defaults
+        if name != "wacc"
+    }
+    values["wacc"] = state[keys["value"]]
+    return values
+
+
+def build_multistage_assumptions_from_ui(values: dict) -> MultiStageDCFAssumptions:
+    """Adapt percent-form UI values to the existing pure assumptions model."""
+    return MultiStageDCFAssumptions(
+        forecast_years=int(values["forecast_years"]),
+        near_term_revenue_growth=(
+            values["year_1_growth"] / 100,
+            values["year_2_growth"] / 100,
+            values["year_3_growth"] / 100,
+        ),
+        revenue_fade_years=int(values["fade_years"]),
+        terminal_growth=values["terminal_growth"] / 100,
+        starting_operating_margin=values["starting_margin"] / 100,
+        mature_operating_margin=values["mature_margin"] / 100,
+        starting_sales_to_capital=values["starting_sales_to_capital"],
+        mature_sales_to_capital=values["mature_sales_to_capital"],
+        operating_tax_rate=values["tax_rate"] / 100,
+        wacc=values["wacc"] / 100,
+    )
+
+
+def build_sensitivity_display_frame(
+    sensitivity: WACCTerminalGrowthSensitivity,
+) -> pd.DataFrame:
+    """Build the read-only WACC-row/g-column per-share display matrix."""
+    rows = []
+    for wacc in sensitivity.wacc_values:
+        row = {}
+        for growth in sensitivity.terminal_growth_values:
+            point = sensitivity.point_at(wacc, growth)
+            row[growth] = (
+                point.intrinsic_value_per_share
+                if point is not None and point.valid
+                else np.nan
+            )
+        rows.append(row)
+    return pd.DataFrame(rows, index=sensitivity.wacc_values)
+
+
+def _sensitivity_value_label(value: float | None) -> str:
+    return f"${value:.2f}" if value is not None and np.isfinite(value) else "N/A"
+
+
+def _sensitivity_delta_label(change: float | None) -> str | None:
+    return f"{change:+.1%} vs base" if change is not None else None
+
+
+def render_multistage_sensitivity(
+    run,
+    assumptions: MultiStageDCFAssumptions,
+    sensitivity: WACCTerminalGrowthSensitivity | None = None,
+) -> None:
+    """Render a current-assumption sensitivity grid without independent state."""
+    sensitivity = sensitivity or build_wacc_terminal_growth_sensitivity(
+        run.inputs, assumptions
+    )
+    base = sensitivity.base_case_point
+    st.subheader("WACC × Terminal Growth Sensitivity")
+    st.caption(
+        "每个格点均使用相同公司输入与经营假设，完整重跑多阶段 DCF；"
+        "表中范围只是所示参数网格的敏感性范围，不是概率区间。"
+    )
+    if not run.per_security_valuation_supported:
+        st.warning(
+            _per_security_unavailable_message(
+                run.per_share_unavailable_reason
+            )
+        )
+
+    frame = build_sensitivity_display_frame(sensitivity)
+    row_labels = {value: f"{value:.1%}" for value in frame.index}
+    column_labels = {value: f"{value:.1%}" for value in frame.columns}
+    display_frame = frame.rename(index=row_labels, columns=column_labels)
+    base_row = row_labels[sensitivity.base_wacc]
+    base_column = column_labels[sensitivity.base_terminal_growth]
+    styles = pd.DataFrame("", index=display_frame.index, columns=display_frame.columns)
+    styles.loc[base_row, base_column] = "background-color: #fff3b0; font-weight: bold"
+    styled = display_frame.style.apply(lambda _: styles, axis=None).format(
+        "${:.2f}", na_rep="N/A"
+    )
+    st.dataframe(styled, width="stretch")
+    st.caption(
+        f"Base case：WACC {sensitivity.base_wacc:.1%} · Terminal Growth "
+        f"{sensitivity.base_terminal_growth:.1%} · Intrinsic Value "
+        f"{_sensitivity_value_label(base.intrinsic_value_per_share)}"
+    )
+
+    coordinates = (
+        ("Base Value", sensitivity.base_wacc, sensitivity.base_terminal_growth),
+        ("WACC -50bp", sensitivity.base_wacc - 0.005, sensitivity.base_terminal_growth),
+        ("WACC +50bp", sensitivity.base_wacc + 0.005, sensitivity.base_terminal_growth),
+        ("Terminal g -50bp", sensitivity.base_wacc, sensitivity.base_terminal_growth - 0.005),
+        ("Terminal g +50bp", sensitivity.base_wacc, sensitivity.base_terminal_growth + 0.005),
+    )
+    summary_columns = st.columns(5)
+    for column, (label, wacc, growth) in zip(summary_columns, coordinates):
+        impact = sensitivity.impact_at(wacc, growth)
+        point = impact.point
+        value = point.intrinsic_value_per_share if point and point.valid else None
+        column.metric(
+            label,
+            _sensitivity_value_label(value),
+            _sensitivity_delta_label(impact.percentage_change),
+        )
+
+    range_columns = st.columns(3)
+    range_columns[0].metric("Minimum Valid Value", _sensitivity_value_label(sensitivity.min_value_per_share))
+    range_columns[1].metric("Base Value", _sensitivity_value_label(base.intrinsic_value_per_share))
+    range_columns[2].metric("Maximum Valid Value", _sensitivity_value_label(sensitivity.max_value_per_share))
+    st.caption("Sensitivity range under displayed WACC / terminal-growth grid.")
+
+    st.markdown("**Terminal Value / Enterprise Value context**")
+    tv_columns = st.columns(5)
+    for column, (label, wacc, growth) in zip(tv_columns, coordinates):
+        point = sensitivity.point_at(wacc, growth)
+        tv_share = point.terminal_value_share if point and point.valid else None
+        column.metric(label, _diagnostic_display(tv_share))
+
+    if sensitivity.invalid_point_count:
+        st.caption(
+            f"{sensitivity.invalid_point_count} grid cells are N/A because existing "
+            "assumption validation rejected those combinations."
+        )
+        with st.expander("Unavailable sensitivity cells", expanded=False):
+            for point in sensitivity.points:
+                if not point.valid:
+                    st.write(
+                        f"WACC {point.wacc:.2%} · g {point.terminal_growth:.2%}："
+                        f"{point.reason}"
+                    )
+
+
+def render_beta_robustness(
+    ticker: str,
+    audit: WACCAuditResult,
+    current_dcf_wacc: float,
+) -> BetaRobustnessAudit | None:
+    """Render compact read-only beta diagnostics without beta controls."""
+    try:
+        beta_audit = load_beta_robustness_audit(
+            ticker,
+            audit.risk_free_rate,
+            audit.equity_risk_premium,
+            audit.after_tax_cost_of_debt,
+            audit.equity_weight,
+            audit.debt_weight,
+            current_dcf_wacc,
+        )
+    except (TypeError, ValueError) as exc:
+        st.caption(f"Beta robustness unavailable：{exc}")
+        return None
+
+    with st.expander("Beta Robustness", expanded=False):
+        rows = []
+        for estimate in beta_audit.estimates:
+            rows.append({
+                "Window": f"{estimate.lookback_years}Y",
+                "Frequency": estimate.frequency.title(),
+                "Raw Beta": estimate.raw_beta,
+                "Adjusted Beta": estimate.adjusted_beta,
+                "R²": estimate.r_squared,
+                "Correlation": estimate.correlation,
+                "Observations": estimate.observation_count,
+                "95% CI Low": estimate.confidence_interval_low,
+                "95% CI High": estimate.confidence_interval_high,
+                "Raw-beta WACC": estimate.implied_wacc_raw,
+            })
+        frame = pd.DataFrame(rows).set_index(["Window", "Frequency"])
+        st.dataframe(
+            frame.style.format({
+                "Raw Beta": "{:.3f}",
+                "Adjusted Beta": "{:.3f}",
+                "R²": "{:.3f}",
+                "Correlation": "{:.3f}",
+                "95% CI Low": "{:.3f}",
+                "95% CI High": "{:.3f}",
+                "Raw-beta WACC": "{:.2%}",
+            }, na_rep="N/A"),
+            width="stretch",
+        )
+        production = beta_audit.production_estimate
+        st.caption(
+            f"Production method reproduction：{production.raw_beta:.6f} · "
+            f"current production beta：{audit.beta:.6f} · "
+            f"difference：{production.raw_beta - audit.beta:+.6f}"
+        )
+        summary_columns = st.columns(5)
+        summary_columns[0].metric(
+            "Minimum Raw Beta", _sensitivity_value_label(beta_audit.minimum_raw_beta).replace("$", "")
+        )
+        summary_columns[1].metric(
+            "Median Raw Beta", _sensitivity_value_label(beta_audit.median_raw_beta).replace("$", "")
+        )
+        summary_columns[2].metric(
+            "Maximum Raw Beta", _sensitivity_value_label(beta_audit.maximum_raw_beta).replace("$", "")
+        )
+        summary_columns[3].metric(
+            "Current DCF WACC implied beta",
+            _sensitivity_value_label(
+                beta_audit.implied_beta_for_current_dcf_wacc
+            ).replace("$", ""),
+        )
+        summary_columns[4].metric("Classification", beta_audit.classification)
+        rolling = beta_audit.rolling_beta
+        if rolling.points:
+            rolling_frame = pd.DataFrame(
+                {
+                    "Period": [point.period_end for point in rolling.points],
+                    "36M Rolling Raw Beta": [point.raw_beta for point in rolling.points],
+                }
+            ).set_index("Period")
+            st.line_chart(rolling_frame)
+            st.caption(
+                f"36M rolling beta · latest {rolling.latest:.3f} · "
+                f"median {rolling.median:.3f} · min {rolling.minimum:.3f} · "
+                f"max {rolling.maximum:.3f} · std {rolling.standard_deviation:.3f}"
+            )
+        alternative = beta_audit.alternative_benchmark_estimate
+        if alternative is not None and alternative.available:
+            st.caption(
+                f"Benchmark check：5Y Monthly vs VTI raw beta "
+                f"{alternative.raw_beta:.3f} (R² {alternative.r_squared:.3f})."
+            )
+        if beta_audit.flags:
+            st.caption("Objective flags：" + "；".join(beta_audit.flags))
+        st.caption(
+            "Adjusted beta = 2/3 × raw beta + 1/3 × 1. It is a diagnostic "
+            "shrinkage assumption and does not replace the production beta."
+        )
+    return beta_audit
+
+
+def render_bottom_up_beta(
+    ticker: str,
+    wacc_audit: WACCAuditResult,
+    assumptions: MultiStageDCFAssumptions,
+    run,
+    historical_audit: BetaRobustnessAudit | None,
+) -> BottomUpBetaResult | None:
+    """Render peer-derived beta evidence without changing any input state."""
+    if historical_audit is None or not historical_audit.production_estimate.available:
+        return None
+    try:
+        bottom_up = load_bottom_up_beta_audit(ticker)
+    except Exception as exc:
+        st.caption(f"Bottom-up beta unavailable: {exc}")
+        return None
+    if bottom_up is None:
+        return None
+    production = historical_audit.production_estimate
+    context = BetaWACCContext(
+        risk_free_rate=wacc_audit.risk_free_rate,
+        equity_risk_premium=wacc_audit.equity_risk_premium,
+        after_tax_cost_of_debt=wacc_audit.after_tax_cost_of_debt,
+        equity_weight=wacc_audit.equity_weight,
+        debt_weight=wacc_audit.debt_weight,
+    )
+    comparison = build_beta_evidence_comparison(
+        inputs=run.inputs,
+        base_assumptions=assumptions,
+        wacc_context=context,
+        historical_raw_beta=production.raw_beta,
+        historical_adjusted_beta=production.adjusted_beta,
+        bottom_up_result=bottom_up,
+    )
+
+    with st.expander("Bottom-Up Beta", expanded=False):
+        st.caption(
+            "Independent evidence for a future Research WACC decision. It does not "
+            "change production beta, Formula-Based WACC, or the provisional DCF default."
+        )
+        st.markdown(f"**{bottom_up.peer_group_name}**")
+        peer_rows = []
+        for peer in bottom_up.peer_observations:
+            peer_rows.append({
+                "Peer": peer.ticker,
+                "Levered Beta": peer.levered_beta,
+                "Adjusted Beta": peer.adjusted_beta,
+                "Debt / Equity": peer.debt_to_equity,
+                "Tax": peer.tax_rate,
+                "Unlevered Beta": peer.unlevered_beta,
+                "Adjusted Unlevered": peer.adjusted_unlevered_beta,
+                "Status": "valid" if peer.valid else peer.reason,
+            })
+        st.dataframe(
+            pd.DataFrame(peer_rows).set_index("Peer").style.format({
+                "Levered Beta": "{:.3f}", "Adjusted Beta": "{:.3f}",
+                "Debt / Equity": "{:.2%}", "Tax": "{:.2%}",
+                "Unlevered Beta": "{:.3f}", "Adjusted Unlevered": "{:.3f}",
+            }, na_rep="N/A"),
+            width="stretch",
+        )
+        for peer in bottom_up.peer_observations:
+            st.caption(f"{peer.ticker}: {peer.inclusion_rationale}")
+        if bottom_up.exclusion_rationales:
+            st.caption(
+                "Explicit exclusions: " + " | ".join(
+                    f"{symbol}: {reason}"
+                    for symbol, reason in bottom_up.exclusion_rationales
+                )
+            )
+
+        distribution = bottom_up.raw_unlevered_distribution
+        summary_columns = st.columns(5)
+        summary_columns[0].metric("Valid Peers", str(bottom_up.valid_peer_count))
+        summary_columns[1].metric("Peer Median Unlevered", f"{distribution.median:.3f}" if distribution.median is not None else "N/A")
+        summary_columns[2].metric("Peer Mean Unlevered", f"{distribution.mean:.3f}" if distribution.mean is not None else "N/A")
+        summary_columns[3].metric("Target Relevered Median", f"{bottom_up.relevered_beta_median:.3f}" if bottom_up.relevered_beta_median is not None else "N/A")
+        summary_columns[4].metric("Target Relevered Mean", f"{bottom_up.relevered_beta_mean:.3f}" if bottom_up.relevered_beta_mean is not None else "N/A")
+        if distribution.minimum is not None:
+            st.caption(
+                f"Raw peer unlevered distribution: min {distribution.minimum:.3f} · "
+                f"max {distribution.maximum:.3f} · median {distribution.median:.3f} · "
+                f"mean {distribution.mean:.3f} · std {distribution.standard_deviation:.3f}. "
+                f"Target D/E {bottom_up.target_debt_to_equity:.2%}; relevering changes "
+                f"median by {bottom_up.relevered_beta_median - distribution.median:+.3f}."
+            )
+        loo = bottom_up.raw_leave_one_out
+        if loo.median_minimum is not None:
+            st.caption(
+                f"Leave-one-out target beta: median-based {loo.median_minimum:.3f}–"
+                f"{loo.median_maximum:.3f}; mean-based {loo.mean_minimum:.3f}–"
+                f"{loo.mean_maximum:.3f}."
+            )
+        adjusted = bottom_up.adjusted_unlevered_distribution
+        if adjusted.median is not None:
+            st.caption(
+                f"Secondary adjusted-peer framework: unlevered median {adjusted.median:.3f}, "
+                f"mean {adjusted.mean:.3f}; target relevered median "
+                f"{bottom_up.adjusted_relevered_beta_median:.3f}, mean "
+                f"{bottom_up.adjusted_relevered_beta_mean:.3f}."
+            )
+
+        evidence_rows = []
+        for point in comparison.points:
+            beta_label = f"{point.beta:.3f}" if point.beta is not None else "N/A"
+            if point.evidence_method == "Provisional DCF Default" and point.beta is not None:
+                beta_label = f"implied {point.beta:.3f}"
+            evidence_rows.append({
+                "Evidence Method": point.evidence_method,
+                "Beta": beta_label,
+                "Formula-Based WACC": point.formula_based_wacc,
+                "DCF Value": point.intrinsic_value_per_share,
+            })
+        evidence_frame = pd.DataFrame(evidence_rows).set_index("Evidence Method")
+        st.markdown("**Evidence reconciliation**")
+        st.dataframe(
+            evidence_frame.style.format({
+                "Formula-Based WACC": "{:.2%}", "DCF Value": "${:.2f}",
+            }, na_rep="N/A"),
+            width="stretch",
+        )
+        st.caption(
+            f"Historical raw beta tested range: {historical_audit.minimum_raw_beta:.3f}–"
+            f"{historical_audit.maximum_raw_beta:.3f}. The first table row is not a beta "
+            "method; it shows the beta mathematically implied by the Provisional DCF Default WACC."
+        )
+        if bottom_up.industry_references:
+            industry_rows = [{
+                "Industry": reference.industry,
+                "Firms": reference.number_of_firms,
+                "Levered Beta": reference.levered_beta,
+                "Unlevered Beta": reference.unlevered_beta,
+                "Debt / Equity": reference.debt_to_equity,
+                "Source Date": reference.source_date,
+                "Mapping Note": reference.mapping_note,
+            } for reference in bottom_up.industry_references]
+            st.markdown("**Damodaran industry references (independent, not selected)**")
+            st.dataframe(
+                pd.DataFrame(industry_rows).set_index("Industry").style.format({
+                    "Levered Beta": "{:.3f}", "Unlevered Beta": "{:.3f}",
+                    "Debt / Equity": "{:.2%}",
+                }, na_rep="N/A"),
+                width="stretch",
+            )
+        if bottom_up.warnings:
+            st.caption("Objective warnings: " + "；".join(bottom_up.warnings))
+        st.caption(f"Peer-evidence robustness: {bottom_up.classification}")
+        st.caption(
+            "Formula-Based WACC is the current formula with only beta changed. "
+            "No beta method is automatically selected for Research WACC."
+        )
+    return bottom_up
+
+
+def render_research_wacc_decision(
+    ticker: str,
+    wacc_audit: WACCAuditResult,
+    historical_audit: BetaRobustnessAudit | None,
+    bottom_up: BottomUpBetaResult | None,
+    assumptions: MultiStageDCFAssumptions,
+    provisional_default_wacc: float,
+    sensitivity: WACCTerminalGrowthSensitivity,
+) -> ResearchWACCDecision | None:
+    """Show the user's single WACC assumption against refreshed evidence."""
+    if (
+        historical_audit is None
+        or not historical_audit.production_estimate.available
+    ):
+        return None
+    keys = research_wacc_session_keys(ticker)
+    production = historical_audit.production_estimate
+    context = BetaWACCContext(
+        risk_free_rate=wacc_audit.risk_free_rate,
+        equity_risk_premium=wacc_audit.equity_risk_premium,
+        after_tax_cost_of_debt=wacc_audit.after_tax_cost_of_debt,
+        equity_weight=wacc_audit.equity_weight,
+        debt_weight=wacc_audit.debt_weight,
+    )
+    try:
+        decision = build_research_wacc_decision(
+            ticker=ticker,
+            wacc_status=st.session_state[keys["status"]],
+            research_wacc=assumptions.wacc,
+            formula_based_wacc=wacc_audit.calculated_wacc,
+            provisional_default_wacc=provisional_default_wacc,
+            wacc_context=context,
+            cost_of_equity_reference=wacc_audit.cost_of_equity,
+            historical_raw_beta=production.raw_beta,
+            historical_adjusted_beta=production.adjusted_beta,
+            bottom_up_result=bottom_up,
+            rationale=st.session_state[keys["rationale"]],
+            created_at=st.session_state[keys["created_at"]],
+        )
+    except (TypeError, ValueError) as exc:
+        st.caption(f"Research WACC evidence unavailable: {exc}")
+        return None
+
+    with st.expander("Research WACC Evidence & Decision", expanded=True):
+        status_label = (
+            "Provisional default"
+            if decision.wacc_status == "provisional_default"
+            else "User-reviewed Research WACC"
+        )
+        summary = st.columns(5)
+        summary[0].metric("Research WACC", f"{decision.research_wacc:.2%}")
+        summary[1].metric("Status", status_label)
+        summary[2].metric("Formula-Based WACC", f"{decision.formula_based_wacc:.2%}")
+        summary[3].metric(
+            "Research minus Formula-Based",
+            f"{decision.research_minus_formula_wacc * 100:+.2f} pp",
+        )
+        summary[4].metric(
+            "Research WACC implied beta",
+            f"{decision.research_wacc_implied_beta:.3f}"
+            if decision.research_wacc_implied_beta is not None else "N/A",
+        )
+        st.caption(
+            "The implied beta is a mechanical diagnostic; it is not a separate "
+            "user-selected beta assumption."
+        )
+
+        evidence_rows = [{
+            "Evidence Method": item.method,
+            "Beta": item.beta,
+            "Formula-Based WACC": item.formula_based_wacc,
+        } for item in decision.evidence_methods]
+        st.dataframe(
+            pd.DataFrame(evidence_rows).set_index("Evidence Method").style.format({
+                "Beta": "{:.3f}", "Formula-Based WACC": "{:.2%}",
+            }),
+            width="stretch",
+        )
+        st.caption(
+            f"Observed WACC evidence range: {decision.observed_wacc_minimum:.2%}–"
+            f"{decision.observed_wacc_maximum:.2%}. This is the descriptive span "
+            "of displayed mechanical evidence methods."
+        )
+        bottom_median_label = (
+            f"{decision.bottom_up_beta_median:.3f}"
+            if decision.bottom_up_beta_median is not None else "N/A"
+        )
+        bottom_mean_label = (
+            f"{decision.bottom_up_beta_mean:.3f}"
+            if decision.bottom_up_beta_mean is not None else "N/A"
+        )
+        st.caption(
+            f"Historical raw beta {decision.historical_raw_beta:.3f} · "
+            f"Historical adjusted beta {decision.historical_adjusted_beta:.3f} · "
+            f"Bottom-up median {bottom_median_label} · "
+            f"Bottom-up mean {bottom_mean_label} · "
+            f"Risk-free {decision.risk_free_rate:.2%} · ERP "
+            f"{decision.equity_risk_premium:.2%}"
+        )
+
+        st.markdown("**Research WACC ±50bp valuation context**")
+        valuation_columns = st.columns(3)
+        for column, label, wacc_value in (
+            (valuation_columns[0], "Research WACC -50bp", assumptions.wacc - 0.005),
+            (valuation_columns[1], "Research WACC base", assumptions.wacc),
+            (valuation_columns[2], "Research WACC +50bp", assumptions.wacc + 0.005),
+        ):
+            point = sensitivity.point_at(wacc_value, assumptions.terminal_growth)
+            value = (
+                point.intrinsic_value_per_share
+                if point is not None and point.valid else None
+            )
+            column.metric(label, _sensitivity_value_label(value))
+
+        beta_end = production.end_date.date() if production.end_date is not None else "N/A"
+        st.caption(
+            f"Evidence dates · Risk-free: {wacc_audit.risk_free_period or 'N/A'} · "
+            f"ERP: {wacc_audit.erp_source} / {wacc_audit.erp_period or 'N/A'} · "
+            f"Beta market data end: {beta_end} · Tax period: "
+            f"{wacc_audit.tax_period or 'N/A'} · Debt period: "
+            f"{wacc_audit.debt_period or 'N/A'}"
+        )
+        if decision.rationale:
+            st.markdown("**User-authored rationale**")
+            st.write(decision.rationale)
+        else:
+            st.caption("User-authored rationale: not provided.")
+        if decision.created_at:
+            st.caption(f"Review recorded: {decision.created_at}")
+        if decision.warnings:
+            st.info("Informational flags: " + "；".join(decision.warnings))
+    return decision
+
+
+def _diagnostic_display(value: float | None,
+                        kind: str = "percent",
+                        currency: str | None = "USD") -> str:
+    if value is None or not np.isfinite(value):
+        return "数据不足"
+    if kind == "amount":
+        amount = value / 1_000_000_000
+        return (
+            f"${amount:.3f}B"
+            if currency == "USD"
+            else f"{currency or 'Statement currency'} {amount:.3f}B"
+        )
+    if kind == "multiple":
+        return f"{value:.2f}x"
+    return f"{value * 100:.2f}%"
+
+
+def _per_security_unavailable_message(reason: str | None) -> str:
+    if reason == FOREIGN_LISTING_NORMALIZATION_UNSUPPORTED:
+        return (
+            "Per-security DCF valuation unavailable: foreign-listing currency / "
+            "ADR normalization is not supported in Phase 2."
+        )
+    if reason == "valuation_currency_metadata_unavailable":
+        return (
+            "Per-security DCF valuation unavailable: statement/security currency "
+            "metadata is incomplete."
+        )
+    return f"Per-security DCF valuation unavailable: {reason or 'unknown_reason'}."
+
+
+def build_company_revenue_forecast_anchors(
+    ticker: str,
+    snapshot: CompanySnapshot,
+    history: FundamentalHistory,
+):
+    """Adapt cached snapshot consensus data to source-independent anchors."""
+    ttm_revenue = history.ttm.get(REVENUE)
+    if ttm_revenue is not None and ttm_revenue.available and ttm_revenue.value:
+        current_base = float(ttm_revenue.value)
+        base_period = (
+            ttm_revenue.periods_used[-1] if ttm_revenue.periods_used else None
+        )
+        base_kind = "ttm"
+    else:
+        current_base = _valid_history_value(history, REVENUE)
+        base_period = (
+            pd.Timestamp(history.annual.index[-1])
+            if current_base is not None and not history.annual.empty else None
+        )
+        base_kind = "annual"
+    if current_base is None:
+        return None
+    latest_annual = _valid_history_value(history, REVENUE)
+    latest_annual_period = (
+        pd.Timestamp(history.annual.index[-1])
+        if latest_annual is not None and not history.annual.empty else None
+    )
+    return load_revenue_forecast_anchors(
+        ticker=ticker,
+        current_revenue_base=current_base,
+        base_period=base_period,
+        base_kind=base_kind,
+        latest_actual_fiscal_revenue=latest_annual,
+        latest_actual_fiscal_period=latest_annual_period,
+        provider_data=snapshot.revenue_estimates,
+        provider_as_of=snapshot.revenue_estimates_as_of,
+    )
+
+
+MULTISTAGE_FLAG_LABELS = {
+    "forecast_start_margin_far_from_current": "预测起始利润率与当前 TTM 相差至少 5 个百分点。",
+    "forecast_start_sales_to_capital_far_from_historical": "预测起始 Sales-to-Capital 与历史 3Y 相差至少 25%。",
+    "terminal_roic_above_current_accounting_roic": "终值隐含 ROIC 高于当前会计 ROIC。",
+    "revenue_never_reaches_terminal_growth": "显式预测期内 Revenue Growth 未达到终值增长率。",
+    "final_state_not_mature": "显式预测末年尚未达到成熟 Margin 或 Sales-to-Capital。",
+    "terminal_value_dominates_enterprise_value": "Terminal Value 占 Enterprise Value 超过 80%。",
+}
+
+
+SCENARIO_EDITABLE_FIELDS = (
+    "year_1_growth",
+    "year_2_growth",
+    "year_3_growth",
+    "fade_years",
+    "terminal_growth",
+    "mature_margin",
+    "mature_sales_to_capital",
+    "wacc",
+)
+
+
+def scenario_session_keys(ticker: str, scenario: str) -> dict[str, str]:
+    """Return issuer-level Bear/Bull editor keys without creating Base state."""
+    normalized_scenario = scenario.strip().lower()
+    if normalized_scenario not in {"bear", "bull"}:
+        raise ValueError("scenario must be bear or bull")
+    issuer_key, _ = issuer_normalization_metadata(ticker)
+    prefix = f"scenario_{issuer_key}_{normalized_scenario}_"
+    keys = {field: prefix + field for field in SCENARIO_EDITABLE_FIELDS}
+    keys.update({
+        "status": prefix + "status",
+        "rationale": prefix + "rationale",
+    })
+    return keys
+
+
+def provisional_scenario_values(
+    base: MultiStageDCFAssumptions,
+    scenario: str,
+) -> dict[str, float | int]:
+    """Create transparent mechanical editor defaults, not recommendations.
+
+    Bear subtracts 5 percentage points from explicit growth and mature margin,
+    shortens the fade by two years, reduces terminal growth by 50bp and mature
+    Sales-to-Capital by 0.20x, and adds 100bp to Research WACC. Bull applies
+    the opposite economic offsets, keeps the Base fade horizon, and subtracts
+    50bp from Research WACC. Values are initialization only and are not
+    regenerated after user editing.
+    """
+    if not isinstance(base, MultiStageDCFAssumptions):
+        raise TypeError("base must be MultiStageDCFAssumptions")
+    normalized_scenario = scenario.strip().lower()
+    if normalized_scenario not in {"bear", "bull"}:
+        raise ValueError("scenario must be bear or bull")
+    growth = tuple(rate * 100 for rate in base.near_term_revenue_growth)
+    if len(growth) != 3:
+        raise ValueError("scenario editor currently requires three near-term years")
+    if normalized_scenario == "bear":
+        growth_offset = -5.0
+        fade_years = max(0, base.revenue_fade_years - 2)
+        terminal_offset = -0.5
+        margin_offset = -5.0
+        capital_offset = -0.20
+        wacc_offset = 1.0
+    else:
+        growth_offset = 5.0
+        fade_years = base.revenue_fade_years
+        terminal_offset = 0.5
+        margin_offset = 5.0
+        capital_offset = 0.20
+        wacc_offset = -0.5
+    return {
+        "year_1_growth": growth[0] + growth_offset,
+        "year_2_growth": growth[1] + growth_offset,
+        "year_3_growth": growth[2] + growth_offset,
+        "fade_years": fade_years,
+        "terminal_growth": base.terminal_growth * 100 + terminal_offset,
+        "mature_margin": base.mature_operating_margin * 100 + margin_offset,
+        "mature_sales_to_capital": (
+            base.mature_sales_to_capital + capital_offset
+        ),
+        "wacc": base.wacc * 100 + wacc_offset,
+    }
+
+
+def initialize_scenario_session_state(
+    state,
+    ticker: str,
+    base: MultiStageDCFAssumptions,
+) -> None:
+    """Initialize issuer-level scenarios once and preserve later user edits."""
+    for scenario in ("bear", "bull"):
+        keys = scenario_session_keys(ticker, scenario)
+        defaults = provisional_scenario_values(base, scenario)
+        for field, value in defaults.items():
+            state.setdefault(keys[field], value)
+        state.setdefault(keys["status"], "provisional")
+        state.setdefault(keys["rationale"], "")
+
+
+def mark_scenario_edited(state, ticker: str, scenario: str) -> None:
+    """Record only that the user edited a scenario; this is not approval."""
+    state[scenario_session_keys(ticker, scenario)["status"]] = "user_edited"
+
+
+def reset_scenario_session_state(
+    state,
+    ticker: str,
+    base: MultiStageDCFAssumptions,
+) -> None:
+    """Reset Bear/Bull inputs only; preserve Base, main WACC, and rationales."""
+    for scenario in ("bear", "bull"):
+        keys = scenario_session_keys(ticker, scenario)
+        rationale = state.get(keys["rationale"], "")
+        for field, value in provisional_scenario_values(base, scenario).items():
+            state[keys[field]] = value
+        state[keys["status"]] = "provisional"
+        state[keys["rationale"]] = rationale
+
+
+def scenario_case_from_state(
+    state,
+    ticker: str,
+    scenario: str,
+    base: MultiStageDCFAssumptions,
+):
+    """Resolve UI-unit scenario state into one complete validated case."""
+    keys = scenario_session_keys(ticker, scenario)
+    return create_scenario_from_base(
+        scenario,
+        base,
+        rationale=state.get(keys["rationale"], ""),
+        near_term_revenue_growth=(
+            float(state[keys["year_1_growth"]]) / 100,
+            float(state[keys["year_2_growth"]]) / 100,
+            float(state[keys["year_3_growth"]]) / 100,
+        ),
+        revenue_fade_years=int(state[keys["fade_years"]]),
+        terminal_growth=float(state[keys["terminal_growth"]]) / 100,
+        mature_operating_margin=float(state[keys["mature_margin"]]) / 100,
+        mature_sales_to_capital=float(
+            state[keys["mature_sales_to_capital"]]
+        ),
+        research_wacc=float(state[keys["wacc"]]) / 100,
+    )
+
+
+def build_scenario_summary_frame(
+    result: MultiScenarioDCFResult,
+) -> pd.DataFrame:
+    """Build numeric Bear/Base/Bull summary data without presentation logic."""
+    rows = {}
+    for scenario in result.scenarios:
+        metrics = scenario.metrics
+        delta = scenario.delta_vs_base
+        rows[scenario.name.title()] = {
+            "Intrinsic Value / Share": (
+                metrics.intrinsic_value_per_share if metrics else np.nan
+            ),
+            "Enterprise Value (B)": (
+                metrics.enterprise_value / 1e9 if metrics else np.nan
+            ),
+            "Equity Value (B)": (
+                metrics.equity_value / 1e9 if metrics else np.nan
+            ),
+            "Terminal Value / EV": (
+                metrics.terminal_value_share if metrics else np.nan
+            ),
+            "Research WACC": metrics.research_wacc if metrics else np.nan,
+            "Terminal Growth": metrics.terminal_growth if metrics else np.nan,
+            "Value Delta vs Base ($)": (
+                delta.intrinsic_value_difference if delta else np.nan
+            ),
+            "Value Delta vs Base (%)": (
+                delta.intrinsic_value_percentage_difference if delta else np.nan
+            ),
+        }
+    return pd.DataFrame(rows)
+
+
+def build_scenario_economic_frame(
+    result: MultiScenarioDCFResult,
+) -> pd.DataFrame:
+    """Build detailed economic-path comparison data from scenario metrics."""
+    rows = {}
+    for scenario in result.scenarios:
+        metrics = scenario.metrics
+        rows[scenario.name.title()] = {
+            "Y1 Revenue Growth": metrics.year_1_revenue_growth if metrics else np.nan,
+            "Y2 Revenue Growth": metrics.year_2_revenue_growth if metrics else np.nan,
+            "Y3 Revenue Growth": metrics.year_3_revenue_growth if metrics else np.nan,
+            "Revenue Fade Years": metrics.revenue_fade_years if metrics else np.nan,
+            "Year 5 Revenue (B)": (
+                metrics.year_5_revenue / 1e9
+                if metrics and metrics.year_5_revenue is not None else np.nan
+            ),
+            "Final Revenue (B)": (
+                metrics.final_forecast_revenue / 1e9 if metrics else np.nan
+            ),
+            "Final / Starting Revenue": (
+                metrics.final_revenue_to_starting_revenue if metrics else np.nan
+            ),
+            "Year 5 Operating Margin": (
+                metrics.year_5_operating_margin
+                if metrics and metrics.year_5_operating_margin is not None else np.nan
+            ),
+            "Mature Operating Margin": (
+                metrics.mature_operating_margin if metrics else np.nan
+            ),
+            "Year 5 Sales-to-Capital": (
+                metrics.year_5_sales_to_capital
+                if metrics and metrics.year_5_sales_to_capital is not None else np.nan
+            ),
+            "Mature Sales-to-Capital": (
+                metrics.mature_sales_to_capital if metrics else np.nan
+            ),
+            "Terminal ROIC": metrics.terminal_roic if metrics else np.nan,
+            "Year 5 FCFF Margin": (
+                metrics.year_5_fcff_margin
+                if metrics and metrics.year_5_fcff_margin is not None else np.nan
+            ),
+            "Final FCFF Margin": (
+                metrics.final_year_fcff_margin
+                if metrics and metrics.final_year_fcff_margin is not None else np.nan
+            ),
+            "Terminal FCFF / NOPAT": (
+                metrics.terminal_fcff_to_nopat
+                if metrics and metrics.terminal_fcff_to_nopat is not None else np.nan
+            ),
+        }
+    return pd.DataFrame(rows)
+
+
+def _render_scenario_editor(
+    ticker: str,
+    scenario: str,
+    base: MultiStageDCFAssumptions,
+) -> None:
+    label = scenario.title()
+    keys = scenario_session_keys(ticker, scenario)
+    status = st.session_state[keys["status"]]
+    with st.expander(f"{label} Case", expanded=True):
+        st.caption(
+            "Status: Provisional scenario defaults"
+            if status == "provisional"
+            else "Status: User-edited scenario"
+        )
+        revenue_column, economics_column = st.columns(2)
+        callback = mark_scenario_edited
+        callback_args = (st.session_state, ticker, scenario)
+        with revenue_column:
+            st.markdown("**Revenue path**")
+            st.number_input(
+                f"{label} Year 1 Growth (%)", step=0.5,
+                key=keys["year_1_growth"], on_change=callback,
+                args=callback_args,
+            )
+            st.number_input(
+                f"{label} Year 2 Growth (%)", step=0.5,
+                key=keys["year_2_growth"], on_change=callback,
+                args=callback_args,
+            )
+            st.number_input(
+                f"{label} Year 3 Growth (%)", step=0.5,
+                key=keys["year_3_growth"], on_change=callback,
+                args=callback_args,
+            )
+            st.number_input(
+                f"{label} Revenue Fade Years", min_value=0,
+                max_value=max(0, base.forecast_years - base.near_term_years),
+                step=1, key=keys["fade_years"], on_change=callback,
+                args=callback_args,
+            )
+            st.number_input(
+                f"{label} Terminal Growth (%)", step=0.1,
+                key=keys["terminal_growth"], on_change=callback,
+                args=callback_args,
+            )
+        with economics_column:
+            st.markdown("**Mature economics / risk**")
+            st.number_input(
+                f"{label} Mature Operating Margin (%)", step=0.5,
+                key=keys["mature_margin"], on_change=callback,
+                args=callback_args,
+            )
+            st.number_input(
+                f"{label} Mature Sales-to-Capital", step=0.05,
+                key=keys["mature_sales_to_capital"], on_change=callback,
+                args=callback_args,
+            )
+            st.number_input(
+                f"{label} Research WACC (%)", step=0.1,
+                key=keys["wacc"], on_change=callback,
+                args=callback_args,
+            )
+        st.text_area(
+            f"{label} rationale (optional, user-authored)",
+            key=keys["rationale"], max_chars=500,
+            placeholder="Record the economic path represented by this case.",
+            on_change=callback, args=callback_args,
+        )
+
+
+def _scenario_unavailable_message(scenario: ScenarioRunResult) -> str:
+    reason = scenario.reason or "unknown_reason"
+    return f"{scenario.name.title()} Case unavailable: {reason}"
+
+
+def render_scenario_analysis(
+    ticker: str,
+    history: FundamentalHistory,
+    base_assumptions: MultiStageDCFAssumptions,
+    base_run: MultiStageDCFRunResult,
+    statement_currency: str | None = "USD",
+) -> MultiScenarioDCFResult:
+    """Render compact scenario editing and comparison around the pure engine."""
+    initialize_scenario_session_state(
+        st.session_state, ticker, base_assumptions
+    )
+    st.header("Bear / Base / Bull Scenario Analysis")
+    st.caption(
+        "Base is the current Multi-Stage DCF above. Bear and Bull are explicit "
+        "alternative economic paths. Provisional defaults are transparent "
+        "mechanical starting values, not researched or recommended scenarios."
+    )
+    st.caption(
+        "This scenario analysis is separate from the WACC × Terminal Growth "
+        "sensitivity analysis."
+    )
+    st.button(
+        "Reset Bear/Bull to provisional defaults",
+        key=scenario_session_keys(ticker, "bear")["status"] + "_reset_both",
+        on_click=reset_scenario_session_state,
+        args=(st.session_state, ticker, base_assumptions),
+        help="Resets Bear/Bull inputs only; Base, main Research WACC, and rationales are preserved.",
+    )
+    st.info(
+        "Base Case uses the current main DCF assumptions directly: "
+        f"Y1/Y2/Y3 {base_assumptions.near_term_revenue_growth[0]:.1%} / "
+        f"{base_assumptions.near_term_revenue_growth[1]:.1%} / "
+        f"{base_assumptions.near_term_revenue_growth[2]:.1%}, "
+        f"Mature Margin {base_assumptions.mature_operating_margin:.1%}, "
+        f"Mature S/C {base_assumptions.mature_sales_to_capital:.2f}x, "
+        f"Research WACC {base_assumptions.wacc:.2%}."
+    )
+    st.caption(
+        "Inherited current-state inputs for Bear and Bull: "
+        f"Forecast Years {base_assumptions.forecast_years}; "
+        f"Starting Operating Margin {base_assumptions.starting_operating_margin:.2%}; "
+        f"Starting Sales-to-Capital {base_assumptions.starting_sales_to_capital:.2f}x; "
+        f"Operating Tax Rate {base_assumptions.operating_tax_rate:.2%}."
+    )
+
+    bear_column, bull_column = st.columns(2)
+    with bear_column:
+        _render_scenario_editor(ticker, "bear", base_assumptions)
+    with bull_column:
+        _render_scenario_editor(ticker, "bull", base_assumptions)
+
+    bear = scenario_case_from_state(
+        st.session_state, ticker, "bear", base_assumptions
+    )
+    bull = scenario_case_from_state(
+        st.session_state, ticker, "bull", base_assumptions
+    )
+    base = create_scenario_from_base(
+        "base", base_assumptions, rationale="Current main Multi-Stage DCF"
+    )
+    result = run_multi_scenario_dcf(
+        inputs=base_run.inputs,
+        fundamentals=history,
+        bear=bear,
+        base=base,
+        bull=bull,
+    )
+
+    unsupported_reasons = {
+        scenario.reason
+        for scenario in result.scenarios
+        if scenario.reason is not None
+        and scenario.metrics is not None
+        and scenario.metrics.intrinsic_value_per_share is None
+    }
+    if len(unsupported_reasons) == 1:
+        st.warning(_per_security_unavailable_message(unsupported_reasons.pop()))
+
+    for scenario in result.scenarios:
+        if not scenario.available or scenario.metrics is None:
+            st.warning(_scenario_unavailable_message(scenario))
+    if "scenario_value_order_unexpected" in result.warnings:
+        st.info(
+            "Scenario value ordering is unexpected: Bear is above Base or "
+            "Bull is below Base. Review the explicit scenario assumptions."
+        )
+
+    st.subheader("Scenario Comparison")
+    summary = build_scenario_summary_frame(result)
+    summary_display = summary.astype(object)
+    for row_name in summary.index:
+        for column_name in summary.columns:
+            value = summary.loc[row_name, column_name]
+            if pd.isna(value):
+                display = "N/A"
+            elif row_name in {
+                "Terminal Value / EV", "Research WACC", "Terminal Growth",
+                "Value Delta vs Base (%)",
+            }:
+                display = f"{value:.2%}"
+            elif row_name in {
+                "Intrinsic Value / Share", "Value Delta vs Base ($)",
+            }:
+                display = f"${value:,.2f}"
+            else:
+                display = f"{value:,.2f}"
+            summary_display.loc[row_name, column_name] = display
+    st.dataframe(summary_display, width="stretch")
+    st.caption(
+        "Value Delta vs Base compares intrinsic values only; it is not market "
+        "upside/downside or an expected return. Percentage rows are stored as decimals."
+    )
+    st.caption(
+        "Issuer-level Enterprise Value, Equity Value and forecast Revenue are "
+        f"shown in {statement_currency or 'statement-currency'} billions."
+    )
+
+    with st.expander("Economic Path Comparison", expanded=False):
+        economic = build_scenario_economic_frame(result)
+        economic_display = economic.astype(object)
+        percentage_rows = {
+            "Y1 Revenue Growth", "Y2 Revenue Growth", "Y3 Revenue Growth",
+            "Year 5 Operating Margin", "Mature Operating Margin",
+            "Terminal ROIC", "Year 5 FCFF Margin", "Final FCFF Margin",
+            "Terminal FCFF / NOPAT",
+        }
+        multiple_rows = {
+            "Final / Starting Revenue", "Year 5 Sales-to-Capital",
+            "Mature Sales-to-Capital",
+        }
+        for row_name in economic.index:
+            for column_name in economic.columns:
+                value = economic.loc[row_name, column_name]
+                if pd.isna(value):
+                    display = "N/A"
+                elif row_name in percentage_rows:
+                    display = f"{value:.2%}"
+                elif row_name in multiple_rows:
+                    display = f"{value:.2f}x"
+                elif row_name == "Revenue Fade Years":
+                    display = f"{int(value)}"
+                else:
+                    display = f"{value:,.3f}"
+                economic_display.loc[row_name, column_name] = display
+        st.dataframe(economic_display, width="stretch")
+
+    revenue_figure = go.Figure()
+    intrinsic_names = []
+    intrinsic_values = []
+    for scenario in result.scenarios:
+        if scenario.dcf_result is not None:
+            years = [
+                year.year_index
+                for year in scenario.dcf_result.operating_forecast.years
+            ]
+            revenues = [
+                year.revenue / 1e9
+                for year in scenario.dcf_result.operating_forecast.years
+            ]
+            revenue_figure.add_trace(go.Scatter(
+                x=years, y=revenues, mode="lines+markers",
+                name=scenario.name.title(),
+            ))
+        if (
+            scenario.metrics is not None
+            and scenario.metrics.intrinsic_value_per_share is not None
+        ):
+            intrinsic_names.append(scenario.name.title())
+            intrinsic_values.append(scenario.metrics.intrinsic_value_per_share)
+    chart_columns = st.columns(2)
+    with chart_columns[0]:
+        revenue_figure.update_layout(
+            title="Scenario Revenue Paths", xaxis_title="Forecast Year",
+            yaxis_title="Revenue (B)",
+        )
+        st.plotly_chart(revenue_figure, width="stretch")
+    with chart_columns[1]:
+        intrinsic_figure = go.Figure(go.Bar(
+            x=intrinsic_names, y=intrinsic_values,
+        ))
+        intrinsic_figure.update_layout(
+            title="Intrinsic Value / Share by Scenario",
+            yaxis_title="Intrinsic Value / Share",
+        )
+        st.plotly_chart(intrinsic_figure, width="stretch")
+    return result
+
+
+def render_multistage_dcf_panel(ticker: str,
+                                snapshot: CompanySnapshot | None,
+                                history: FundamentalHistory | None,
+                                wacc_audit: WACCAuditResult | None = None) -> None:
+    """Collect assumptions, call pure engines, and render research diagnostics."""
+    st.header("Multi-Stage DCF 多阶段估值")
+    st.caption(
+        "以下均为可编辑的研究起始假设，不是推荐值。模型不会根据历史数据自动修改输入，"
+        "也不会与当前股价比较。"
+    )
+    st.caption(
+        "Phase 2 每证券估值仅支持报表币种与证券币种、发行人股数与证券单位可直接对账的上市标的；"
+        "尚不支持外币 ADR/证券单位转换。"
+    )
+    if snapshot is None or history is None:
+        st.warning("公司快照或基本面历史不可用，暂时无法运行多阶段 DCF。")
+        return
+
+    revenue_anchors = build_company_revenue_forecast_anchors(
+        ticker, snapshot, history
+    )
+
+    initialize_multistage_session_state(st.session_state, ticker, history)
+    prefix = f"multistage_{ticker.strip().upper()}_"
+    research_keys = research_wacc_session_keys(ticker)
+    provisional_default_wacc = multistage_initial_defaults(ticker, history)["wacc"] / 100
+    with st.container(border=True):
+        st.subheader("Assumptions 可编辑假设")
+        revenue_column, margin_column, capital_column, terminal_column = st.columns(4)
+        with revenue_column:
+            st.markdown("**Revenue Growth**")
+            y1 = st.number_input("Year 1 Growth (%)", step=0.5, key=prefix + "year_1_growth")
+            if revenue_anchors is not None:
+                point = revenue_anchors.points[0]
+                st.caption(
+                    f"FY consensus anchor：{_diagnostic_display(point.implied_revenue_growth)}"
+                    if point.available else "FY consensus anchor：数据不足"
+                )
+            y2 = st.number_input("Year 2 Growth (%)", step=0.5, key=prefix + "year_2_growth")
+            if revenue_anchors is not None:
+                point = revenue_anchors.points[1]
+                st.caption(
+                    f"FY consensus anchor：{_diagnostic_display(point.implied_revenue_growth)}"
+                    if point.available else "FY consensus anchor：数据不足"
+                )
+            y3 = st.number_input("Year 3 Growth (%)", step=0.5, key=prefix + "year_3_growth")
+            if revenue_anchors is not None:
+                point = revenue_anchors.points[2]
+                st.caption(
+                    f"FY consensus anchor：{_diagnostic_display(point.implied_revenue_growth)}"
+                    if point.available else "FY consensus anchor：数据不足"
+                )
+            fade_years = st.number_input("Revenue Fade Years", min_value=0, max_value=17, step=1, key=prefix + "fade_years")
+            forecast_years = st.number_input("Forecast Years", min_value=3, max_value=20, step=1, key=prefix + "forecast_years")
+        with margin_column:
+            st.markdown("**Operating Margin**")
+            starting_margin = st.number_input("Starting Margin (%)", step=0.5, key=prefix + "starting_margin")
+            mature_margin = st.number_input("Mature Margin (%)", step=0.5, key=prefix + "mature_margin")
+            st.caption("起始值仅首次从当前 TTM/年度 Margin 初始化。")
+        with capital_column:
+            st.markdown("**Sales-to-Capital**")
+            starting_stc = st.number_input("Starting Sales-to-Capital", step=0.05, key=prefix + "starting_sales_to_capital")
+            mature_stc = st.number_input("Mature Sales-to-Capital", step=0.05, key=prefix + "mature_sales_to_capital")
+        with terminal_column:
+            st.markdown("**Tax / WACC / Terminal**")
+            tax_rate = st.number_input("Operating Tax Rate (%)", min_value=0.0, max_value=100.0, step=0.5, key=prefix + "tax_rate")
+            wacc = st.number_input(
+                "Research WACC (%)",
+                step=0.1,
+                key=research_keys["value"],
+                on_change=mark_research_wacc_reviewed,
+                args=(st.session_state, ticker),
+            )
+            status = st.session_state[research_keys["status"]]
+            st.caption(
+                "Status: Provisional default"
+                if status == "provisional_default"
+                else "Status: User-reviewed Research WACC"
+            )
+            st.button(
+                "Confirm current Research WACC as reviewed",
+                key=research_keys["status"] + "_confirm",
+                on_click=mark_research_wacc_reviewed,
+                args=(st.session_state, ticker),
+            )
+            if wacc_audit is not None and wacc_audit.available:
+                st.caption(
+                    f"Formula-Based WACC {wacc_audit.calculated_wacc:.2%} · "
+                    f"Risk-free {wacc_audit.risk_free_rate:.2%} · "
+                    f"ERP {wacc_audit.equity_risk_premium:.2%}"
+                )
+            terminal_growth = st.number_input("Terminal Growth (%)", step=0.1, key=prefix + "terminal_growth")
+            st.caption("Near-term explicit growth years：固定为 3 年。")
+
+    st.text_area(
+        "Research WACC rationale (optional, user-authored)",
+        key=research_keys["rationale"],
+        max_chars=500,
+        placeholder="Record the business or long-horizon risk judgment behind this WACC.",
+    )
+
+    try:
+        ui_values = {
+            "year_1_growth": y1, "year_2_growth": y2,
+            "year_3_growth": y3, "fade_years": fade_years,
+            "forecast_years": forecast_years,
+            "starting_margin": starting_margin,
+            "mature_margin": mature_margin,
+            "starting_sales_to_capital": starting_stc,
+            "mature_sales_to_capital": mature_stc,
+            "tax_rate": tax_rate, "wacc": wacc,
+            "terminal_growth": terminal_growth,
+        }
+        assumptions = build_multistage_assumptions_from_ui(ui_values)
+        run = run_real_company_multistage_dcf(snapshot, history, assumptions)
+        diagnostics = build_assumption_diagnostics(
+            history, run.inputs, assumptions, run.forecast_path,
+            run.operating_forecast, run.terminal_value, run.enterprise_value,
+        )
+        sensitivity = build_wacc_terminal_growth_sensitivity(
+            run.inputs, assumptions
+        )
+    except (TypeError, ValueError) as exc:
+        st.error(f"假设无法运行：{exc}")
+        return
+
+    st.subheader("Valuation Output 假设对应估值")
+    statement_currency = run.inputs.statement_currency
+    security_currency = run.inputs.security_currency
+    output_columns = st.columns(6)
+    per_share = run.per_share_value
+    output_columns[0].metric(
+        "Intrinsic Value / Share",
+        (
+            f"${per_share.intrinsic_value_per_share:.2f}"
+            if per_share and security_currency == "USD"
+            else (
+                f"{security_currency} {per_share.intrinsic_value_per_share:.2f}"
+                if per_share and security_currency else "N/A"
+            )
+        ),
+    )
+    output_columns[1].metric("Enterprise Value", _diagnostic_display(run.enterprise_value.enterprise_value, "amount", statement_currency))
+    output_columns[2].metric("Equity Value", _diagnostic_display(run.equity_value.equity_value, "amount", statement_currency))
+    output_columns[3].metric("Explicit Forecast PV", _diagnostic_display(run.enterprise_value.explicit_forecast_pv, "amount", statement_currency))
+    output_columns[4].metric("PV Terminal Value", _diagnostic_display(run.enterprise_value.terminal_value_pv, "amount", statement_currency))
+    output_columns[5].metric("Terminal Value / EV", _diagnostic_display(run.enterprise_value.terminal_value_share))
+    shares = run.inputs.normalized_share_count
+    share_period = shares.source_period.date() if shares.source_period is not None else "current metadata"
+    if not run.per_security_valuation_supported:
+        st.warning(
+            _per_security_unavailable_message(run.per_share_unavailable_reason)
+        )
+        if shares.available:
+            st.caption(
+                f"Observed issuer-share denominator："
+                f"{shares.shares_outstanding / 1_000_000_000:.6f}B · "
+                f"{shares.source} · {share_period}; it is not converted to the "
+                "displayed security unit."
+            )
+    elif shares.available:
+        st.caption(
+            f"Per-share denominator：{shares.shares_outstanding / 1_000_000_000:.6f}B shares · "
+            f"{shares.scope} · {shares.source} · {share_period}"
+        )
+        if "multi_class_issuer" in shares.warnings:
+            st.info("使用合并普通股股数；未对不同投票权类别设置溢价或折价。")
+    else:
+        st.warning("合并普通股数不可用；Enterprise Value 与 Equity Value 可用，但不显示每股价值。")
+    st.caption(f"WACC − Terminal Growth：{(assumptions.wacc - assumptions.terminal_growth) * 100:.2f} percentage points")
+
+    if wacc_audit is not None and wacc_audit.available:
+        with st.expander("WACC Calculation Details", expanded=False):
+            st.markdown(
+                f"CAPM：{wacc_audit.risk_free_rate:.2%} + "
+                f"{wacc_audit.beta:.3f} × {wacc_audit.equity_risk_premium:.2%} "
+                f"= **{wacc_audit.cost_of_equity:.2%}**  \n"
+                f"Debt：{wacc_audit.pre_tax_cost_of_debt:.2%} × "
+                f"(1 − {wacc_audit.tax_rate:.2%}) = "
+                f"**{wacc_audit.after_tax_cost_of_debt:.2%}**  \n"
+                f"WACC：{wacc_audit.equity_weight:.2%} × "
+                f"{wacc_audit.cost_of_equity:.2%} + "
+                f"{wacc_audit.debt_weight:.2%} × "
+                f"{wacc_audit.after_tax_cost_of_debt:.2%} = "
+                f"**{wacc_audit.calculated_wacc:.2%}**"
+            )
+            audit_columns = st.columns(3)
+            audit_columns[0].metric(
+                "Formula-Based WACC", f"{wacc_audit.calculated_wacc:.2%}"
+            )
+            audit_columns[1].metric("Provisional DCF Default WACC", f"{assumptions.wacc:.2%}")
+            audit_columns[2].metric(
+                "Provisional minus Formula-Based",
+                f"{(assumptions.wacc - wacc_audit.calculated_wacc) * 100:+.2f} pp",
+            )
+            st.caption(
+                f"Risk-free：{wacc_audit.risk_free_source} · "
+                f"{wacc_audit.risk_free_period or 'N/A'} | "
+                f"Beta：{wacc_audit.beta_source} · "
+                f"{wacc_audit.beta_observations} observations | "
+                f"ERP：{wacc_audit.erp_source} · {wacc_audit.erp_period or 'N/A'}"
+            )
+            st.caption(
+                f"Equity contribution：{wacc_audit.equity_contribution:.2%} · "
+                f"Debt contribution：{wacc_audit.debt_contribution:.2%} · "
+                f"Market cap：{_diagnostic_display(wacc_audit.market_cap, 'amount', security_currency)} · "
+                f"Gross debt：{_diagnostic_display(wacc_audit.debt_value, 'amount', statement_currency)}"
+            )
+            if wacc_audit.fallbacks_used:
+                st.caption("Fallbacks：" + "；".join(wacc_audit.fallbacks_used))
+            else:
+                st.caption("Fallbacks：none")
+        historical_beta_audit = render_beta_robustness(
+            ticker, wacc_audit, assumptions.wacc
+        )
+        bottom_up_audit = render_bottom_up_beta(
+            ticker, wacc_audit, assumptions, run, historical_beta_audit
+        )
+        render_research_wacc_decision(
+            ticker,
+            wacc_audit,
+            historical_beta_audit,
+            bottom_up_audit,
+            assumptions,
+            provisional_default_wacc,
+            sensitivity,
+        )
+
+    render_multistage_sensitivity(run, assumptions, sensitivity)
+
+    path_rows = []
+    for operating, discounted in zip(
+        run.operating_forecast.years, run.discounted_forecast.years
+    ):
+        path_rows.append({
+            "Year": operating.year_index, "Stage": operating.stage,
+            "Revenue Growth": operating.revenue_growth,
+            "Revenue (B)": operating.revenue / 1e9,
+            "Operating Margin": operating.operating_margin,
+            "Operating Income (B)": operating.operating_income / 1e9,
+            "NOPAT (B)": operating.nopat / 1e9,
+            "Sales-to-Capital": operating.sales_to_capital,
+            "Reinvestment (B)": operating.reinvestment / 1e9,
+            "FCFF (B)": operating.fcff / 1e9,
+            "Discount Factor": discounted.discount_factor,
+            "PV FCFF (B)": discounted.present_value_fcff / 1e9,
+        })
+    path_frame = pd.DataFrame(path_rows).set_index("Year")
+    with st.expander("Forecast Path 年度预测表", expanded=True):
+        st.dataframe(
+            path_frame.style.format({
+                "Revenue Growth": "{:.2%}", "Revenue (B)": "{:.3f}",
+                "Operating Margin": "{:.2%}", "Operating Income (B)": "{:.3f}",
+                "NOPAT (B)": "{:.3f}", "Sales-to-Capital": "{:.3f}",
+                "Reinvestment (B)": "{:.3f}", "FCFF (B)": "{:.3f}",
+                "Discount Factor": "{:.4f}", "PV FCFF (B)": "{:.3f}",
+            }),
+            width="stretch",
+        )
+
+    if revenue_anchors is not None:
+        st.subheader("Near-Term Revenue Forecast Anchors")
+        st.caption(
+            "External analyst consensus is evidence only. Current DCF uses a TTM starting base, "
+            "while these estimates are fiscal-year levels; mismatched periods are not forced into a delta."
+        )
+        normalized_estimates = revenue_anchors_to_forward_estimate_set(
+            revenue_anchors, retrieved_at=snapshot.revenue_estimates_as_of
+        )
+        dcf_periods = build_dcf_revenue_forecast_periods(
+            run.inputs.starting_revenue_periods[-1],
+            run.operating_forecast.years,
+        )
+        anchor_rows = []
+        prior_consensus_period = normalized_estimates.latest_actual_fiscal_period
+        for dcf_period, estimate in zip(dcf_periods, normalized_estimates.estimates):
+            alignment = align_dcf_and_consensus_period(
+                dcf_period, estimate, prior_consensus_period,
+            )
+            point = compare_aligned_forward_estimate(
+                dcf_period, estimate, alignment
+            )
+            if estimate.fiscal_period_end is not None:
+                prior_consensus_period = estimate.fiscal_period_end
+            anchor_rows.append({
+                "DCF Year": point.forecast_year_index,
+                "DCF Period": (
+                    f"{alignment.dcf_period_start.date()} → "
+                    f"{alignment.dcf_period_end.date()}"
+                ),
+                "Fiscal Period": (
+                    point.fiscal_period.date() if point.fiscal_period else "N/A"
+                ),
+                "Consensus Revenue (B)": (
+                    point.consensus_revenue / 1e9
+                    if point.consensus_revenue is not None else np.nan
+                ),
+                "Consensus FY Growth": point.consensus_fiscal_growth,
+                "DCF Revenue (B)": point.dcf_revenue / 1e9,
+                "DCF Growth": point.dcf_growth,
+                "Growth Difference (pp)": (
+                    point.assumption_minus_consensus_growth * 100
+                    if point.assumption_minus_consensus_growth is not None
+                    else np.nan
+                ),
+                "Revenue Difference (B)": (
+                    point.dcf_minus_consensus_revenue / 1e9
+                    if point.dcf_minus_consensus_revenue is not None else np.nan
+                ),
+                "Analysts": estimate.analyst_count,
+                "Source": estimate.source,
+                "Provider As-of": (
+                    estimate.source_as_of.date()
+                    if estimate.source_as_of is not None else "N/A"
+                ),
+                "Retrieved At": (
+                    estimate.retrieved_at.date()
+                    if estimate.retrieved_at is not None else "N/A"
+                ),
+                "Overlap": alignment.overlap_fraction,
+                "Alignment": alignment.alignment_status,
+            })
+        anchor_frame = pd.DataFrame(anchor_rows).set_index("DCF Year")
+        st.dataframe(
+            anchor_frame.style.format({
+                "Consensus Revenue (B)": "{:.3f}",
+                "Consensus FY Growth": "{:.2%}",
+                "DCF Revenue (B)": "{:.3f}",
+                "DCF Growth": "{:.2%}",
+                "Growth Difference (pp)": "{:+.2f}",
+                "Revenue Difference (B)": "{:+.3f}",
+                "Overlap": "{:.1%}",
+            }, na_rep="N/A"),
+            width="stretch",
+        )
+        with st.expander("Forecast anchor source details", expanded=False):
+            st.write(f"Issuer anchor ticker：{revenue_anchors.issuer_ticker}")
+            st.write(f"Source：{revenue_anchors.source}")
+            st.write("Statistic：mean analyst consensus Revenue")
+            for point in revenue_anchors.points:
+                period = point.fiscal_period.date() if point.fiscal_period else "N/A"
+                st.write(
+                    f"FY{point.forecast_year_index} · {period} · analysts: "
+                    f"{point.analyst_count if point.analyst_count is not None else 'N/A'} · "
+                    f"status: {'available' if point.available else point.reason}"
+                )
+            as_of = next(
+                (point.source_as_of for point in revenue_anchors.points if point.source_as_of),
+                None,
+            )
+            st.write(f"Retrieved as of：{as_of if as_of is not None else 'N/A'}")
+            if revenue_anchors.warnings:
+                st.write("Warnings：" + ", ".join(revenue_anchors.warnings))
+
+    chart_1, chart_2, chart_3 = st.columns(3)
+    years = [row.year_index for row in run.operating_forecast.years]
+    revenues = [row.revenue / 1e9 for row in run.operating_forecast.years]
+    margins = [row.operating_margin * 100 for row in run.operating_forecast.years]
+    fcff_margins = [row.fcff / row.revenue * 100 for row in run.operating_forecast.years]
+    implied_roic = [row.operating_margin * (1 - assumptions.operating_tax_rate) * row.sales_to_capital * 100 for row in run.operating_forecast.years]
+    stc_path = [row.sales_to_capital for row in run.operating_forecast.years]
+    with chart_1:
+        figure = go.Figure(go.Scatter(x=years, y=revenues, mode="lines+markers"))
+        figure.update_layout(title="Revenue Path", xaxis_title="Year", yaxis_title="B")
+        st.plotly_chart(figure, width="stretch")
+    with chart_2:
+        figure = go.Figure()
+        figure.add_trace(go.Scatter(x=years, y=margins, name="Operating Margin"))
+        figure.add_trace(go.Scatter(x=years, y=fcff_margins, name="FCFF Margin"))
+        figure.update_layout(title="Margin Path", xaxis_title="Year", yaxis_title="%")
+        st.plotly_chart(figure, width="stretch")
+    with chart_3:
+        figure = go.Figure()
+        figure.add_trace(go.Scatter(x=years, y=implied_roic, name="Implied ROIC"))
+        figure.add_trace(go.Scatter(x=years, y=stc_path, name="Sales-to-Capital", yaxis="y2"))
+        figure.update_layout(title="ROIC / Capital Efficiency", xaxis_title="Year", yaxis_title="ROIC %", yaxis2=dict(title="S/C", overlaying="y", side="right"))
+        st.plotly_chart(figure, width="stretch")
+
+    st.subheader("Assumption Diagnostics 假设诊断")
+    revenue_diag, margin_diag, capital_diag = st.columns(3)
+    with revenue_diag:
+        st.markdown("**Revenue**")
+        st.write(f"Historical CAGR 3Y：{_diagnostic_display(diagnostics.revenue.historical_cagr_3y)}")
+        st.write(f"Y1 / Y2 / Y3：{y1:.1f}% / {y2:.1f}% / {y3:.1f}%")
+        st.write(f"Year 5 Revenue：{_diagnostic_display(diagnostics.revenue.year_5_revenue, 'amount', statement_currency)}")
+        st.write(f"Final Revenue：{_diagnostic_display(diagnostics.revenue.final_forecast_revenue, 'amount', statement_currency)}")
+        st.write(f"Revenue Multiple：{_diagnostic_display(diagnostics.revenue.final_to_starting_revenue_multiple, 'multiple')}")
+    with margin_diag:
+        st.markdown("**Margin**")
+        st.write(f"Annual / TTM：{_diagnostic_display(diagnostics.operating_margin.latest_annual_margin)} / {_diagnostic_display(diagnostics.operating_margin.latest_ttm_margin)}")
+        st.write(f"Start / Year 5 / Mature：{_diagnostic_display(diagnostics.operating_margin.starting_forecast_margin)} / {_diagnostic_display(diagnostics.operating_margin.year_5_margin)} / {_diagnostic_display(diagnostics.operating_margin.mature_margin)}")
+    with capital_diag:
+        st.markdown("**Capital Efficiency**")
+        st.write(f"Latest / 3Y：{_diagnostic_display(diagnostics.sales_to_capital.latest_annual, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.historical_normalized_3y, 'multiple')}")
+        st.write(f"Start / Year 5 / Mature：{_diagnostic_display(diagnostics.sales_to_capital.starting_forecast, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.year_5, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.mature, 'multiple')}")
+
+    roic_diag, cash_diag, dependency_diag = st.columns(3)
+    with roic_diag:
+        st.markdown("**ROIC**")
+        st.write(f"Accounting：{_diagnostic_display(diagnostics.roic.current_accounting_roic)}")
+        st.write(f"Year 1 / Year 5 / Terminal：{_diagnostic_display(diagnostics.roic.year_1_implied_operating_roic)} / {_diagnostic_display(diagnostics.roic.year_5_implied_operating_roic)} / {_diagnostic_display(diagnostics.roic.terminal_derived_roic)}")
+    with cash_diag:
+        cash = diagnostics.cash_flow_economics
+        st.markdown("**Cash Flow**")
+        st.write(f"Historical TTM FCF Margin：{_diagnostic_display(cash.historical_fundamental_ttm_fcf_margin)}")
+        st.write(f"FCFF Margin Y1 / Y5 / Final：{_diagnostic_display(cash.year_1.fcff_margin)} / {_diagnostic_display(cash.year_5.fcff_margin if cash.year_5 else None)} / {_diagnostic_display(cash.final_year.fcff_margin)}")
+        st.write(f"FCFF/NOPAT Y1 / Y5 / Final：{_diagnostic_display(cash.year_1.fcff_to_nopat)} / {_diagnostic_display(cash.year_5.fcff_to_nopat if cash.year_5 else None)} / {_diagnostic_display(cash.final_year.fcff_to_nopat)}")
+        st.write(f"Terminal Reinvestment Rate：{_diagnostic_display(cash.terminal_reinvestment_rate)}")
+        st.caption("Historical fundamental FCF Margin 与 forecast FCFF Margin 口径不同。")
+    with dependency_diag:
+        dependency = diagnostics.terminal_dependency
+        st.markdown("**Valuation Dependency**")
+        st.write(f"Explicit PV：{_diagnostic_display(dependency.explicit_forecast_pv, 'amount', statement_currency)}")
+        st.write(f"Terminal PV：{_diagnostic_display(dependency.terminal_value_pv, 'amount', statement_currency)}")
+        st.write(f"Terminal / EV：{_diagnostic_display(dependency.terminal_value_share)}")
+    if diagnostics.flags:
+        st.markdown("**Objective informational flags**")
+        for flag in diagnostics.flags:
+            st.info(MULTISTAGE_FLAG_LABELS.get(flag, flag))
+
+    render_scenario_analysis(
+        ticker, history, assumptions, run, statement_currency
+    )
+
 # ================= 4. Streamlit UI =================
 def main():
     st.set_page_config(page_title="美股基本面分析器", layout="wide")
@@ -834,15 +3471,27 @@ def main():
         ticker = st.text_input("股票代码 Ticker (如 AAPL, MSFT)", "AAPL").strip().upper()
 
         try:
-            current_price, fetched_net_debt, fetched_shares = fetch_market_data(ticker)
-            fcff_data, fcff_source = fetch_fcff_data(ticker)
-            wacc_reference = fetch_wacc_reference(ticker)
-            annual_financials, quarterly_financials, health_checks = fetch_financial_overview(ticker)
+            snapshot = load_company_snapshot(ticker)
+            per_security_support = assess_per_security_valuation_support(
+                ticker=ticker,
+                statement_currency=snapshot.financial_currency,
+                security_currency=snapshot.price_currency,
+            )
+            current_price, fetched_net_debt, fetched_shares = fetch_market_data(ticker, snapshot)
+            fcff_data, fcff_source = fetch_fcff_data(ticker, snapshot)
+            wacc_reference = fetch_wacc_reference(ticker, snapshot)
+            wacc_audit = build_wacc_audit_result(ticker, wacc_reference)
+            annual_financials, quarterly_financials, health_checks = fetch_financial_overview(ticker, snapshot)
+            fundamental_history = build_company_fundamentals(snapshot)
         except Exception as exc:
-            current_price, fetched_net_debt, fetched_shares = 0.0, 0.0, 0.0
+            snapshot = None
+            per_security_support = None
+            current_price, fetched_net_debt, fetched_shares = None, None, None
             fcff_data, fcff_source = pd.Series(dtype=float), "无数据"
             wacc_reference = {"wacc": None, "error": str(exc)}
+            wacc_audit = build_wacc_audit_result(ticker, wacc_reference)
             annual_financials, quarterly_financials, health_checks = pd.DataFrame(), pd.DataFrame(), []
+            fundamental_history = None
             st.warning(f"yfinance 公司数据读取失败: {exc}")
 
         st.subheader("📈 增长假设")
@@ -875,26 +3524,82 @@ def main():
                     f"有效税率 **{wacc_reference['tax_rate']*100:.1f}%** · "
                     f"合成评级 **{wacc_reference['rating']}**"
                 )
+                wacc_assumptions = []
+                if wacc_reference.get("interest_assumption_used"):
+                    wacc_assumptions.append("缺失利息费用按 0")
+                if wacc_reference.get("tax_assumption_used"):
+                    wacc_assumptions.append("缺失/无效税率按 21%")
+                if wacc_reference.get("beta_assumption_used"):
+                    wacc_assumptions.append("缺失 Beta 按 1.0")
+                if wacc_assumptions:
+                    st.caption("显式回退假设：" + "；".join(wacc_assumptions))
         else:
             st.caption(f"WACC 参考暂不可用：{wacc_reference.get('error') or '数据不足'}")
 
         st.subheader("🏦 资产负债表")
+        statement_currency = (
+            snapshot.financial_currency if snapshot is not None else None
+        )
+        net_debt_label = (
+            f"净债务 Net debt ({statement_currency} B)"
+            if statement_currency else "净债务 Net debt (B)"
+        )
+        shares_label = (
+            "发行人普通股 Issuer ordinary shares (B)"
+            if per_security_support is not None
+            and not per_security_support.supported
+            else "总股本 Shares Outstanding (B)"
+        )
         net_debt = st.number_input(
-            "净债务 Net debt (B)",
-            value=float(fetched_net_debt),
+            net_debt_label,
+            value=float(fetched_net_debt) if fetched_net_debt is not None else 0.0,
             step=0.1,
             format="%.3f",
             key=f"net_debt_{ticker}",
         )
         shares = st.number_input(
-            "总股本 Shares Outstanding (B)",
-            value=float(fetched_shares),
+            shares_label,
+            value=float(fetched_shares) if fetched_shares is not None else 0.0,
             step=0.01,
             format="%.3f",
             key=f"shares_{ticker}",
         )
-        if fetched_net_debt or fetched_shares:
+        net_debt_confirmed = fetched_net_debt is not None
+        if fetched_net_debt is None:
+            st.warning("yfinance 缺少净债务数据；请核实输入值后确认，未确认时不会运行估值。")
+            net_debt_confirmed = st.checkbox(
+                "确认使用手动净债务输入",
+                key=f"confirm_net_debt_{ticker}",
+            )
+        if fetched_shares is None:
+            st.warning("yfinance 缺少总股本数据；请输入有效股本后再运行估值。")
+        if fetched_net_debt is not None or fetched_shares is not None:
             st.caption("以上默认值已从 yfinance 自动获取，可手动覆盖。")
+        if per_security_support is not None and not per_security_support.supported:
+            st.warning(
+                _per_security_unavailable_message(per_security_support.reason)
+            )
+
+    st.divider()
+    statement_currency = snapshot.financial_currency if snapshot else None
+    render_financial_trends(
+        ticker, annual_financials, quarterly_financials, statement_currency
+    )
+    st.divider()
+    render_fundamental_quality(
+        ticker, fundamental_history, statement_currency
+    )
+    st.divider()
+    render_multistage_dcf_panel(
+        ticker, snapshot, fundamental_history, wacc_audit
+    )
+    st.divider()
+    st.header("Simple FCFF DCF — Reference")
+    st.caption("保留的简化 FCFF 模型，仅作为独立参考；不作为多阶段 DCF 的校准目标。")
+    if per_security_support is not None and not per_security_support.supported:
+        st.warning(
+            _per_security_unavailable_message(per_security_support.reason)
+        )
 
     # 主界面
     col1, col2 = st.columns([1, 2])
@@ -913,6 +3618,18 @@ def main():
                 st.error("无法自动读取总股本，请在左侧手动填写“总股本 (十亿股)”。")
                 return
 
+            if per_security_support is not None and not per_security_support.supported:
+                st.error(
+                    _per_security_unavailable_message(
+                        per_security_support.reason
+                    )
+                )
+                return
+
+            if not net_debt_confirmed:
+                st.error("净债务数据缺失，请先核实输入值并确认。")
+                return
+
             # 计算
             res = calculate_dcf(
                 fcff_data, growth_rate, wacc, terminal_growth,
@@ -924,11 +3641,17 @@ def main():
                 return
 
             intrinsic = res["intrinsic_value"]
-            margin_safety = (intrinsic - current_price) / current_price * 100 if current_price > 0 else 0
+            margin_safety = _margin_of_safety(intrinsic, current_price)
 
-            st.metric("📉 当前股价 Current Price", f"${current_price:.2f}")
+            current_price_display = (
+                f"${current_price:.2f}" if current_price is not None else "不可用"
+            )
+            margin_display = (
+                f"{margin_safety:+.1f}%" if margin_safety is not None else "不可用"
+            )
+            st.metric("📉 当前股价 Current Price", current_price_display)
             st.metric("🎯 内在价值 Intrinsic Value", f"${intrinsic:.2f}")
-            st.metric("🛡️ 安全边际 Safety Margin", f"{margin_safety:+.1f}%")
+            st.metric("🛡️ 安全边际 Safety Margin", margin_display)
 
             st.markdown(
                 f"**核心假设**：FCFF = ${res['last_fcf']:.2f}B | "
@@ -991,9 +3714,6 @@ def main():
         else:
             st.info("点击左侧「运行估值」查看图表")
 
-    st.divider()
-    render_financial_trends(ticker, annual_financials, quarterly_financials)
-    st.divider()
     render_health_checks(ticker, health_checks)
 
 if __name__ == "__main__":
