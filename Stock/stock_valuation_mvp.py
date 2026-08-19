@@ -45,6 +45,7 @@ from Stock.forecast_anchors import (
 )
 from Stock.multistage_integration import (
     MultiStageDCFRunResult,
+    run_multistage_dcf,
     run_real_company_multistage_dcf,
 )
 from Stock.valuation import MultiStageDCFAssumptions
@@ -84,7 +85,38 @@ from Stock.research_wacc import (
 )
 from Stock.valuation_support import (
     FOREIGN_LISTING_NORMALIZATION_UNSUPPORTED,
-    assess_per_security_valuation_support,
+)
+from Stock.company_profiles import (
+    CompanyProfileLookupResult,
+    ResearchAssumption,
+    ResearchEvidenceItem,
+    build_multistage_assumptions_from_profile,
+    build_provisional_company_profile,
+)
+from Stock.nvda_research import (
+    NVDAResearchProfileResult,
+    build_nvda_research_profile,
+)
+from Stock.alphabet_research import (
+    AlphabetResearchProfileResult,
+    build_alphabet_research_profile,
+)
+from Stock.company_profile_review import (
+    REQUIRED_REVIEW_GROUPS,
+    CompanyProfileReviewState,
+    initialize_profile_review,
+    mark_profile_reviewed,
+    reconcile_review_state,
+    reopen_profile_review,
+    set_overall_review_note,
+    set_review_group,
+)
+from Stock.company_profile_application import (
+    ProfileApplyPlan,
+    ReviewedProfileApplication,
+    assumptions_match,
+    build_profile_apply_plan,
+    create_reviewed_profile_application,
 )
 
 warnings.filterwarnings("ignore")
@@ -1901,6 +1933,81 @@ def research_wacc_session_keys(ticker: str) -> dict[str, str]:
     }
 
 
+def base_profile_application_key(ticker: str) -> str:
+    issuer_key, _ = issuer_normalization_metadata(ticker)
+    return f"reviewed_profile_application_{issuer_key}"
+
+
+def _multistage_base_state_values(
+    assumptions: MultiStageDCFAssumptions,
+) -> dict[str, float | int]:
+    """Translate validated engine units to existing UI/session-state units."""
+    growth = assumptions.near_term_revenue_growth
+    return {
+        "year_1_growth": growth[0] * 100,
+        "year_2_growth": growth[1] * 100,
+        "year_3_growth": growth[2] * 100,
+        "fade_years": assumptions.revenue_fade_years,
+        "forecast_years": assumptions.forecast_years,
+        "terminal_growth": assumptions.terminal_growth * 100,
+        "starting_margin": assumptions.starting_operating_margin * 100,
+        "mature_margin": assumptions.mature_operating_margin * 100,
+        "starting_sales_to_capital": assumptions.starting_sales_to_capital,
+        "mature_sales_to_capital": assumptions.mature_sales_to_capital,
+        "tax_rate": assumptions.operating_tax_rate * 100,
+        "wacc": assumptions.wacc * 100,
+    }
+
+
+def apply_reviewed_profile_to_base_session_state(
+    state,
+    ticker: str,
+    snapshot,
+    current_base: MultiStageDCFAssumptions,
+    *,
+    applied_at: str,
+) -> ReviewedProfileApplication:
+    """Perform the explicit UI-boundary mutation for one complete snapshot."""
+    application_key = base_profile_application_key(ticker)
+    previous = state.get(application_key)
+    if not isinstance(previous, ReviewedProfileApplication):
+        previous = None
+    plan = build_profile_apply_plan(
+        snapshot, current_base, previous_application=previous
+    )
+    application = create_reviewed_profile_application(
+        plan, applied_at=applied_at
+    )
+    normalized_ticker = ticker.strip().upper()
+    prefix = f"multistage_{normalized_ticker}_"
+    values = _multistage_base_state_values(application.assumptions)
+    for name, value in values.items():
+        if name != "wacc":
+            state[prefix + name] = value
+
+    wacc_keys = research_wacc_session_keys(ticker)
+    state[wacc_keys["value"]] = values["wacc"]
+    state[wacc_keys["status"]] = "user_reviewed"
+    state[wacc_keys["created_at"]] = applied_at
+    wacc_review_note = next(
+        (
+            item.user_note.strip()
+            for item in snapshot.group_reviews
+            if item.group == "wacc" and item.user_note.strip()
+        ),
+        "",
+    )
+    if wacc_review_note:
+        state[wacc_keys["rationale"]] = wacc_review_note
+    elif not str(state.get(wacc_keys["rationale"], "")).strip():
+        research_wacc = snapshot.profile.wacc_framework.research_wacc
+        state[wacc_keys["rationale"]] = (
+            research_wacc.rationale if research_wacc is not None else ""
+        )
+    state[application_key] = application
+    return application
+
+
 def mark_research_wacc_reviewed(
     state,
     ticker: str,
@@ -2497,6 +2604,885 @@ def _per_security_unavailable_message(reason: str | None) -> str:
             "metadata is incomplete."
         )
     return f"Per-security DCF valuation unavailable: {reason or 'unknown_reason'}."
+
+
+def _profile_evidence_display(
+    evidence: ResearchEvidenceItem | None,
+    *,
+    kind: str = "percent",
+    currency: str | None = None,
+) -> str:
+    if evidence is None or not evidence.available or not isinstance(
+        evidence.value, (int, float)
+    ):
+        return "数据不足"
+    return _diagnostic_display(float(evidence.value), kind, currency)
+
+
+def _profile_assumption_display(
+    assumption: ResearchAssumption | None,
+    *,
+    kind: str = "percent",
+) -> str:
+    if assumption is None or assumption.value is None:
+        return "数据不足"
+    if kind == "integer":
+        return str(int(assumption.value))
+    return _diagnostic_display(float(assumption.value), kind)
+
+
+NVDA_REVIEW_STATE_KEY = "company_profile_review_NVDA"
+NVDA_REVIEW_GROUP_LABELS = {
+    "revenue": "Revenue",
+    "margin": "Margin",
+    "capital": "Capital Efficiency",
+    "tax": "Tax",
+    "wacc": "WACC",
+    "terminal": "Terminal Economics",
+}
+
+
+def initialize_nvda_review_session_state(
+    session_state,
+    candidate_profile,
+) -> CompanyProfileReviewState:
+    """Persist and reconcile one issuer-level review state across reruns."""
+    existing = session_state.get(NVDA_REVIEW_STATE_KEY)
+    if not isinstance(existing, CompanyProfileReviewState):
+        state = initialize_profile_review(candidate_profile)
+    else:
+        previous = existing
+        state = reconcile_review_state(existing, candidate_profile)
+        for group in REQUIRED_REVIEW_GROUPS:
+            if previous.group(group).reviewed and not state.group(group).reviewed:
+                session_state[f"nvda_review_{group}_checked"] = False
+    session_state[NVDA_REVIEW_STATE_KEY] = state
+    return state
+
+
+def _review_evidence_line(profile, group: str) -> str:
+    evidence = {item.evidence_id: item for item in profile.evidence_items}
+
+    def display(evidence_id: str, kind: str = "percent") -> str:
+        item = evidence.get(evidence_id)
+        if item is None or not item.available:
+            return "N/A"
+        if not isinstance(item.value, (int, float)):
+            return str(item.value)
+        if kind == "amount":
+            return f"{float(item.value) / 1e9:.3f}B"
+        if kind == "multiple":
+            return f"{float(item.value):.2f}x"
+        if kind == "beta":
+            return f"{float(item.value):.3f}"
+        return f"{float(item.value):.2%}"
+
+    if group == "revenue":
+        anchors = profile.revenue_framework.forward_revenue_anchors
+        fy1 = fy2 = "N/A"
+        if anchors is not None:
+            if anchors.points[0].available:
+                fy1 = f"{anchors.points[0].revenue_estimate / 1e9:.3f}B"
+            if anchors.points[1].available:
+                fy2 = f"{anchors.points[1].revenue_estimate / 1e9:.3f}B"
+        return (
+            f"TTM Revenue {display('ttm_revenue', 'amount')} · "
+            f"FY2027/FY2028 consensus {fy1} / {fy2} · "
+            f"Q2 guidance {display('q2_fy27_revenue_guidance', 'amount')} · "
+            f"Candidate {_profile_assumption_display(profile.revenue_framework.year1_growth)} / "
+            f"{_profile_assumption_display(profile.revenue_framework.year2_growth)} / "
+            f"{_profile_assumption_display(profile.revenue_framework.year3_growth)}"
+        )
+    if group == "margin":
+        return (
+            f"TTM Operating Margin {display('ttm_operating_margin')} · "
+            f"latest annual {display('latest_annual_operating_margin')} · "
+            f"Q1 FY2027 {display('q1_fy27_operating_margin')} · "
+            f"Candidate mature {_profile_assumption_display(profile.margin_framework.mature_operating_margin)}"
+        )
+    if group == "capital":
+        return (
+            f"Latest S/C {display('latest_sales_to_capital', 'multiple')} · "
+            f"normalized 3Y {display('sales_to_capital_3y', 'multiple')} · "
+            f"Accounting ROIC {display('accounting_roic')} · "
+            f"Candidate start/mature "
+            f"{_profile_assumption_display(profile.capital_efficiency_framework.starting_sales_to_capital, kind='multiple')} / "
+            f"{_profile_assumption_display(profile.capital_efficiency_framework.mature_sales_to_capital, kind='multiple')}"
+        )
+    if group == "tax":
+        return (
+            f"Latest annual operating tax {display('latest_operating_tax_rate')} · "
+            f"FY2027 guidance midpoint {display('fy27_tax_guidance')} · "
+            f"Candidate {_profile_assumption_display(profile.operating_tax_rate)}"
+        )
+    if group == "wacc":
+        return (
+            f"Formula WACC {display('formula_based_wacc')} · raw/adjusted beta "
+            f"{display('historical_raw_beta', 'beta')} / "
+            f"{display('historical_adjusted_beta', 'beta')} · bottom-up median "
+            f"{display('bottom_up_beta_median', 'beta')} · Candidate "
+            f"{_profile_assumption_display(profile.wacc_framework.research_wacc)}"
+        )
+    return (
+        f"Terminal Growth {_profile_assumption_display(profile.terminal_framework.terminal_growth)} · "
+        f"Terminal ROIC {_diagnostic_display(profile.terminal_framework.terminal_roic)} · "
+        f"Terminal Reinvestment {_diagnostic_display(profile.terminal_framework.terminal_reinvestment_rate)}"
+    )
+
+
+def _review_group_rationale(profile, group: str) -> str:
+    if group == "revenue":
+        return profile.revenue_framework.near_term_growth_rationale
+    if group == "margin":
+        return profile.margin_framework.mature_margin_rationale
+    if group == "capital":
+        return profile.capital_efficiency_framework.mature_s2c_rationale
+    if group == "tax":
+        return profile.operating_tax_rate.rationale
+    if group == "wacc":
+        return profile.wacc_framework.rationale
+    return profile.terminal_framework.terminal_growth_rationale
+
+
+def render_nvda_research_review(
+    candidate_profile,
+    state: CompanyProfileReviewState,
+) -> CompanyProfileReviewState:
+    """Render explicit human review controls without applying DCF inputs."""
+    st.markdown("### NVDA Research Review")
+    if state.profile_status == "reviewed":
+        snapshot = state.reviewed_snapshot
+        st.success("Status: Reviewed Research Profile")
+        st.caption(f"Reviewed at: {snapshot.reviewed_at}")
+        progress = " · ".join(
+            f"{NVDA_REVIEW_GROUP_LABELS[group]} ✓"
+            for group in REQUIRED_REVIEW_GROUPS
+        )
+        st.write("Review progress: " + progress)
+        with st.expander("Reviewed notes", expanded=False):
+            for item in snapshot.group_reviews:
+                st.write(
+                    f"**{NVDA_REVIEW_GROUP_LABELS[item.group]}**："
+                    f"{item.user_note or 'No user note'}"
+                )
+            st.write(
+                "**Overall review note**："
+                + (snapshot.overall_review_note or "No overall note")
+            )
+        if "reviewed_profile_evidence_changed" in state.warnings:
+            st.warning(
+                "Current evidence differs from the reviewed snapshot; reviewed "
+                "assumptions remain unchanged. A fresh review may be appropriate."
+            )
+        if "review_refresh_recommended" in state.warnings:
+            st.warning(
+                "The newly generated Research Candidate differs from the reviewed "
+                "assumption snapshot; the reviewed profile remains unchanged."
+            )
+        st.info(
+            "Review and application are separate actions. Review status alone does "
+            "not update the Current Base DCF."
+        )
+        if st.button(
+            "Reopen NVDA Research Review",
+            key="nvda_review_reopen",
+        ):
+            state = reopen_profile_review(
+                state,
+                candidate_profile,
+                reopened_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            )
+            st.session_state[NVDA_REVIEW_STATE_KEY] = state
+            for group in REQUIRED_REVIEW_GROUPS:
+                st.session_state[f"nvda_review_{group}_checked"] = False
+            st.rerun()
+        return state
+
+    st.info("Status: Research in Progress")
+    for group in REQUIRED_REVIEW_GROUPS:
+        group_state = state.group(group)
+        check_key = f"nvda_review_{group}_checked"
+        note_key = f"nvda_review_{group}_note"
+        if check_key not in st.session_state:
+            st.session_state[check_key] = group_state.reviewed
+        if note_key not in st.session_state:
+            st.session_state[note_key] = group_state.user_note
+        label = NVDA_REVIEW_GROUP_LABELS[group]
+        with st.expander(
+            f"{label} {'✓' if group_state.reviewed else 'Not reviewed'}",
+            expanded=False,
+        ):
+            st.caption("Research evidence / candidate rationale")
+            st.write(_review_evidence_line(candidate_profile, group))
+            st.caption(_review_group_rationale(candidate_profile, group))
+            note = st.text_area(
+                f"{label} user review note",
+                key=note_key,
+                placeholder="Optional human review note; candidate rationale remains unchanged.",
+            )
+            checked = st.checkbox(
+                f"{label} reviewed",
+                key=check_key,
+            )
+        if checked != group_state.reviewed or note != group_state.user_note:
+            state = set_review_group(
+                state,
+                candidate_profile,
+                group,
+                reviewed=checked,
+                user_note=note,
+                reviewed_at=(
+                    group_state.reviewed_at
+                    if checked and group_state.reviewed
+                    else (
+                        pd.Timestamp.now(tz="UTC").isoformat()
+                        if checked else None
+                    )
+                ),
+            )
+
+    overall_key = "nvda_review_overall_note"
+    if overall_key not in st.session_state:
+        st.session_state[overall_key] = state.overall_review_note
+    overall_note = st.text_area(
+        "Overall profile review note (optional)",
+        key=overall_key,
+        placeholder="Record the human judgment behind accepting this profile.",
+    )
+    if overall_note != state.overall_review_note:
+        state = set_overall_review_note(state, overall_note)
+
+    st.session_state[NVDA_REVIEW_STATE_KEY] = state
+    progress = " · ".join(
+        f"{NVDA_REVIEW_GROUP_LABELS[group]} "
+        f"{'✓' if state.group(group).reviewed else '○'}"
+        for group in REQUIRED_REVIEW_GROUPS
+    )
+    st.write("Review progress: " + progress)
+    if state.incomplete_groups:
+        st.caption(
+            "Remaining: " + "；".join(
+                NVDA_REVIEW_GROUP_LABELS[group]
+                for group in state.incomplete_groups
+            )
+        )
+    if st.button(
+        "Mark NVDA Research Profile as Reviewed",
+        key="nvda_review_finalize",
+        disabled=not state.eligible_for_full_review,
+    ):
+        state = mark_profile_reviewed(
+            state,
+            candidate_profile,
+            reviewed_at=pd.Timestamp.now(tz="UTC").isoformat(),
+        )
+        st.session_state[NVDA_REVIEW_STATE_KEY] = state
+        st.rerun()
+    return state
+
+
+PROFILE_APPLY_FIELD_LABELS = {
+    "year_1_growth": "Y1 Growth",
+    "year_2_growth": "Y2 Growth",
+    "year_3_growth": "Y3 Growth",
+    "revenue_fade_years": "Fade Years",
+    "forecast_years": "Forecast Horizon",
+    "starting_operating_margin": "Starting Margin",
+    "mature_operating_margin": "Mature Margin",
+    "starting_sales_to_capital": "Starting S/C",
+    "mature_sales_to_capital": "Mature S/C",
+    "operating_tax_rate": "Operating Tax",
+    "research_wacc": "Research WACC",
+    "terminal_growth": "Terminal Growth",
+}
+
+
+def _profile_apply_value(field: str, value: float | int) -> str:
+    if field in {"revenue_fade_years", "forecast_years"}:
+        return str(int(value))
+    if field in {"starting_sales_to_capital", "mature_sales_to_capital"}:
+        return f"{float(value):.2f}x"
+    return f"{float(value):.2%}"
+
+
+def _explicit_profile_apply_callback(
+    state,
+    ticker: str,
+    snapshot,
+    current_base: MultiStageDCFAssumptions,
+) -> None:
+    apply_reviewed_profile_to_base_session_state(
+        state,
+        ticker,
+        snapshot,
+        current_base,
+        applied_at=pd.Timestamp.now(tz="UTC").isoformat(),
+    )
+
+
+def render_reviewed_profile_application(
+    ticker: str,
+    review_state: CompanyProfileReviewState,
+    current_base: MultiStageDCFAssumptions,
+) -> ProfileApplyPlan | None:
+    """Render an explicit all-or-nothing Reviewed Profile application action."""
+    application_key = base_profile_application_key(ticker)
+    previous = st.session_state.get(application_key)
+    if not isinstance(previous, ReviewedProfileApplication):
+        previous = None
+
+    if review_state.profile_status != "reviewed":
+        if previous is not None:
+            if assumptions_match(current_base, previous.assumptions):
+                st.info(
+                    "Current Base remains based on the previously applied reviewed "
+                    "profile while Research Review is reopened."
+                )
+            else:
+                st.warning(
+                    "Current Base has been modified since the reviewed profile was "
+                    "applied. Reopening review did not alter the Base."
+                )
+        return None
+
+    snapshot = review_state.reviewed_snapshot
+    plan = build_profile_apply_plan(
+        snapshot, current_base, previous_application=previous
+    )
+    st.markdown("### Apply Reviewed Profile to Current Base")
+    if not plan.available or snapshot is None:
+        st.warning(
+            "Reviewed profile cannot be applied: "
+            + (plan.reason or "reviewed_profile_unavailable")
+        )
+        return plan
+
+    if plan.changed_fields:
+        changed_frame = pd.DataFrame([
+            {
+                "Assumption": PROFILE_APPLY_FIELD_LABELS[item.field],
+                "Current Base": _profile_apply_value(
+                    item.field, item.current_value
+                ),
+                "Reviewed Profile": _profile_apply_value(
+                    item.field, item.reviewed_value
+                ),
+            }
+            for item in plan.changed_fields
+        ]).set_index("Assumption")
+        st.caption(
+            f"{len(plan.changed_fields)} assumption(s) will change; application "
+            "is complete and cannot be partial."
+        )
+        st.dataframe(changed_frame, width="stretch")
+    else:
+        st.caption(
+            "The economically relevant Current Base values already match the "
+            "reviewed snapshot. Explicit Apply is still required unless provenance "
+            "has already been recorded."
+        )
+
+    if plan.newer_review_available:
+        st.info(
+            "A newer reviewed profile is available. The previously applied Base "
+            "has not been replaced automatically."
+        )
+    if plan.base_diverged:
+        st.warning(
+            "Current Base has been modified since the reviewed profile was applied. "
+            "It will not be restored automatically."
+        )
+
+    if plan.already_applied:
+        st.success("Reviewed NVDA Research Profile applied to Current Base DCF.")
+        st.caption(
+            f"Reviewed at: {previous.reviewed_at} · Applied at: "
+            f"{previous.applied_at} · Source: Reviewed NVDA Research Profile"
+        )
+        st.button(
+            "Reviewed profile already applied",
+            key="nvda_reviewed_profile_apply",
+            disabled=True,
+        )
+        return plan
+
+    label = (
+        "Reapply Reviewed NVDA Profile"
+        if plan.base_diverged else "Apply Reviewed NVDA Profile to Base DCF"
+    )
+    st.caption(
+        f"Reviewed at: {snapshot.reviewed_at} · Applied at: Not applied"
+    )
+    st.button(
+        label,
+        key="nvda_reviewed_profile_apply",
+        type="primary",
+        on_click=_explicit_profile_apply_callback,
+        args=(st.session_state, ticker, snapshot, current_base),
+    )
+    return plan
+
+
+def render_company_research_profile(
+    lookup: CompanyProfileLookupResult,
+    *,
+    statement_currency: str | None,
+    current_assumptions: MultiStageDCFAssumptions | None = None,
+    current_run: MultiStageDCFRunResult | None = None,
+    candidate_run: MultiStageDCFRunResult | None = None,
+    nvda_research: NVDAResearchProfileResult | None = None,
+    alphabet_research: AlphabetResearchProfileResult | None = None,
+) -> None:
+    """Render research evidence and the explicit reviewed-profile transition."""
+    st.subheader("Company Research Profile 公司研究档案")
+    if not lookup.available or lookup.profile is None:
+        st.info(
+            "该公司尚无显式 Company Research Profile；当前 DCF 仍是手动/临时假设工作流。"
+        )
+        return
+
+    candidate_profile = lookup.profile
+    review_state = None
+    if (
+        candidate_profile.issuer_id == "NVDA"
+        and candidate_profile.profile_status == "research_in_progress"
+    ):
+        review_state = initialize_nvda_review_session_state(
+            st.session_state, candidate_profile
+        )
+    profile = (
+        review_state.reviewed_snapshot.profile
+        if review_state is not None
+        and review_state.profile_status == "reviewed"
+        and review_state.reviewed_snapshot is not None
+        else candidate_profile
+    )
+    status_labels = {
+        "provisional": "Provisional 临时",
+        "research_in_progress": "Research in progress 研究中",
+        "reviewed": "Reviewed 已复核",
+    }
+    st.caption(
+        f"Issuer：{profile.issuer_id} · Status："
+        f"{status_labels[profile.profile_status]}"
+    )
+    if profile.profile_status == "provisional":
+        st.warning(
+            "Current operating assumptions are provisional and have not yet "
+            "been reviewed as company-specific research assumptions."
+        )
+    elif profile.profile_status == "research_in_progress":
+        st.info(
+            "NVDA Research Candidate is read-only and unreviewed. It does not "
+            "change the editable Base DCF assumptions."
+        )
+
+    if (
+        current_assumptions is not None
+        and profile.profile_status in {"research_in_progress", "reviewed"}
+    ):
+        translated = build_multistage_assumptions_from_profile(profile)
+        candidate = translated.assumptions
+        if candidate is not None:
+            evidence_labels = {
+                item.evidence_id: item.label for item in profile.evidence_items
+            }
+
+            def evidence_text(assumption: ResearchAssumption | None) -> str:
+                if assumption is None:
+                    return "N/A"
+                labels = [
+                    evidence_labels.get(reference, reference)
+                    for reference in assumption.evidence_references[:3]
+                ]
+                return "；".join(labels) if labels else "N/A"
+
+            assumptions_rows = (
+                ("Y1 Growth", current_assumptions.near_term_revenue_growth[0], candidate.near_term_revenue_growth[0], profile.revenue_framework.year1_growth, "percent"),
+                ("Y2 Growth", current_assumptions.near_term_revenue_growth[1], candidate.near_term_revenue_growth[1], profile.revenue_framework.year2_growth, "percent"),
+                ("Y3 Growth", current_assumptions.near_term_revenue_growth[2], candidate.near_term_revenue_growth[2], profile.revenue_framework.year3_growth, "percent"),
+                ("Fade Years", current_assumptions.revenue_fade_years, candidate.revenue_fade_years, profile.revenue_framework.revenue_fade_years, "integer"),
+                ("Forecast Horizon", current_assumptions.forecast_years, candidate.forecast_years, profile.forecast_years, "integer"),
+                ("Starting Margin", current_assumptions.starting_operating_margin, candidate.starting_operating_margin, profile.margin_framework.starting_operating_margin, "percent"),
+                ("Mature Margin", current_assumptions.mature_operating_margin, candidate.mature_operating_margin, profile.margin_framework.mature_operating_margin, "percent"),
+                ("Starting S/C", current_assumptions.starting_sales_to_capital, candidate.starting_sales_to_capital, profile.capital_efficiency_framework.starting_sales_to_capital, "multiple"),
+                ("Mature S/C", current_assumptions.mature_sales_to_capital, candidate.mature_sales_to_capital, profile.capital_efficiency_framework.mature_sales_to_capital, "multiple"),
+                ("Operating Tax", current_assumptions.operating_tax_rate, candidate.operating_tax_rate, profile.operating_tax_rate, "percent"),
+                ("Research WACC", current_assumptions.wacc, candidate.wacc, profile.wacc_framework.research_wacc, "percent"),
+                ("Terminal Growth", current_assumptions.terminal_growth, candidate.terminal_growth, profile.terminal_framework.terminal_growth, "percent"),
+            )
+            comparison_label = (
+                "Reviewed Research Profile"
+                if profile.profile_status == "reviewed"
+                else "Research Candidate"
+            )
+            comparison_frame = pd.DataFrame(
+                {
+                    "Assumption": [row[0] for row in assumptions_rows],
+                    (
+                        "Current Provisional"
+                        if profile.issuer_id == "ALPHABET_INC"
+                        else "Current DCF"
+                    ): [
+                        str(int(row[1])) if row[4] == "integer" else (
+                            f"{row[1]:.2%}" if row[4] == "percent" else f"{row[1]:.2f}x"
+                        ) for row in assumptions_rows
+                    ],
+                    comparison_label: [
+                        str(int(row[2])) if row[4] == "integer" else (
+                            f"{row[2]:.2%}" if row[4] == "percent" else f"{row[2]:.2f}x"
+                        ) for row in assumptions_rows
+                    ],
+                    "Key Evidence": [evidence_text(row[3]) for row in assumptions_rows],
+                }
+            ).set_index("Assumption")
+            st.markdown(
+                f"**Current DCF / Current Base vs {comparison_label}**"
+            )
+            st.dataframe(comparison_frame, width="stretch")
+            st.caption(
+                "Research Candidate values remain separate from Base state. Only "
+                "an immutable Reviewed Profile can be applied through the explicit "
+                "all-or-nothing action below."
+            )
+
+            research_details = nvda_research or alphabet_research
+            if research_details is not None:
+                issuer_label = (
+                    "Alphabet"
+                    if profile.issuer_id == "ALPHABET_INC" else "NVDA"
+                )
+                with st.expander(
+                    f"{issuer_label} Revenue Evidence and Period Reconciliation",
+                    expanded=False,
+                ):
+                    revenue_frame = pd.DataFrame([
+                        {
+                            "Evidence": row.label,
+                            "Period": row.period,
+                            "Revenue (B)": (
+                                row.revenue / 1e9 if row.revenue is not None else None
+                            ),
+                            "Growth": row.growth,
+                            "Source": row.source,
+                            "Source / retrieval date": row.source_date or row.retrieved_at,
+                            "Analysts": row.analyst_count,
+                            "Notes": row.notes,
+                        }
+                        for row in research_details.revenue_evidence
+                    ]).set_index("Evidence")
+                    st.dataframe(
+                        revenue_frame.style.format(
+                            {"Revenue (B)": "{:.3f}", "Growth": "{:.2%}"},
+                            na_rep="N/A",
+                        ),
+                        width="stretch",
+                    )
+                    for note in research_details.period_reconciliation:
+                        st.caption(note)
+                    range_frame = pd.DataFrame([
+                        {
+                            "DCF Year": item.assumption_id,
+                            "Low evidence case": item.low,
+                            "Research Candidate": item.central,
+                            "High evidence case": item.high,
+                            "Rationale": item.rationale,
+                        }
+                        for item in research_details.growth_ranges
+                    ]).set_index("DCF Year")
+                    st.markdown("**Research context ranges — not Bear/Base/Bull scenarios**")
+                    st.dataframe(
+                        range_frame.style.format({
+                            "Low evidence case": "{:.2%}",
+                            "Research Candidate": "{:.2%}",
+                            "High evidence case": "{:.2%}",
+                        }),
+                        width="stretch",
+                    )
+
+                if alphabet_research is not None:
+                    with st.expander(
+                        "Alphabet Segment, AI Infrastructure and Capital Context",
+                        expanded=False,
+                    ):
+                        segment_frame = pd.DataFrame([
+                            {
+                                "Business": row.segment,
+                                "Period": row.period,
+                                "Revenue (B)": (
+                                    row.revenue / 1e9
+                                    if row.revenue is not None else None
+                                ),
+                                "Revenue Growth": row.revenue_growth,
+                                "Operating Income (B)": (
+                                    row.operating_income / 1e9
+                                    if row.operating_income is not None else None
+                                ),
+                                "Operating Margin": row.operating_margin,
+                                "Notes": row.notes,
+                            }
+                            for row in alphabet_research.segment_evidence
+                        ]).set_index("Business")
+                        st.dataframe(
+                            segment_frame.style.format({
+                                "Revenue (B)": "{:.3f}",
+                                "Revenue Growth": "{:.2%}",
+                                "Operating Income (B)": "{:.3f}",
+                                "Operating Margin": "{:.2%}",
+                            }, na_rep="N/A"),
+                            width="stretch",
+                        )
+                        evidence = {
+                            item.evidence_id: item
+                            for item in profile.evidence_items
+                        }
+                        for evidence_id in (
+                            "h1_2026_capex", "ttm_capex",
+                            "2026_capex_guidance", "h1_2026_depreciation",
+                            "cloud_backlog", "search_ai_monetization",
+                            "search_ai_disruption",
+                        ):
+                            item = evidence.get(evidence_id)
+                            if item is not None:
+                                value = (
+                                    _diagnostic_display(
+                                        float(item.value), "amount",
+                                        statement_currency,
+                                    )
+                                    if isinstance(item.value, (int, float))
+                                    and item.unit == "currency_amount"
+                                    else str(item.value)
+                                )
+                                st.write(f"**{item.label}**：{value}")
+                                if item.notes:
+                                    st.caption(item.notes)
+
+            with st.expander("Research Rationale, Sources and Uncertainty", expanded=False):
+                for _, _, _, assumption, _ in assumptions_rows:
+                    if assumption is not None:
+                        st.markdown(f"**{assumption.assumption_id}** — {assumption.rationale}")
+                source_rows = [
+                    {
+                        "Evidence": item.label,
+                        "Period": item.period,
+                        "Source": item.source,
+                        "Source date": item.source_date,
+                        "Retrieved": item.retrieved_at,
+                    }
+                    for item in profile.evidence_items
+                    if item.category in {
+                        "management_guidance", "company_specific_research",
+                        "industry_reference", "market_risk",
+                    }
+                ]
+                if source_rows:
+                    st.dataframe(
+                        pd.DataFrame(source_rows).set_index("Evidence"),
+                        width="stretch",
+                    )
+                st.markdown("**Uncertainty notes**")
+                for note in profile.uncertainty_notes:
+                    st.write(f"• {note}")
+                st.caption(
+                    "Future scenario dimensions: "
+                    + "；".join(profile.future_scenario_drivers)
+                )
+
+            if review_state is not None:
+                review_state = render_nvda_research_review(
+                    candidate_profile, review_state
+                )
+                render_reviewed_profile_application(
+                    candidate_profile.issuer_id,
+                    review_state,
+                    current_assumptions,
+                )
+
+            terminal = profile.terminal_framework
+            diagnostic_columns = st.columns(3)
+            diagnostic_columns[0].metric(
+                "Terminal ROIC",
+                _diagnostic_display(terminal.terminal_roic),
+            )
+            diagnostic_columns[1].metric(
+                "Terminal Reinvestment Rate",
+                _diagnostic_display(terminal.terminal_reinvestment_rate),
+            )
+            diagnostic_columns[2].metric(
+                "Terminal FCFF / NOPAT",
+                _diagnostic_display(terminal.terminal_fcff_conversion),
+            )
+
+            preview_label = (
+                "Reviewed Research DCF Preview"
+                if profile.profile_status == "reviewed"
+                else (
+                    "Alphabet Research Candidate DCF Preview"
+                    if profile.issuer_id == "ALPHABET_INC"
+                    else "Research Candidate DCF Preview"
+                )
+            )
+            st.markdown(f"**{preview_label}**")
+            preview_run = candidate_run
+            if current_run is not None:
+                preview_run = run_multistage_dcf(
+                    current_run.inputs, candidate
+                )
+            if preview_run is None:
+                st.warning(f"{preview_label} unavailable.")
+            else:
+                years = preview_run.operating_forecast.years
+                preview_columns = st.columns(4)
+                per_share = preview_run.per_share_value
+                preview_columns[0].metric(
+                    "Intrinsic Value / Share",
+                    f"${per_share.intrinsic_value_per_share:.2f}"
+                    if per_share is not None else "N/A",
+                )
+                preview_columns[1].metric(
+                    "Enterprise Value",
+                    _diagnostic_display(preview_run.enterprise_value.enterprise_value, "amount", statement_currency),
+                )
+                preview_columns[2].metric(
+                    "Equity Value",
+                    _diagnostic_display(preview_run.equity_value.equity_value, "amount", statement_currency),
+                )
+                preview_columns[3].metric(
+                    "TV / EV",
+                    _diagnostic_display(preview_run.enterprise_value.terminal_value_share),
+                )
+                revenue_indexes = (1, 3, 5, len(years))
+                revenue_columns = st.columns(4)
+                for column, index in zip(revenue_columns, revenue_indexes):
+                    column.metric(
+                        f"Year {index} Revenue" if index != len(years) else "Final Revenue",
+                        _diagnostic_display(years[index - 1].revenue, "amount", statement_currency),
+                    )
+                st.caption(
+                    f"Mature Margin {candidate.mature_operating_margin:.2%} · "
+                    f"Mature S/C {candidate.mature_sales_to_capital:.2f}x · "
+                    f"Terminal ROIC {candidate.derived_terminal_roic:.2%} · "
+                    f"Terminal Reinvestment {candidate.terminal_reinvestment_rate:.2%}"
+                )
+                if current_run is not None:
+                    current_value = (
+                        current_run.per_share_value.intrinsic_value_per_share
+                        if current_run.per_share_value is not None else None
+                    )
+                    candidate_value = (
+                        per_share.intrinsic_value_per_share
+                        if per_share is not None else None
+                    )
+                    if current_value is not None and candidate_value is not None:
+                        st.caption(
+                            f"{comparison_label} minus Current Base DCF: "
+                            f"{candidate_value - current_value:+.2f} per share "
+                            f"({candidate_value / current_value - 1:+.2%}). "
+                            "Primary deltas are shown in the assumption table; no causal attribution is implied."
+                        )
+
+    with st.expander("Evidence vs Current Research Assumption", expanded=False):
+        revenue, margin, capital, risk = st.columns(4)
+        revenue_framework = profile.revenue_framework
+        with revenue:
+            st.markdown("**Revenue**")
+            st.write(
+                "TTM evidence："
+                + _profile_evidence_display(
+                    revenue_framework.ttm_revenue,
+                    kind="amount",
+                    currency=statement_currency,
+                )
+            )
+            if revenue_framework.forward_revenue_anchors is not None:
+                anchor = revenue_framework.forward_revenue_anchors.points[0]
+                st.write(
+                    "FY consensus evidence："
+                    + _diagnostic_display(anchor.implied_revenue_growth)
+                    if anchor.available else "FY consensus evidence：数据不足"
+                )
+                if anchor.fiscal_period is not None:
+                    st.caption(
+                        f"Fiscal period：{anchor.fiscal_period.date()} · "
+                        f"Analysts：{anchor.analyst_count or 'N/A'}"
+                    )
+            st.write(
+                "Research Y1 assumption："
+                + _profile_assumption_display(revenue_framework.year1_growth)
+            )
+            st.caption(
+                "Evidence remains read-only and is not automatically applied."
+            )
+        with margin:
+            st.markdown("**Margin**")
+            st.write(
+                "TTM Operating Margin evidence："
+                + _profile_evidence_display(
+                    profile.margin_framework.ttm_operating_margin
+                )
+            )
+            st.write(
+                "Starting assumption："
+                + _profile_assumption_display(
+                    profile.margin_framework.starting_operating_margin
+                )
+            )
+            st.write(
+                "Mature assumption："
+                + _profile_assumption_display(
+                    profile.margin_framework.mature_operating_margin
+                )
+            )
+        with capital:
+            st.markdown("**Capital Efficiency**")
+            st.write(
+                "Normalized 3Y S/C evidence："
+                + _profile_evidence_display(
+                    profile.capital_efficiency_framework.normalized_3y_sales_to_capital,
+                    kind="multiple",
+                )
+            )
+            st.write(
+                "Starting S/C assumption："
+                + _profile_assumption_display(
+                    profile.capital_efficiency_framework.starting_sales_to_capital,
+                    kind="multiple",
+                )
+            )
+            st.write(
+                "Mature S/C assumption："
+                + _profile_assumption_display(
+                    profile.capital_efficiency_framework.mature_sales_to_capital,
+                    kind="multiple",
+                )
+            )
+        with risk:
+            st.markdown("**Risk / WACC**")
+            audit = profile.wacc_framework.wacc_audit
+            st.write(
+                "Formula-Based WACC evidence："
+                + _diagnostic_display(
+                    audit.calculated_wacc
+                    if audit is not None and audit.available else None
+                )
+            )
+            st.write(
+                "Research WACC assumption："
+                + _profile_assumption_display(
+                    profile.wacc_framework.research_wacc
+                )
+            )
+            st.write(
+                "Operating Tax assumption："
+                + _profile_assumption_display(profile.operating_tax_rate)
+            )
+            st.write(
+                "Forecast horizon："
+                + _profile_assumption_display(
+                    profile.forecast_years, kind="integer"
+                )
+                + " years"
+            )
 
 
 def build_company_revenue_forecast_anchors(
@@ -3161,6 +4147,115 @@ def render_multistage_dcf_panel(ticker: str,
         st.error(f"假设无法运行：{exc}")
         return
 
+    applied_profile = st.session_state.get(base_profile_application_key(ticker))
+    if isinstance(applied_profile, ReviewedProfileApplication):
+        if assumptions_match(assumptions, applied_profile.assumptions):
+            st.success(
+                "Operating assumption status: Reviewed NVDA Research Profile applied"
+            )
+            st.caption(
+                f"Reviewed at: {applied_profile.reviewed_at} · Applied at: "
+                f"{applied_profile.applied_at} · source: {applied_profile.source}"
+            )
+        else:
+            st.warning(
+                "Operating assumption status: Current Base has diverged from the "
+                "previously applied Reviewed NVDA Research Profile."
+            )
+
+    nvda_research = None
+    alphabet_research = None
+    candidate_run = None
+    if ticker.strip().upper() == "NVDA":
+        beta_audit = None
+        bottom_up = None
+        if wacc_audit is not None and wacc_audit.available:
+            try:
+                beta_audit = load_beta_robustness_audit(
+                    ticker,
+                    wacc_audit.risk_free_rate,
+                    wacc_audit.equity_risk_premium,
+                    wacc_audit.after_tax_cost_of_debt,
+                    wacc_audit.equity_weight,
+                    wacc_audit.debt_weight,
+                    assumptions.wacc,
+                )
+                bottom_up = load_bottom_up_beta_audit(ticker)
+            except Exception:
+                # Research candidate remains usable with the available Phase 2
+                # evidence; missing diagnostics stay explicitly absent.
+                beta_audit = None
+                bottom_up = None
+        nvda_research = build_nvda_research_profile(
+            assumptions,
+            history,
+            revenue_anchors=revenue_anchors,
+            wacc_audit=wacc_audit,
+            beta_audit=beta_audit,
+            bottom_up_beta=bottom_up,
+            retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
+        )
+        profile_lookup = nvda_research.lookup
+        translation = build_multistage_assumptions_from_profile(
+            profile_lookup.profile
+        )
+        if translation.available and translation.assumptions is not None:
+            candidate_run = run_real_company_multistage_dcf(
+                snapshot, history, translation.assumptions
+            )
+    elif ticker.strip().upper() in {"GOOG", "GOOGL"}:
+        beta_audit = None
+        bottom_up = None
+        if wacc_audit is not None and wacc_audit.available:
+            try:
+                beta_audit = load_beta_robustness_audit(
+                    ticker,
+                    wacc_audit.risk_free_rate,
+                    wacc_audit.equity_risk_premium,
+                    wacc_audit.after_tax_cost_of_debt,
+                    wacc_audit.equity_weight,
+                    wacc_audit.debt_weight,
+                    assumptions.wacc,
+                )
+                bottom_up = load_bottom_up_beta_audit(ticker)
+            except Exception:
+                beta_audit = None
+                bottom_up = None
+        alphabet_research = build_alphabet_research_profile(
+            assumptions,
+            history,
+            revenue_anchors=revenue_anchors,
+            wacc_audit=wacc_audit,
+            beta_audit=beta_audit,
+            bottom_up_beta=bottom_up,
+            retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
+        )
+        profile_lookup = alphabet_research.lookup
+        translation = build_multistage_assumptions_from_profile(
+            profile_lookup.profile
+        )
+        if translation.available and translation.assumptions is not None:
+            candidate_run = run_real_company_multistage_dcf(
+                snapshot, history, translation.assumptions
+            )
+    else:
+        profile_lookup = build_provisional_company_profile(
+            ticker,
+            assumptions,
+            history=history,
+            revenue_anchors=revenue_anchors,
+            wacc_audit=wacc_audit,
+        )
+    render_company_research_profile(
+        profile_lookup,
+        statement_currency=run.inputs.statement_currency,
+        current_assumptions=assumptions,
+        current_run=run,
+        candidate_run=candidate_run,
+        nvda_research=nvda_research,
+        alphabet_research=alphabet_research,
+    )
+
     st.subheader("Valuation Output 假设对应估值")
     statement_currency = run.inputs.statement_currency
     security_currency = run.inputs.security_currency
@@ -3225,9 +4320,15 @@ def render_multistage_dcf_panel(ticker: str,
             audit_columns[0].metric(
                 "Formula-Based WACC", f"{wacc_audit.calculated_wacc:.2%}"
             )
-            audit_columns[1].metric("Provisional DCF Default WACC", f"{assumptions.wacc:.2%}")
+            applied_wacc_label = (
+                "Reviewed Profile Research WACC"
+                if isinstance(applied_profile, ReviewedProfileApplication)
+                and assumptions_match(assumptions, applied_profile.assumptions)
+                else "Current Research WACC"
+            )
+            audit_columns[1].metric(applied_wacc_label, f"{assumptions.wacc:.2%}")
             audit_columns[2].metric(
-                "Provisional minus Formula-Based",
+                "Research minus Formula-Based",
                 f"{(assumptions.wacc - wacc_audit.calculated_wacc) * 100:+.2f} pp",
             )
             st.caption(
@@ -3472,113 +4573,18 @@ def main():
 
         try:
             snapshot = load_company_snapshot(ticker)
-            per_security_support = assess_per_security_valuation_support(
-                ticker=ticker,
-                statement_currency=snapshot.financial_currency,
-                security_currency=snapshot.price_currency,
-            )
-            current_price, fetched_net_debt, fetched_shares = fetch_market_data(ticker, snapshot)
-            fcff_data, fcff_source = fetch_fcff_data(ticker, snapshot)
             wacc_reference = fetch_wacc_reference(ticker, snapshot)
             wacc_audit = build_wacc_audit_result(ticker, wacc_reference)
             annual_financials, quarterly_financials, health_checks = fetch_financial_overview(ticker, snapshot)
             fundamental_history = build_company_fundamentals(snapshot)
         except Exception as exc:
             snapshot = None
-            per_security_support = None
-            current_price, fetched_net_debt, fetched_shares = None, None, None
-            fcff_data, fcff_source = pd.Series(dtype=float), "无数据"
             wacc_reference = {"wacc": None, "error": str(exc)}
             wacc_audit = build_wacc_audit_result(ticker, wacc_reference)
             annual_financials, quarterly_financials, health_checks = pd.DataFrame(), pd.DataFrame(), []
             fundamental_history = None
             st.warning(f"yfinance 公司数据读取失败: {exc}")
-
-        st.subheader("📈 增长假设")
-        growth_rate = st.slider("未来N年增长率 Future Growth (%)", 0.0, 100.0, 8.0, 0.1) / 100
-        terminal_growth = st.slider("终值增长率 Terminal Growth (%)", 0.0, 5.0, 2.5, 0.1) / 100
-        forecast_years = st.slider("预测年限 Forecast Years", 5, 15, 5)
-
-        st.subheader("💰 资本成本")
-        wacc = st.slider("WACC (%)", 5.0, 15.0, 9.0, 0.1) / 100
-        if wacc_reference.get("wacc") is not None:
-            wacc_notes = [
-                f"模型 WACC {wacc_reference['wacc']*100:.2f}%",
-                f"股权成本 {wacc_reference['cost_equity']*100:.2f}%",
-                f"税后债务成本 {wacc_reference['after_tax_cost_debt']*100:.2f}%",
-                f"Beta {wacc_reference['beta']:.2f}",
-            ]
-            if wacc_reference.get("industry_wacc") is not None:
-                wacc_notes.append(
-                    f"{wacc_reference['matched_industry']} 行业 {wacc_reference['industry_wacc']*100:.2f}%"
-                )
-            st.caption("参考：" + " · ".join(wacc_notes))
-            with st.expander("WACC 计算明细", expanded=False):
-                st.markdown(
-                    f"无风险利率 **{wacc_reference['risk_free']*100:.2f}%** "
-                    f"（{wacc_reference['treasury_date']}）  \n"
-                    f"成熟市场 ERP **{wacc_reference['erp']*100:.2f}%** "
-                    f"（{wacc_reference['erp_date']}）  \n"
-                    f"股权/债务权重 **{wacc_reference['equity_weight']*100:.1f}% / "
-                    f"{wacc_reference['debt_weight']*100:.1f}%**  \n"
-                    f"有效税率 **{wacc_reference['tax_rate']*100:.1f}%** · "
-                    f"合成评级 **{wacc_reference['rating']}**"
-                )
-                wacc_assumptions = []
-                if wacc_reference.get("interest_assumption_used"):
-                    wacc_assumptions.append("缺失利息费用按 0")
-                if wacc_reference.get("tax_assumption_used"):
-                    wacc_assumptions.append("缺失/无效税率按 21%")
-                if wacc_reference.get("beta_assumption_used"):
-                    wacc_assumptions.append("缺失 Beta 按 1.0")
-                if wacc_assumptions:
-                    st.caption("显式回退假设：" + "；".join(wacc_assumptions))
-        else:
-            st.caption(f"WACC 参考暂不可用：{wacc_reference.get('error') or '数据不足'}")
-
-        st.subheader("🏦 资产负债表")
-        statement_currency = (
-            snapshot.financial_currency if snapshot is not None else None
-        )
-        net_debt_label = (
-            f"净债务 Net debt ({statement_currency} B)"
-            if statement_currency else "净债务 Net debt (B)"
-        )
-        shares_label = (
-            "发行人普通股 Issuer ordinary shares (B)"
-            if per_security_support is not None
-            and not per_security_support.supported
-            else "总股本 Shares Outstanding (B)"
-        )
-        net_debt = st.number_input(
-            net_debt_label,
-            value=float(fetched_net_debt) if fetched_net_debt is not None else 0.0,
-            step=0.1,
-            format="%.3f",
-            key=f"net_debt_{ticker}",
-        )
-        shares = st.number_input(
-            shares_label,
-            value=float(fetched_shares) if fetched_shares is not None else 0.0,
-            step=0.01,
-            format="%.3f",
-            key=f"shares_{ticker}",
-        )
-        net_debt_confirmed = fetched_net_debt is not None
-        if fetched_net_debt is None:
-            st.warning("yfinance 缺少净债务数据；请核实输入值后确认，未确认时不会运行估值。")
-            net_debt_confirmed = st.checkbox(
-                "确认使用手动净债务输入",
-                key=f"confirm_net_debt_{ticker}",
-            )
-        if fetched_shares is None:
-            st.warning("yfinance 缺少总股本数据；请输入有效股本后再运行估值。")
-        if fetched_net_debt is not None or fetched_shares is not None:
-            st.caption("以上默认值已从 yfinance 自动获取，可手动覆盖。")
-        if per_security_support is not None and not per_security_support.supported:
-            st.warning(
-                _per_security_unavailable_message(per_security_support.reason)
-            )
+        st.caption("估值假设统一在主页面的 Multi-Stage DCF 面板中管理。")
 
     st.divider()
     statement_currency = snapshot.financial_currency if snapshot else None
@@ -3594,126 +4600,6 @@ def main():
         ticker, snapshot, fundamental_history, wacc_audit
     )
     st.divider()
-    st.header("Simple FCFF DCF — Reference")
-    st.caption("保留的简化 FCFF 模型，仅作为独立参考；不作为多阶段 DCF 的校准目标。")
-    if per_security_support is not None and not per_security_support.supported:
-        st.warning(
-            _per_security_unavailable_message(per_security_support.reason)
-        )
-
-    # 主界面
-    col1, col2 = st.columns([1, 2])
-
-    with col1:
-        if st.button("🚀 运行估值 Run Valuation", type="primary"):
-            if not ticker:
-                st.error("请输入股票代码。")
-                return
-
-            if len(fcff_data) == 0:
-                st.warning("无法获取该股票现金流数据，请检查代码或更换股票。")
-                return
-
-            if shares <= 0:
-                st.error("无法自动读取总股本，请在左侧手动填写“总股本 (十亿股)”。")
-                return
-
-            if per_security_support is not None and not per_security_support.supported:
-                st.error(
-                    _per_security_unavailable_message(
-                        per_security_support.reason
-                    )
-                )
-                return
-
-            if not net_debt_confirmed:
-                st.error("净债务数据缺失，请先核实输入值并确认。")
-                return
-
-            # 计算
-            res = calculate_dcf(
-                fcff_data, growth_rate, wacc, terminal_growth,
-                forecast_years, net_debt, shares
-            )
-
-            if "error" in res:
-                st.error(res["error"])
-                return
-
-            intrinsic = res["intrinsic_value"]
-            margin_safety = _margin_of_safety(intrinsic, current_price)
-
-            current_price_display = (
-                f"${current_price:.2f}" if current_price is not None else "不可用"
-            )
-            margin_display = (
-                f"{margin_safety:+.1f}%" if margin_safety is not None else "不可用"
-            )
-            st.metric("📉 当前股价 Current Price", current_price_display)
-            st.metric("🎯 内在价值 Intrinsic Value", f"${intrinsic:.2f}")
-            st.metric("🛡️ 安全边际 Safety Margin", margin_display)
-
-            st.markdown(
-                f"**核心假设**：FCFF = ${res['last_fcf']:.2f}B | "
-                f"净债务 = ${net_debt:.2f}B | 股本 = {shares:.3f}B | "
-                f"增长率={growth_rate*100:.1f}% | WACC={wacc*100:.1f}% | "
-                f"终值g={terminal_growth*100:.1f}%"
-            )
-            st.caption(f"现金流口径：{fcff_source}")
-
-            # 敏感性分析
-            st.subheader("📊 参数敏感性热力图")
-            wacc_grid = np.linspace(max(0.05, wacc-0.03), min(0.15, wacc+0.03), 10)
-            growth_grid = np.linspace(max(0.01, growth_rate-0.03), min(0.15, growth_rate+0.03), 10)
-
-            grid_vals = sensitivity_grid(
-                fcff_data, wacc_grid, growth_grid, terminal_growth,
-                forecast_years, net_debt, shares
-            )
-
-            fig_heat = go.Figure(data=go.Heatmap(
-                z=grid_vals,
-                x=[f"{g*100:.1f}%" for g in growth_grid],
-                y=[f"{w*100:.1f}%" for w in wacc_grid],
-                colorscale="RdYlGn",
-                colorbar=dict(title="Intrinsic Value ($)")
-            ))
-            fig_heat.update_layout(xaxis_title="Growth Rate", yaxis_title="WACC", height=400)
-            st.plotly_chart(fig_heat, width="stretch")
-
-        st.info("💡 提示：DCF对假设极度敏感。建议用滑块观察价值区间变化，类似物理系统的相变分析。")
-
-    with col2:
-        st.subheader("📈 FCFF 投影与折现 Projection & Discount")
-        if "res" in locals() and "error" not in res:
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-                                row_heights=[0.6, 0.4],
-                                subplot_titles=["FCFF 投影", "折现因子与PV"])
-
-            # 历史 FCFF
-            fig.add_trace(go.Scatter(x=fcff_data.index, y=fcff_data.values, name="历史FCFF", mode="lines+markers"), row=1, col=1)
-            # 投影 FCFF
-            # 从最新年度/TTM 报告期向后逐年投影，保留相同月日。
-            latest_fcff_date = pd.Timestamp(fcff_data.index[-1])
-            proj_idx = pd.DatetimeIndex(
-                [latest_fcff_date + pd.DateOffset(years=i)
-                 for i in range(1, len(res["projected_fcf"]) + 1)]
-            )
-            fig.add_trace(go.Scatter(x=proj_idx, y=res["projected_fcf"], name="投影FCFF", line=dict(dash="dash")), row=1, col=1)
-
-            # 折现因子
-            years = np.arange(1, forecast_years+1)
-            disc_factors = 1 / (1 + wacc) ** years
-            fig.add_trace(go.Bar(x=proj_idx, y=res["pv_fcf"], name="FCFF现值", opacity=0.7), row=2, col=1)
-            fig.add_trace(go.Scatter(x=proj_idx, y=disc_factors, name="折现因子", line=dict(color="red")), row=2, col=1)
-
-            fig.update_layout(height=500, showlegend=True)
-            fig.update_yaxes(title_text="十亿美元", row=1, col=1)
-            fig.update_yaxes(title_text="十亿美元", row=2, col=1)
-            st.plotly_chart(fig, width="stretch")
-        else:
-            st.info("点击左侧「运行估值」查看图表")
-
     render_health_checks(ticker, health_checks)
 
 if __name__ == "__main__":
