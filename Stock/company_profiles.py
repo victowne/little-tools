@@ -180,6 +180,24 @@ class TerminalResearchFramework:
 
 
 @dataclass(frozen=True)
+class ReinvestmentStrategyMetadata:
+    """Auditable research strategy metadata; valuation formulas live elsewhere."""
+
+    strategy: str
+    explicit_years: int
+    handoff_years: int
+    economic_capex_to_revenue: tuple[float, ...]
+    working_capital_to_delta_revenue: float
+    server_useful_life_years: float
+    economic_capex_definition: str
+    depreciation_definition: str
+    utilization_methodology: str
+    calculation_module: str
+    evidence_as_of: str
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class CompanyResearchProfile:
     ticker: str
     issuer_id: str
@@ -200,6 +218,8 @@ class CompanyResearchProfile:
     evidence_items: tuple[ResearchEvidenceItem, ...] = ()
     uncertainty_notes: tuple[str, ...] = ()
     future_scenario_drivers: tuple[str, ...] = ()
+    reinvestment_strategy: ReinvestmentStrategyMetadata | None = None
+    model_risk: Literal["Low", "Medium", "High"] | None = None
 
     def __post_init__(self) -> None:
         if self.profile_status not in PROFILE_STATUSES:
@@ -260,6 +280,40 @@ COMPANY_PROFILE_DEFINITIONS: dict[str, CompanyProfileDefinition] = {
             "profile_contains_provisional_assumptions",
             "multi_class_security_structure",
         ),
+    ),
+    "MSFT": CompanyProfileDefinition(
+        issuer_id="MSFT",
+        ticker="MSFT",
+        company_name="Microsoft Corporation",
+        business_summary="Microsoft issuer-level research profile.",
+        warnings=("profile_contains_provisional_assumptions",),
+    ),
+    "META": CompanyProfileDefinition(
+        issuer_id="META",
+        ticker="META",
+        company_name="Meta Platforms, Inc.",
+        business_summary="Meta issuer-level research profile.",
+        warnings=("profile_contains_provisional_assumptions",),
+    ),
+    "AMZN": CompanyProfileDefinition(
+        "AMZN", "AMZN", "Amazon.com, Inc.",
+        "Amazon unified-production research profile.",
+        ("profile_contains_provisional_assumptions",),
+    ),
+    "MU": CompanyProfileDefinition(
+        "MU", "MU", "Micron Technology, Inc.",
+        "Micron through-cycle unified-production research profile.",
+        ("profile_contains_provisional_assumptions",),
+    ),
+    "AAPL": CompanyProfileDefinition(
+        "AAPL", "AAPL", "Apple Inc.",
+        "Apple unified-production research profile.",
+        ("profile_contains_provisional_assumptions",),
+    ),
+    "AVGO": CompanyProfileDefinition(
+        "AVGO", "AVGO", "Broadcom Inc.",
+        "Broadcom consolidated unified-production research profile.",
+        ("profile_contains_provisional_assumptions",),
     ),
 }
 

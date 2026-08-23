@@ -220,11 +220,17 @@ def test_goog_and_googl_resolve_to_same_issuer_profile():
     assert goog.profile.issuer_id == "ALPHABET_INC"
 
 
-def test_nvda_resolves_independently_and_unknown_is_explicit():
+def test_nvda_and_new_hyperscalers_resolve_and_unknown_is_explicit():
     nvda = get_company_profile("NVDA")
-    unknown = get_company_profile("MSFT")
+    microsoft = get_company_profile("MSFT")
+    meta = get_company_profile("META")
+    amazon = get_company_profile("AMZN")
+    unknown = get_company_profile("TSLA")
     assert nvda.available
     assert nvda.profile.issuer_id == "NVDA"
+    assert microsoft.available and microsoft.profile.issuer_id == "MSFT"
+    assert meta.available and meta.profile.issuer_id == "META"
+    assert amazon.available and amazon.profile.issuer_id == "AMZN"
     assert not unknown.available
     assert unknown.profile is None
     assert unknown.reason == "profile_unavailable"

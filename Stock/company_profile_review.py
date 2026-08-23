@@ -74,6 +74,26 @@ def _assumption_payload(assumption: ResearchAssumption | None):
     }
 
 
+def _reinvestment_strategy_payload(profile: CompanyResearchProfile):
+    strategy = profile.reinvestment_strategy
+    if strategy is None:
+        return None
+    return {
+        "strategy": strategy.strategy,
+        "explicit_years": strategy.explicit_years,
+        "handoff_years": strategy.handoff_years,
+        "economic_capex_to_revenue": strategy.economic_capex_to_revenue,
+        "working_capital_to_delta_revenue": strategy.working_capital_to_delta_revenue,
+        "server_useful_life_years": strategy.server_useful_life_years,
+        "economic_capex_definition": strategy.economic_capex_definition,
+        "depreciation_definition": strategy.depreciation_definition,
+        "utilization_methodology": strategy.utilization_methodology,
+        "calculation_module": strategy.calculation_module,
+        "evidence_as_of": strategy.evidence_as_of,
+        "warnings": strategy.warnings,
+    }
+
+
 def _group_payload(profile: CompanyResearchProfile, group: ReviewGroup):
     if group == "revenue":
         revenue = profile.revenue_framework
@@ -85,9 +105,10 @@ def _group_payload(profile: CompanyResearchProfile, group: ReviewGroup):
         return (_assumption_payload(profile.margin_framework.mature_operating_margin),)
     if group == "capital":
         capital = profile.capital_efficiency_framework
-        return tuple(_assumption_payload(item) for item in (
+        assumptions = tuple(_assumption_payload(item) for item in (
             capital.starting_sales_to_capital, capital.mature_sales_to_capital,
         ))
+        return assumptions + (_reinvestment_strategy_payload(profile),)
     if group == "tax":
         return (_assumption_payload(profile.operating_tax_rate),)
     if group == "wacc":
@@ -335,6 +356,68 @@ def mark_profile_reviewed(
         reviewed_snapshot=snapshot,
         reopened_at=None,
     )
+
+
+def review_complete_profile_one_click(
+    candidate: CompanyResearchProfile,
+    *,
+    reviewed_at: str,
+    previous_state: CompanyProfileReviewState | None = None,
+) -> CompanyProfileReviewState:
+    """Create one complete immutable snapshot without six checkbox actions.
+
+    Existing user notes are retained.  If the same assumptions were already
+    reviewed, the existing snapshot and timestamp are returned unchanged; an
+    evidence-only refresh therefore does not silently create a new review.
+    """
+    if candidate.profile_status != "research_in_progress":
+        raise ValueError("review_requires_research_in_progress_profile")
+    translation = build_multistage_assumptions_from_profile(candidate)
+    if not translation.available or translation.assumptions is None:
+        raise ValueError(
+            translation.reason or "research_profile_incomplete_or_invalid"
+        )
+    timestamp = str(reviewed_at).strip()
+    if not timestamp:
+        raise ValueError("reviewed_at_required")
+    if previous_state is not None and previous_state.issuer_id != candidate.issuer_id:
+        raise ValueError("review_state_issuer_mismatch")
+    if (
+        previous_state is not None
+        and previous_state.profile_status == "reviewed"
+        and previous_state.reviewed_snapshot is not None
+        and candidate_assumption_signature(candidate)
+        == previous_state.reviewed_snapshot.assumption_signature
+    ):
+        return previous_state
+
+    note_by_group = {}
+    overall_note = ""
+    prior_snapshot = None
+    warnings = ()
+    if previous_state is not None:
+        note_by_group = {
+            item.group: item.user_note for item in previous_state.group_reviews
+        }
+        overall_note = previous_state.overall_review_note
+        prior_snapshot = previous_state.reviewed_snapshot
+        warnings = previous_state.warnings
+    groups = tuple(ReviewGroupState(
+        group=group,
+        reviewed=True,
+        user_note=note_by_group.get(group, ""),
+        candidate_signature=candidate_group_signature(candidate, group),
+        reviewed_at=timestamp,
+    ) for group in REQUIRED_REVIEW_GROUPS)
+    draft = CompanyProfileReviewState(
+        issuer_id=candidate.issuer_id,
+        profile_status="research_in_progress",
+        group_reviews=groups,
+        overall_review_note=overall_note,
+        reviewed_snapshot=prior_snapshot,
+        warnings=warnings,
+    )
+    return mark_profile_reviewed(draft, candidate, reviewed_at=timestamp)
 
 
 def reopen_profile_review(

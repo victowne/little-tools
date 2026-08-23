@@ -3,7 +3,9 @@ from dataclasses import replace
 import pandas as pd
 import pytest
 
+from Stock import stock_valuation_mvp as app
 from Stock.alphabet_research import build_alphabet_research_profile
+from Stock.company_profile_one_click import build_one_click_review_apply
 from Stock.company_profiles import build_multistage_assumptions_from_profile
 from Stock.forecast_anchors import ForecastAnchorPoint, RevenueForecastAnchors
 from Stock.fundamentals import (
@@ -159,21 +161,36 @@ def test_alphabet_candidate_is_issuer_level_research_in_progress():
     )
 
 
+def test_alphabet_uses_generic_one_click_workflow_and_shared_issuer_state():
+    profile = research("GOOGL").lookup.profile
+    result = build_one_click_review_apply(
+        profile, current_assumptions(),
+        reviewed_at="2026-08-22T10:00:00+00:00",
+        applied_at="2026-08-22T10:00:01+00:00",
+        preview_validated=True,
+    )
+
+    assert result.reviewed_snapshot.profile.issuer_id == "ALPHABET_INC"
+    assert result.application.issuer == "ALPHABET_INC"
+    assert app.profile_review_state_key("GOOG") == app.profile_review_state_key("GOOGL")
+    assert app.base_profile_application_key("GOOG") == app.base_profile_application_key("GOOGL")
+
+
 def test_candidate_translation_is_exact_and_current_base_is_unchanged():
     current = current_assumptions()
     profile = research().lookup.profile
     translated = build_multistage_assumptions_from_profile(profile)
     assert translated.available
     assert current == current_assumptions()
-    assert translated.assumptions.near_term_revenue_growth == (0.22, 0.17, 0.13)
+    assert translated.assumptions.near_term_revenue_growth == (0.23, 0.20, 0.17)
     assert translated.assumptions.revenue_fade_years == 8
     assert translated.assumptions.forecast_years == 11
     assert translated.assumptions.starting_operating_margin == pytest.approx(
         0.3311032213642185
     )
-    assert translated.assumptions.mature_operating_margin == pytest.approx(0.32)
-    assert translated.assumptions.starting_sales_to_capital == pytest.approx(0.45)
-    assert translated.assumptions.mature_sales_to_capital == pytest.approx(0.60)
+    assert translated.assumptions.mature_operating_margin == pytest.approx(0.34)
+    assert translated.assumptions.starting_sales_to_capital == pytest.approx(0.50)
+    assert translated.assumptions.mature_sales_to_capital == pytest.approx(0.75)
     assert translated.assumptions.operating_tax_rate == pytest.approx(0.17)
     assert translated.assumptions.wacc == pytest.approx(0.0975)
     assert translated.assumptions.terminal_growth == pytest.approx(0.0325)
@@ -238,7 +255,7 @@ def test_candidate_preview_runs_full_dcf_and_share_classes_reconcile():
 def test_terminal_economics_reconcile_and_are_not_pathological():
     profile = research().lookup.profile
     terminal = profile.terminal_framework
-    expected_roic = 0.32 * (1 - 0.17) * 0.60
+    expected_roic = 0.34 * (1 - 0.17) * 0.75
     assert terminal.terminal_roic == pytest.approx(expected_roic)
     assert terminal.terminal_reinvestment_rate == pytest.approx(
         0.0325 / expected_roic

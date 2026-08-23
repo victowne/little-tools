@@ -37,6 +37,7 @@ from Stock.fundamentals import (
 )
 from Stock.multistage_integration import RealCompanyDCFInputs, run_multistage_dcf
 from Stock.nvda_research import build_nvda_research_profile
+from Stock.company_profile_one_click import build_one_click_review_apply
 from Stock.share_normalization import NormalizedShareCount
 from Stock.valuation import MultiStageDCFAssumptions
 
@@ -168,6 +169,141 @@ def test_nvda_profile_is_research_in_progress_with_multiple_evidence_refs():
     assert profile.last_reviewed_at is None
     assert len(profile.revenue_framework.year1_growth.evidence_references) >= 4
     assert profile.uncertainty_notes
+
+
+def test_one_click_review_apply_needs_no_group_confirmations():
+    profile = research().lookup.profile
+    initial = initialize_profile_review(profile)
+    assert initial.incomplete_groups == REQUIRED_REVIEW_GROUPS
+
+    result = build_one_click_review_apply(
+        profile,
+        current_assumptions(),
+        reviewed_at="2026-08-22T10:00:00+00:00",
+        applied_at="2026-08-22T10:00:01+00:00",
+        previous_review_state=initial,
+        preview_validated=True,
+    )
+
+    assert result.review_state.profile_status == "reviewed"
+    assert result.reviewed_snapshot.profile.profile_status == "reviewed"
+    assert result.reviewed_snapshot.reviewed_at == "2026-08-22T10:00:00+00:00"
+    assert result.application.applied_at == "2026-08-22T10:00:01+00:00"
+    assert result.application.assumptions == result.assumptions
+    assert all(item.reviewed for item in result.reviewed_snapshot.group_reviews)
+
+
+def test_one_click_rejects_unavailable_preview_before_snapshot_creation():
+    profile = research().lookup.profile
+    with pytest.raises(ValueError, match="candidate_dcf_preview_unavailable"):
+        build_one_click_review_apply(
+            profile,
+            current_assumptions(),
+            reviewed_at="2026-08-22T10:00:00+00:00",
+            applied_at="2026-08-22T10:00:01+00:00",
+            preview_validated=False,
+        )
+
+
+def test_one_click_session_commit_is_atomic_and_applies_exact_snapshot():
+    profile = research().lookup.profile
+    state = {}
+    before = dict(state)
+    with pytest.raises(ValueError, match="candidate_dcf_preview_unavailable"):
+        app.review_and_apply_profile_to_base_session_state(
+            state, "NVDA", profile, current_assumptions(),
+            reviewed_at="2026-08-22T10:00:00+00:00",
+            applied_at="2026-08-22T10:00:01+00:00",
+            preview_validated=False,
+        )
+    assert state == before
+
+    result = app.review_and_apply_profile_to_base_session_state(
+        state, "NVDA", profile, current_assumptions(),
+        reviewed_at="2026-08-22T10:00:00+00:00",
+        applied_at="2026-08-22T10:00:01+00:00",
+        preview_validated=True,
+    )
+    values = app.initialize_multistage_session_state(state, "NVDA", history())
+    applied_base = app.build_multistage_assumptions_from_ui(values)
+    assert applied_base == result.assumptions
+    assert state[app.research_wacc_session_keys("NVDA")["status"]] == "user_reviewed"
+    assert state[app.base_profile_application_key("NVDA")].source == "reviewed_company_profile"
+
+
+def test_same_candidate_review_reuses_snapshot_and_evidence_refresh_does_not_retimestamp():
+    profile = research().lookup.profile
+    first = build_one_click_review_apply(
+        profile, current_assumptions(),
+        reviewed_at="2026-08-22T10:00:00+00:00",
+        applied_at="2026-08-22T10:00:01+00:00",
+        preview_validated=True,
+    )
+    second = build_one_click_review_apply(
+        profile, first.assumptions,
+        reviewed_at="2026-08-23T10:00:00+00:00",
+        applied_at="2026-08-23T10:00:01+00:00",
+        previous_review_state=first.review_state,
+        previous_application=first.application,
+        preview_validated=True,
+    )
+    assert second.reviewed_snapshot is first.reviewed_snapshot
+    assert second.reviewed_snapshot.reviewed_at == "2026-08-22T10:00:00+00:00"
+    assert second.reused_existing_snapshot
+
+
+def test_changed_candidate_creates_new_snapshot_without_mutating_old_snapshot_or_base():
+    profile = research().lookup.profile
+    first = build_one_click_review_apply(
+        profile, current_assumptions(),
+        reviewed_at="2026-08-22T10:00:00+00:00",
+        applied_at="2026-08-22T10:00:01+00:00",
+        preview_validated=True,
+    )
+    old_snapshot = first.reviewed_snapshot
+    old_base = first.assumptions
+    revenue = profile.revenue_framework
+    changed_y3 = replace(revenue.year3_growth, value=0.27)
+    changed_profile = replace(
+        profile,
+        revenue_framework=replace(revenue, year3_growth=changed_y3),
+    )
+
+    reconciled = reconcile_review_state(first.review_state, changed_profile)
+    assert "review_refresh_recommended" in reconciled.warnings
+    assert old_snapshot.profile.revenue_framework.year3_growth.value == 0.25
+    assert first.application.assumptions == old_base
+
+    updated = build_one_click_review_apply(
+        changed_profile, old_base,
+        reviewed_at="2026-08-23T10:00:00+00:00",
+        applied_at="2026-08-23T10:00:01+00:00",
+        previous_review_state=reconciled,
+        previous_application=first.application,
+        preview_validated=True,
+    )
+    assert updated.reviewed_snapshot is not old_snapshot
+    assert updated.assumptions.near_term_revenue_growth[2] == pytest.approx(0.27)
+    assert old_snapshot.profile.revenue_framework.year3_growth.value == 0.25
+
+
+def test_one_click_preserves_formula_wacc_evidence():
+    profile = research().lookup.profile
+    before = tuple(
+        item for item in profile.evidence_items
+        if item.evidence_id == "formula_based_wacc"
+    )
+    result = build_one_click_review_apply(
+        profile, current_assumptions(),
+        reviewed_at="2026-08-22T10:00:00+00:00",
+        applied_at="2026-08-22T10:00:01+00:00",
+        preview_validated=True,
+    )
+    after = tuple(
+        item for item in result.reviewed_snapshot.profile.evidence_items
+        if item.evidence_id == "formula_based_wacc"
+    )
+    assert after == before
 
 
 def test_current_and_candidate_assumptions_remain_separate():

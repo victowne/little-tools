@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from io import StringIO
 
@@ -53,6 +53,17 @@ from Stock.valuation_sensitivity import (
     WACCTerminalGrowthSensitivity,
     build_wacc_terminal_growth_sensitivity,
 )
+from Stock.reverse_dcf import (
+    GROWTH_UPLIFT,
+    MATURE_MARGIN,
+    MATURE_SALES_TO_CAPITAL,
+    SOLVED,
+    WACC,
+    ReverseDCFAnalysis,
+    ReverseResearchRange,
+    research_ranges_from_profile,
+    run_reverse_dcf,
+)
 from Stock.valuation_scenarios import (
     MultiScenarioDCFResult,
     ScenarioRunResult,
@@ -97,13 +108,37 @@ from Stock.nvda_research import (
     NVDAResearchProfileResult,
     build_nvda_research_profile,
 )
+from Stock.nvda_growth_reassessment import (
+    ConsensusRevenuePoint,
+    GrowthDurationDCFComparison,
+    GrowthDurationReassessment,
+    build_nvda_growth_reassessment,
+    compare_growth_duration_dcf,
+)
 from Stock.alphabet_research import (
     AlphabetResearchProfileResult,
     build_alphabet_research_profile,
 )
+from Stock.hyperscaler_research import (
+    HyperscalerResearchProfileResult,
+    build_meta_research_profile,
+    build_microsoft_research_profile,
+)
+from Stock.amazon_research import (
+    AmazonResearchProfileResult,
+    build_amazon_research_profile,
+    run_amazon_candidate_preview,
+)
+from Stock.unified_company_research import (
+    UnifiedCompanyResearchResult,
+    build_apple_research_profile,
+    build_broadcom_research_profile,
+    build_micron_research_profile,
+)
 from Stock.company_profile_review import (
     REQUIRED_REVIEW_GROUPS,
     CompanyProfileReviewState,
+    candidate_assumption_signature,
     initialize_profile_review,
     mark_profile_reviewed,
     reconcile_review_state,
@@ -118,6 +153,7 @@ from Stock.company_profile_application import (
     build_profile_apply_plan,
     create_reviewed_profile_application,
 )
+from Stock.company_profile_one_click import build_one_click_review_apply
 
 warnings.filterwarnings("ignore")
 
@@ -2008,6 +2044,69 @@ def apply_reviewed_profile_to_base_session_state(
     return application
 
 
+def review_and_apply_profile_to_base_session_state(
+    state,
+    ticker: str,
+    candidate_profile,
+    current_base: MultiStageDCFAssumptions,
+    *,
+    reviewed_at: str,
+    applied_at: str,
+    preview_validated: bool,
+):
+    """Atomically commit one complete Candidate snapshot and exact Base apply."""
+    review_key = profile_review_state_key(ticker)
+    application_key = base_profile_application_key(ticker)
+    previous_review = state.get(review_key)
+    if not isinstance(previous_review, CompanyProfileReviewState):
+        previous_review = None
+    previous_application = state.get(application_key)
+    if not isinstance(previous_application, ReviewedProfileApplication):
+        previous_application = None
+
+    # All validation and object creation happen before any session mutation.
+    result = build_one_click_review_apply(
+        candidate_profile,
+        current_base,
+        reviewed_at=reviewed_at,
+        applied_at=applied_at,
+        previous_review_state=previous_review,
+        previous_application=previous_application,
+        preview_validated=preview_validated,
+    )
+    values = _multistage_base_state_values(result.assumptions)
+    normalized_ticker = ticker.strip().upper()
+    prefix = f"multistage_{normalized_ticker}_"
+    updates = {
+        prefix + name: value
+        for name, value in values.items()
+        if name != "wacc"
+    }
+    wacc_keys = research_wacc_session_keys(ticker)
+    updates.update({
+        wacc_keys["value"]: values["wacc"],
+        wacc_keys["status"]: "user_reviewed",
+        wacc_keys["created_at"]: applied_at,
+        review_key: result.review_state,
+        application_key: result.application,
+    })
+    wacc_note = next((
+        item.user_note.strip()
+        for item in result.reviewed_snapshot.group_reviews
+        if item.group == "wacc" and item.user_note.strip()
+    ), "")
+    research_wacc = result.reviewed_snapshot.profile.wacc_framework.research_wacc
+    updates[wacc_keys["rationale"]] = (
+        wacc_note
+        or str(state.get(wacc_keys["rationale"], "")).strip()
+        or (research_wacc.rationale if research_wacc is not None else "")
+    )
+
+    for key, value in updates.items():
+        state[key] = value
+    return result
+
+
 def mark_research_wacc_reviewed(
     state,
     ticker: str,
@@ -2186,6 +2285,149 @@ def render_multistage_sensitivity(
                         f"WACC {point.wacc:.2%} · g {point.terminal_growth:.2%}："
                         f"{point.reason}"
                     )
+
+
+@st.cache_data(show_spinner=False)
+def calculate_reverse_dcf_cached(
+    inputs,
+    assumptions: MultiStageDCFAssumptions,
+    market_price: float | None,
+    ticker: str,
+    base_source: str,
+    range_items: tuple[tuple[str, float, float], ...] = (),
+) -> ReverseDCFAnalysis:
+    """Cache the expensive full-engine scan without caching mutable UI state."""
+    ranges = {
+        variable: ReverseResearchRange(lower, upper)
+        for variable, lower, upper in range_items
+    }
+    return run_reverse_dcf(
+        inputs,
+        assumptions,
+        market_price,
+        ticker=ticker,
+        base_source=base_source,
+        research_ranges=ranges,
+    )
+
+
+def _reverse_value_label(variable: str, value) -> str:
+    if value is None:
+        return "N/A"
+    if variable == GROWTH_UPLIFT:
+        if isinstance(value, tuple):
+            return " / ".join(f"{item:.1%}" for item in value)
+        return f"{value * 100:+.2f} pp"
+    if variable in {MATURE_MARGIN, WACC}:
+        return f"{float(value):.2%}"
+    return f"{float(value):.3f}x"
+
+
+def _reverse_gap_label(result) -> str:
+    if result.status != SOLVED or result.implied_value is None:
+        return "N/A"
+    if result.variable == GROWTH_UPLIFT:
+        return f"{result.implied_value * 100:+.2f} pp each year"
+    base = float(result.research_value)
+    difference = result.implied_value - base
+    if result.variable == MATURE_MARGIN:
+        return f"{difference * 100:+.2f} pp"
+    if result.variable == WACC:
+        return f"{difference * 10_000:+.0f} bp"
+    return f"{difference:+.3f}x"
+
+
+def render_reverse_dcf(
+    analysis: ReverseDCFAnalysis,
+    *,
+    model_risk: str | None = None,
+    limitations: tuple[str, ...] = (),
+) -> None:
+    """Render read-only market-implied expectations from a pure result."""
+    st.subheader("Reverse DCF — Market-Implied Expectations")
+    st.caption(
+        "一次只改变一个假设，并在每个求解点完整重跑 production DCF；"
+        "结果是各自独立的市场隐含条件，不代表这些条件需要同时成立，也不会改写 Base。"
+        " Holding all other Research Base assumptions constant, each row asks "
+        "what one condition would reconcile DCF/share with market price."
+    )
+    summary = st.columns(4)
+    summary[0].metric("Base Source", analysis.base_source)
+    summary[1].metric(
+        "Base DCF / Share",
+        f"${analysis.base_dcf_per_share:.2f}"
+        if analysis.base_dcf_per_share is not None else "N/A",
+    )
+    summary[2].metric(
+        "Market Price",
+        f"${analysis.market_price:.2f}" if analysis.market_price is not None else "N/A",
+    )
+    summary[3].metric(
+        "Price / Base DCF",
+        f"{analysis.price_to_base_dcf:.2f}x"
+        if analysis.price_to_base_dcf is not None else "N/A",
+    )
+
+    labels = {
+        GROWTH_UPLIFT: "Y1/Y2/Y3 equal growth uplift",
+        MATURE_MARGIN: "Mature Operating Margin",
+        MATURE_SALES_TO_CAPITAL: "Mature Sales-to-Capital",
+        WACC: "Research WACC",
+    }
+    rows = []
+    for result in analysis.results:
+        implied = result.implied_value
+        if result.variable == GROWTH_UPLIFT and result.status == SOLVED:
+            implied_label = (
+                f"{_reverse_value_label(result.variable, implied)} → "
+                f"{_reverse_value_label(result.variable, result.implied_growth_path)}"
+            )
+        else:
+            implied_label = _reverse_value_label(result.variable, implied)
+        research_range = (
+            f"{_reverse_value_label(result.variable, result.research_range.lower)} – "
+            f"{_reverse_value_label(result.variable, result.research_range.upper)}"
+            if result.research_range is not None else "N/A"
+        )
+        rows.append({
+            "Single Variable": labels[result.variable],
+            "Research Base": _reverse_value_label(
+                result.variable, result.research_value
+            ),
+            "Market-Implied": implied_label,
+            "Status": result.status,
+            "Gap": _reverse_gap_label(result),
+            "Research Range": research_range,
+            "Range Relation": result.range_relation,
+            "Expectation Gap": result.expectation_gap,
+            "Solved DCF": (
+                f"${result.implied_dcf_value:.2f}"
+                if result.implied_dcf_value is not None else "N/A"
+            ),
+            "TV / EV": (
+                f"{result.terminal_value_share:.1%}"
+                if result.terminal_value_share is not None else "N/A"
+            ),
+            "Reason": result.reason or "",
+        })
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    st.caption(
+        "Search bounds：Growth Δ −30pp to +50pp · Mature Margin 0–80% · "
+        "Mature S/C 0.1–5.0x · WACC terminal g + 0.5pp to 20%."
+    )
+    if any(
+        warning != "single_variable_results_are_not_joint_requirements"
+        for warning in analysis.warnings
+    ):
+        st.warning(
+            "多个维度无法在合理单变量区间内得到唯一解；这表示市场价格不能被"
+            "安全地归因于某一个独立假设，而不是一个投资结论。"
+        )
+    if model_risk or limitations:
+        with st.expander("Reverse DCF model context", expanded=False):
+            st.write(f"Company Profile model risk：{model_risk or 'N/A'}")
+            for limitation in limitations:
+                st.write(f"• {limitation}")
 
 
 def render_beta_robustness(
@@ -2642,22 +2884,35 @@ NVDA_REVIEW_GROUP_LABELS = {
 }
 
 
+def profile_review_state_key(ticker: str) -> str:
+    issuer_key, _ = issuer_normalization_metadata(ticker)
+    return f"company_profile_review_{issuer_key}"
+
+
+def initialize_profile_review_session_state(
+    session_state,
+    ticker: str,
+    candidate_profile,
+) -> CompanyProfileReviewState:
+    """Persist a generic issuer-level review state across reruns."""
+    key = profile_review_state_key(ticker)
+    existing = session_state.get(key)
+    if not isinstance(existing, CompanyProfileReviewState):
+        state = initialize_profile_review(candidate_profile)
+    else:
+        state = reconcile_review_state(existing, candidate_profile)
+    session_state[key] = state
+    return state
+
+
 def initialize_nvda_review_session_state(
     session_state,
     candidate_profile,
 ) -> CompanyProfileReviewState:
-    """Persist and reconcile one issuer-level review state across reruns."""
-    existing = session_state.get(NVDA_REVIEW_STATE_KEY)
-    if not isinstance(existing, CompanyProfileReviewState):
-        state = initialize_profile_review(candidate_profile)
-    else:
-        previous = existing
-        state = reconcile_review_state(existing, candidate_profile)
-        for group in REQUIRED_REVIEW_GROUPS:
-            if previous.group(group).reviewed and not state.group(group).reviewed:
-                session_state[f"nvda_review_{group}_checked"] = False
-    session_state[NVDA_REVIEW_STATE_KEY] = state
-    return state
+    """Backward-compatible NVDA wrapper around the generic state helper."""
+    return initialize_profile_review_session_state(
+        session_state, "NVDA", candidate_profile
+    )
 
 
 def _review_evidence_line(profile, group: str) -> str:
@@ -2742,6 +2997,180 @@ def _review_group_rationale(profile, group: str) -> str:
     if group == "wacc":
         return profile.wacc_framework.rationale
     return profile.terminal_framework.terminal_growth_rationale
+
+
+def _one_click_review_apply_callback(
+    state,
+    ticker: str,
+    candidate_profile,
+    current_base: MultiStageDCFAssumptions,
+    preview_validated: bool,
+) -> None:
+    reviewed_at = pd.Timestamp.now(tz="UTC").isoformat()
+    applied_at = pd.Timestamp.now(tz="UTC").isoformat()
+    review_and_apply_profile_to_base_session_state(
+        state, ticker, candidate_profile, current_base,
+        reviewed_at=reviewed_at, applied_at=applied_at,
+        preview_validated=preview_validated,
+    )
+
+
+def render_one_click_profile_workflow(
+    ticker: str,
+    candidate_profile,
+    review_state: CompanyProfileReviewState,
+    current_base: MultiStageDCFAssumptions,
+    candidate_run: MultiStageDCFRunResult | None,
+) -> None:
+    """Render the generic explicit one-click Review & Apply workflow."""
+    st.markdown("### Research Profile Review & Apply")
+    translation = build_multistage_assumptions_from_profile(candidate_profile)
+    candidate = translation.assumptions
+    preview_valid = candidate_run is not None
+    complete = translation.available and candidate is not None and preview_valid
+    previous = st.session_state.get(base_profile_application_key(ticker))
+    if not isinstance(previous, ReviewedProfileApplication):
+        previous = None
+
+    snapshot = review_state.reviewed_snapshot
+    same_reviewed_candidate = (
+        review_state.profile_status == "reviewed"
+        and snapshot is not None
+        and candidate_assumption_signature(candidate_profile)
+        == snapshot.assumption_signature
+    )
+    candidate_changed = (
+        review_state.profile_status == "reviewed"
+        and snapshot is not None
+        and not same_reviewed_candidate
+    )
+
+    if "reviewed_profile_evidence_changed" in review_state.warnings:
+        st.info(
+            "Research evidence has refreshed since review, while the reviewed "
+            "assumptions remain unchanged."
+        )
+
+    if candidate is not None:
+        changes = []
+        for field, label in PROFILE_APPLY_FIELD_LABELS.items():
+            candidate_value = {
+                "year_1_growth": candidate.near_term_revenue_growth[0],
+                "year_2_growth": candidate.near_term_revenue_growth[1],
+                "year_3_growth": candidate.near_term_revenue_growth[2],
+                "revenue_fade_years": candidate.revenue_fade_years,
+                "forecast_years": candidate.forecast_years,
+                "starting_operating_margin": candidate.starting_operating_margin,
+                "mature_operating_margin": candidate.mature_operating_margin,
+                "starting_sales_to_capital": candidate.starting_sales_to_capital,
+                "mature_sales_to_capital": candidate.mature_sales_to_capital,
+                "operating_tax_rate": candidate.operating_tax_rate,
+                "research_wacc": candidate.wacc,
+                "terminal_growth": candidate.terminal_growth,
+            }[field]
+            base_value = {
+                "year_1_growth": current_base.near_term_revenue_growth[0],
+                "year_2_growth": current_base.near_term_revenue_growth[1],
+                "year_3_growth": current_base.near_term_revenue_growth[2],
+                "revenue_fade_years": current_base.revenue_fade_years,
+                "forecast_years": current_base.forecast_years,
+                "starting_operating_margin": current_base.starting_operating_margin,
+                "mature_operating_margin": current_base.mature_operating_margin,
+                "starting_sales_to_capital": current_base.starting_sales_to_capital,
+                "mature_sales_to_capital": current_base.mature_sales_to_capital,
+                "operating_tax_rate": current_base.operating_tax_rate,
+                "research_wacc": current_base.wacc,
+                "terminal_growth": current_base.terminal_growth,
+            }[field]
+            equal = (
+                base_value == candidate_value
+                if isinstance(base_value, int) and isinstance(candidate_value, int)
+                else np.isclose(float(base_value), float(candidate_value))
+            )
+            if not equal:
+                changes.append({
+                    "Assumption": label,
+                    "Current Base": _profile_apply_value(field, base_value),
+                    "Research Candidate": _profile_apply_value(field, candidate_value),
+                })
+        st.markdown("**Current Base vs Research Candidate — meaningful differences**")
+        if changes:
+            st.dataframe(
+                pd.DataFrame(changes).set_index("Assumption"), width="stretch"
+            )
+        else:
+            st.caption("Current Base values already match the Research Candidate.")
+
+    if not complete:
+        st.warning(
+            "Research Candidate is incomplete or its DCF Preview is unavailable; "
+            "Review & Apply is disabled."
+        )
+        st.button(
+            "Review & Apply Research Profile",
+            key=f"one_click_review_apply_{candidate_profile.issuer_id}",
+            disabled=True,
+        )
+        return
+
+    if candidate_changed:
+        st.info(
+            "New Research Candidate available. The prior Reviewed Snapshot and "
+            "Current Base remain unchanged until explicit Review & Apply."
+        )
+        st.button(
+            "Review & Apply Updated Research Profile",
+            key=f"one_click_review_apply_{candidate_profile.issuer_id}",
+            type="primary",
+            on_click=_one_click_review_apply_callback,
+            args=(st.session_state, ticker, candidate_profile, current_base, True),
+        )
+        return
+
+    if same_reviewed_candidate and snapshot is not None:
+        plan = build_profile_apply_plan(
+            snapshot, current_base, previous_application=previous
+        )
+        if plan.already_applied:
+            st.success("Reviewed profile already applied")
+            st.caption(
+                f"Reviewed at: {previous.reviewed_at} · Applied at: "
+                f"{previous.applied_at} · Source: {previous.source}"
+            )
+            return
+        if plan.base_diverged:
+            st.warning(
+                "Current Base has diverged from the applied Reviewed Profile."
+            )
+            st.button(
+                "Reapply Reviewed Profile",
+                key=f"one_click_reapply_{candidate_profile.issuer_id}",
+                type="primary",
+                on_click=_explicit_profile_apply_callback,
+                args=(st.session_state, ticker, snapshot, current_base),
+            )
+            return
+        st.info("Reviewed Snapshot is ready and has not yet been applied.")
+        st.button(
+            "Apply Reviewed Profile",
+            key=f"one_click_apply_reviewed_{candidate_profile.issuer_id}",
+            type="primary",
+            on_click=_explicit_profile_apply_callback,
+            args=(st.session_state, ticker, snapshot, current_base),
+        )
+        return
+
+    st.caption(
+        "One deliberate action validates the Candidate, creates an immutable "
+        "Reviewed Snapshot, and applies that exact snapshot to Current Base."
+    )
+    st.button(
+        "Review & Apply Research Profile",
+        key=f"one_click_review_apply_{candidate_profile.issuer_id}",
+        type="primary",
+        on_click=_one_click_review_apply_callback,
+        args=(st.session_state, ticker, candidate_profile, current_base, True),
+    )
 
 
 def render_nvda_research_review(
@@ -3023,6 +3452,195 @@ def render_reviewed_profile_application(
     return plan
 
 
+def render_nvda_growth_duration_reassessment(
+    reassessment: GrowthDurationReassessment,
+    comparison: GrowthDurationDCFComparison | None,
+) -> None:
+    """Render the isolated read-only NVDA growth-duration research shadow."""
+    with st.expander(
+        "NVDA Growth Duration & Product-Cycle Reassessment",
+        expanded=False,
+    ):
+        st.caption(
+            "Read-only research shadow. It does not update the NVDA Research "
+            "Candidate, Review state, Reviewed Snapshot, Current Base, or Apply workflow."
+        )
+
+        st.markdown("**A. Quarterly Revenue momentum**")
+        quarterly = pd.DataFrame([
+            {
+                "Quarter": point.fiscal_quarter,
+                "Period end": point.period_end,
+                "Revenue (B)": point.revenue / 1e9,
+                "YoY": point.yoy_growth,
+                "Sequential": point.sequential_growth,
+                "Source": point.source,
+            }
+            for point in reassessment.quarterly_revenue
+        ]).set_index("Quarter")
+        st.dataframe(
+            quarterly.style.format({
+                "Revenue (B)": "{:.3f}", "YoY": "{:.2%}",
+                "Sequential": "{:.2%}",
+            }, na_rep="N/A"),
+            width="stretch",
+        )
+        st.caption(
+            "The eight-quarter path decelerated during the initial Blackwell "
+            "transition, then reaccelerated through Q1 FY2027; a single-quarter "
+            "annualization is not treated as a forecast."
+        )
+
+        st.markdown("**B. Data Center momentum**")
+        data_center = pd.DataFrame([
+            {
+                "Quarter": point.fiscal_quarter,
+                "Revenue (B)": point.revenue / 1e9,
+                "YoY": point.yoy_growth,
+                "Sequential": point.sequential_growth,
+                "Share of total Revenue": point.share_of_total_revenue,
+            }
+            for point in reassessment.data_center_revenue
+        ]).set_index("Quarter")
+        st.dataframe(
+            data_center.style.format({
+                "Revenue (B)": "{:.3f}", "YoY": "{:.2%}",
+                "Sequential": "{:.2%}", "Share of total Revenue": "{:.2%}",
+            }),
+            width="stretch",
+        )
+
+        st.markdown("**C. Product-cycle timeline**")
+        product_cycles = pd.DataFrame([
+            {
+                "Platform": point.platform,
+                "Launch / ramp window": point.ramp_window,
+                "Current evidence": point.current_evidence,
+                "Revenue relevance": point.revenue_relevance,
+                "Confidence": point.confidence,
+                "Source": point.source,
+            }
+            for point in reassessment.product_cycles
+        ]).set_index("Platform")
+        st.dataframe(product_cycles, width="stretch")
+
+        st.markdown("**D. Consensus, guidance and period alignment**")
+        run_rate_columns = st.columns(4)
+        for column, label, value in (
+            (run_rate_columns[0], "Validated TTM", reassessment.run_rates.validated_ttm_revenue),
+            (run_rate_columns[1], "Latest quarter ×4", reassessment.run_rates.latest_quarter_annualized),
+            (run_rate_columns[2], "Guidance midpoint ×4", reassessment.run_rates.guidance_midpoint_annualized),
+            (run_rate_columns[3], "FY2027 consensus", reassessment.run_rates.fy2027_consensus_revenue),
+        ):
+            column.metric(label, f"${value / 1e9:.3f}B" if value is not None else "N/A")
+        st.caption(
+            "Quarter ×4 figures are run-rate diagnostics only. FY consensus ends "
+            "before the corresponding TTM-based DCF year and is not copied directly."
+        )
+        alignment_frame = pd.DataFrame([
+            {
+                "DCF Year": f"Y{item.dcf_year}",
+                "DCF period end": item.dcf_period_end,
+                "Fiscal consensus period": item.fiscal_consensus_period_end,
+                "Alignment": item.alignment,
+                "Note": item.note,
+            }
+            for item in reassessment.alignments
+        ]).set_index("DCF Year")
+        st.dataframe(alignment_frame, width="stretch")
+
+        st.markdown("**E. Y1–Y5 research path**")
+        current_growth = reassessment.current_implied_first_five_growth
+        research_path = pd.DataFrame([
+            {
+                "Year": f"Y{item.year_index}",
+                "Existing candidate / implied fade": current_growth[item.year_index - 1],
+                "Slower-normalization shadow": item.growth,
+                "Confidence": item.confidence,
+                "Evidence": "；".join(item.evidence),
+                "Rationale": item.rationale,
+            }
+            for item in reassessment.research_path
+        ]).set_index("Year")
+        st.dataframe(
+            research_path.style.format({
+                "Existing candidate / implied fade": "{:.2%}",
+                "Slower-normalization shadow": "{:.2%}",
+            }),
+            width="stretch",
+        )
+        st.caption(
+            "The shadow is an upper-duration diagnostic, not a revised stored "
+            "Research Candidate. Current evidence is insufficient to update the profile."
+        )
+
+        if comparison is not None:
+            st.markdown("**F–G. Existing versus five-year shadow DCF**")
+            year_rows = []
+            for existing_year, shadow_year, existing_pv, shadow_pv in zip(
+                comparison.existing.operating_forecast.years[:5],
+                comparison.shadow.operating_forecast.years[:5],
+                comparison.existing.discounted_forecast.years[:5],
+                comparison.shadow.discounted_forecast.years[:5],
+            ):
+                year_rows.append({
+                    "Year": f"Y{existing_year.year_index}",
+                    "Existing Revenue (B)": existing_year.revenue / 1e9,
+                    "Shadow Revenue (B)": shadow_year.revenue / 1e9,
+                    "Existing FCFF (B)": existing_year.fcff / 1e9,
+                    "Shadow FCFF (B)": shadow_year.fcff / 1e9,
+                    "Existing FCFF PV (B)": existing_pv.present_value_fcff / 1e9,
+                    "Shadow FCFF PV (B)": shadow_pv.present_value_fcff / 1e9,
+                })
+            st.dataframe(
+                pd.DataFrame(year_rows).set_index("Year").style.format("{:.3f}"),
+                width="stretch",
+            )
+
+            def summary_row(label, run):
+                per_share = run.per_share_value
+                return {
+                    "Model": label,
+                    "Explicit FCFF (B)": run.operating_forecast.total_fcff / 1e9,
+                    "Explicit FCFF PV (B)": run.enterprise_value.explicit_forecast_pv / 1e9,
+                    "Enterprise Value (B)": run.enterprise_value.enterprise_value / 1e9,
+                    "Equity Value (B)": run.equity_value.equity_value / 1e9,
+                    "Intrinsic / Share": per_share.intrinsic_value_per_share if per_share else None,
+                    "TV / EV": run.enterprise_value.terminal_value_share,
+                }
+
+            summary = pd.DataFrame([
+                summary_row("Existing Candidate", comparison.existing),
+                summary_row("Slower-normalization shadow", comparison.shadow),
+            ]).set_index("Model")
+            st.dataframe(
+                summary.style.format({
+                    "Explicit FCFF (B)": "{:.3f}",
+                    "Explicit FCFF PV (B)": "{:.3f}",
+                    "Enterprise Value (B)": "{:.3f}",
+                    "Equity Value (B)": "{:.3f}",
+                    "Intrinsic / Share": "${:.2f}",
+                    "TV / EV": "{:.2%}",
+                }),
+                width="stretch",
+            )
+
+        st.markdown("**H. Evidence balance and decision**")
+        evidence_columns = st.columns(2)
+        with evidence_columns[0]:
+            st.markdown("Supporting longer duration")
+            for item in reassessment.supporting_evidence:
+                st.write(f"• {item}")
+        with evidence_columns[1]:
+            st.markdown("Against longer duration")
+            for item in reassessment.opposing_evidence:
+                st.write(f"• {item}")
+        st.warning(
+            f"Growth-duration decision: {reassessment.decision}. The stored "
+            "55% / 40% / 25% candidate remains unchanged."
+        )
+
+
 def render_company_research_profile(
     lookup: CompanyProfileLookupResult,
     *,
@@ -3031,7 +3649,13 @@ def render_company_research_profile(
     current_run: MultiStageDCFRunResult | None = None,
     candidate_run: MultiStageDCFRunResult | None = None,
     nvda_research: NVDAResearchProfileResult | None = None,
+    nvda_growth_reassessment: GrowthDurationReassessment | None = None,
+    nvda_growth_comparison: GrowthDurationDCFComparison | None = None,
     alphabet_research: AlphabetResearchProfileResult | None = None,
+    hyperscaler_research: HyperscalerResearchProfileResult | None = None,
+    amazon_research: AmazonResearchProfileResult | None = None,
+    unified_research: UnifiedCompanyResearchResult | None = None,
+    current_price: float | None = None,
 ) -> None:
     """Render research evidence and the explicit reviewed-profile transition."""
     st.subheader("Company Research Profile 公司研究档案")
@@ -3042,21 +3666,20 @@ def render_company_research_profile(
         return
 
     candidate_profile = lookup.profile
+    workflow_ticker = (
+        current_run.inputs.ticker
+        if current_run is not None
+        else candidate_profile.ticker
+    )
     review_state = None
     if (
-        candidate_profile.issuer_id == "NVDA"
-        and candidate_profile.profile_status == "research_in_progress"
+        candidate_profile.profile_status == "research_in_progress"
+        and candidate_profile.issuer_id in {"NVDA", "ALPHABET_INC", "MSFT", "META", "AMZN", "MU", "AAPL", "AVGO"}
     ):
-        review_state = initialize_nvda_review_session_state(
-            st.session_state, candidate_profile
+        review_state = initialize_profile_review_session_state(
+            st.session_state, workflow_ticker, candidate_profile
         )
-    profile = (
-        review_state.reviewed_snapshot.profile
-        if review_state is not None
-        and review_state.profile_status == "reviewed"
-        and review_state.reviewed_snapshot is not None
-        else candidate_profile
-    )
+    profile = candidate_profile
     status_labels = {
         "provisional": "Provisional 临时",
         "research_in_progress": "Research in progress 研究中",
@@ -3066,14 +3689,21 @@ def render_company_research_profile(
         f"Issuer：{profile.issuer_id} · Status："
         f"{status_labels[profile.profile_status]}"
     )
+    if profile.model_risk is not None:
+        st.caption(
+            f"Production-model abstraction risk：{profile.model_risk} · "
+            "research descriptor only, not an investment rating."
+        )
     if profile.profile_status == "provisional":
         st.warning(
             "Current operating assumptions are provisional and have not yet "
             "been reviewed as company-specific research assumptions."
         )
     elif profile.profile_status == "research_in_progress":
+        research_candidate_label = profile.company_name
         st.info(
-            "NVDA Research Candidate is read-only and unreviewed. It does not "
+            f"{research_candidate_label} Research Candidate is read-only and "
+            "unreviewed. It does not "
             "change the editable Base DCF assumptions."
         )
 
@@ -3146,11 +3776,15 @@ def render_company_research_profile(
                 "all-or-nothing action below."
             )
 
-            research_details = nvda_research or alphabet_research
+            research_details = (
+                nvda_research or alphabet_research or hyperscaler_research
+                or amazon_research or unified_research
+            )
             if research_details is not None:
                 issuer_label = (
                     "Alphabet"
-                    if profile.issuer_id == "ALPHABET_INC" else "NVDA"
+                    if profile.issuer_id == "ALPHABET_INC"
+                    else profile.company_name
                 )
                 with st.expander(
                     f"{issuer_label} Revenue Evidence and Period Reconciliation",
@@ -3178,6 +3812,18 @@ def render_company_research_profile(
                         ),
                         width="stretch",
                     )
+
+                    if hasattr(research_details, "confidence_assessments"):
+                        confidence_frame = pd.DataFrame([
+                            {
+                                "Category": item.category,
+                                "Confidence": item.confidence,
+                                "Rationale": item.rationale,
+                            }
+                            for item in research_details.confidence_assessments
+                        ]).set_index("Category")
+                        st.markdown("**Evidence confidence — descriptive, not a score**")
+                        st.dataframe(confidence_frame, width="stretch")
                     for note in research_details.period_reconciliation:
                         st.caption(note)
                     range_frame = pd.DataFrame([
@@ -3200,7 +3846,305 @@ def render_company_research_profile(
                         width="stretch",
                     )
 
+                if (
+                    unified_research is not None
+                    and unified_research.micron_period_alignment is not None
+                ):
+                    alignment = unified_research.micron_period_alignment
+                    with st.expander(
+                        "Micron Forecast-Period Alignment Audit",
+                        expanded=False,
+                    ):
+                        alignment_rows = [{
+                            "Metric": "Current TTM",
+                            "Period": alignment.ttm_period,
+                            "Revenue (B)": alignment.ttm_revenue / 1e9,
+                            "Overlap / construction": "FY2025 Q4 + FY2026 Q1-Q3",
+                        }]
+                        alignment_rows.extend({
+                            "Metric": point.fiscal_year + " consensus",
+                            "Period": point.fiscal_year,
+                            "Revenue (B)": point.revenue / 1e9,
+                            "Overlap / construction": (
+                                f"Fiscal consensus; analysts {point.analyst_count}"
+                                if point.analyst_count is not None
+                                else "Fiscal consensus; analyst count N/A"
+                            ),
+                        } for point in alignment.fiscal_consensus)
+                        alignment_rows.extend({
+                            "Metric": f"DCF Y{point.year_index}",
+                            "Period": point.period,
+                            "Revenue (B)": point.revenue / 1e9,
+                            "Overlap / construction": " + ".join(
+                                label for label, _ in point.quarters
+                            ),
+                        } for point in alignment.rolling_years)
+                        st.dataframe(
+                            pd.DataFrame(alignment_rows).set_index("Metric").style.format(
+                                {"Revenue (B)": "{:.3f}"}
+                            ),
+                            width="stretch",
+                        )
+                        st.caption(alignment.interpolation_method)
+                        st.warning(
+                            "Old 45% Y1 implied Revenue "
+                            f"{alignment.old_y1_implied_revenue / 1e9:.3f}B, "
+                            "which approximately reproduced FY2026 consensus rather "
+                            "than the forward rolling year. Period-alignment error: "
+                            f"{'Yes' if alignment.old_y1_alignment_error else 'No'}."
+                        )
+                        st.caption(
+                            "The rolling path is evidence, not a price-calibrated forecast. "
+                            "Only Y1/Y2/Y3 enter production; Y4 onward remains deterministic fade."
+                        )
+
+                if nvda_growth_reassessment is not None:
+                    render_nvda_growth_duration_reassessment(
+                        nvda_growth_reassessment,
+                        nvda_growth_comparison,
+                    )
+
                 if alphabet_research is not None:
+                    with st.expander(
+                        "Alphabet Growth & Mature Economics Reassessment",
+                        expanded=False,
+                    ):
+                        reassessment = alphabet_research.reassessment
+                        st.caption(
+                            f"Evidence as of {reassessment.evidence_as_of} · "
+                            "Read-only research; no Base or Scenario state is changed."
+                        )
+                        st.markdown("**A. Growth Momentum**")
+                        quarterly_frame = pd.DataFrame([
+                            {
+                                "Quarter": row.quarter,
+                                "Revenue (B)": row.revenue / 1e9,
+                                "YoY Growth": row.year_over_year_growth,
+                                "Sequential Growth": row.sequential_growth,
+                                "Source": row.source,
+                            }
+                            for row in reassessment.quarterly_revenue
+                        ]).set_index("Quarter")
+                        st.dataframe(
+                            quarterly_frame.style.format({
+                                "Revenue (B)": "{:.3f}",
+                                "YoY Growth": "{:.2%}",
+                                "Sequential Growth": "{:.2%}",
+                            }, na_rep="N/A"),
+                            width="stretch",
+                        )
+                        st.caption(
+                            "Eight-quarter consolidated YoY growth accelerated "
+                            "from 15% to 24%; seasonality makes sequential growth "
+                            "contextual rather than a forecast anchor."
+                        )
+                        segment_momentum_frame = pd.DataFrame([
+                            {
+                                "Business": row.segment,
+                                "Quarter": row.quarter,
+                                "Revenue (B)": row.revenue / 1e9,
+                                "YoY Growth": row.year_over_year_growth,
+                                "Source": row.source,
+                            }
+                            for row in reassessment.segment_momentum
+                        ]).set_index(["Business", "Quarter"])
+                        st.dataframe(
+                            segment_momentum_frame.style.format({
+                                "Revenue (B)": "{:.3f}",
+                                "YoY Growth": "{:.2%}",
+                            }),
+                            width="stretch",
+                        )
+                        contribution_frame = pd.DataFrame([
+                            {
+                                "Business": row.segment,
+                                "Prior-year Revenue Weight": row.prior_year_revenue_weight,
+                                "Q2 2026 YoY Growth": row.year_over_year_growth,
+                                "Growth Contribution": row.consolidated_growth_contribution,
+                            }
+                            for row in reassessment.q2_2026_growth_contributions
+                        ]).set_index("Business")
+                        st.markdown("**Q2 2026 issuer-level growth contribution diagnostic**")
+                        st.dataframe(
+                            contribution_frame.style.format({
+                                "Prior-year Revenue Weight": "{:.2%}",
+                                "Q2 2026 YoY Growth": "{:.2%}",
+                                "Growth Contribution": "{:.2%}",
+                            }),
+                            width="stretch",
+                        )
+                        st.caption(
+                            "Contribution = prior-year segment weight × segment "
+                            "growth. This reconciles issuer growth and is not a segment DCF."
+                        )
+
+                        st.markdown("**B. Capital Efficiency**")
+                        capital_evidence = {
+                            item.evidence_id: item for item in profile.evidence_items
+                        }
+                        latest_sc = profile.capital_efficiency_framework.latest_sales_to_capital
+                        normalized_sc = profile.capital_efficiency_framework.normalized_3y_sales_to_capital
+                        capital_columns = st.columns(4)
+                        capital_columns[0].metric(
+                            "Latest accounting S/C",
+                            _profile_evidence_display(latest_sc, kind="multiple"),
+                        )
+                        capital_columns[1].metric(
+                            "Normalized 3Y S/C",
+                            _profile_evidence_display(normalized_sc, kind="multiple"),
+                        )
+                        for column, evidence_id, label in (
+                            (capital_columns[2], "h1_2026_capex", "H1 2026 CapEx"),
+                            (capital_columns[3], "h1_2026_depreciation", "H1 2026 Depreciation"),
+                        ):
+                            item = capital_evidence.get(evidence_id)
+                            column.metric(
+                                label,
+                                _diagnostic_display(
+                                    float(item.value), "amount", statement_currency
+                                ) if item is not None and isinstance(item.value, (int, float)) else "N/A",
+                            )
+                        for index, step in enumerate(reassessment.capex_lead_lag, 1):
+                            st.caption(f"{index}. {step}")
+
+                        st.markdown("**C. Mature Economics Matrix**")
+                        matrix_frame = pd.DataFrame([
+                            {
+                                "Mature Margin": point.mature_operating_margin,
+                                "Mature S/C": point.mature_sales_to_capital,
+                                "Terminal ROIC": point.terminal_roic,
+                                "Terminal Reinvestment": point.terminal_reinvestment_rate,
+                                "FCFF / NOPAT": point.fcff_to_nopat,
+                            }
+                            for point in reassessment.terminal_economics_matrix
+                        ]).set_index(["Mature Margin", "Mature S/C"])
+                        st.dataframe(
+                            matrix_frame.style.format({
+                                "Terminal ROIC": "{:.2%}",
+                                "Terminal Reinvestment": "{:.2%}",
+                                "FCFF / NOPAT": "{:.2%}",
+                            }),
+                            width="stretch",
+                        )
+                        st.caption(
+                            "Terminal ROIC = mature margin × (1 − tax) × S/C; "
+                            "reinvestment = terminal growth / ROIC. Diagnostic only."
+                        )
+
+                        st.markdown("**D. Existing vs Revised Candidate**")
+                        revision_frame = pd.DataFrame([
+                            {
+                                "Parameter": item.parameter,
+                                "Existing Candidate": (
+                                    str(int(item.existing_value))
+                                    if item.unit == "integer"
+                                    else (
+                                        f"{item.existing_value:.2%}"
+                                        if item.unit == "percent"
+                                        else f"{item.existing_value:.2f}x"
+                                    )
+                                ),
+                                "Revised Candidate": (
+                                    str(int(item.revised_value))
+                                    if item.unit == "integer"
+                                    else (
+                                        f"{item.revised_value:.2%}"
+                                        if item.unit == "percent"
+                                        else f"{item.revised_value:.2f}x"
+                                    )
+                                ),
+                                "Evidence": item.evidence,
+                                "Why": item.rationale,
+                            }
+                            for item in reassessment.revisions
+                        ]).set_index("Parameter")
+                        st.dataframe(revision_frame, width="stretch")
+                        st.caption(reassessment.revision_note)
+
+                        if current_run is not None:
+                            existing_run = run_multistage_dcf(
+                                current_run.inputs,
+                                reassessment.existing_candidate,
+                            )
+                            revised_run = run_multistage_dcf(
+                                current_run.inputs,
+                                reassessment.revised_candidate,
+                            )
+                            growth_only = run_multistage_dcf(
+                                current_run.inputs,
+                                replace(
+                                    reassessment.existing_candidate,
+                                    near_term_revenue_growth=(0.23, 0.20, 0.17),
+                                ),
+                            )
+                            margin_only = run_multistage_dcf(
+                                current_run.inputs,
+                                replace(
+                                    reassessment.existing_candidate,
+                                    mature_operating_margin=0.34,
+                                ),
+                            )
+                            sales_to_capital_only = run_multistage_dcf(
+                                current_run.inputs,
+                                replace(
+                                    reassessment.existing_candidate,
+                                    starting_sales_to_capital=0.50,
+                                    mature_sales_to_capital=0.70,
+                                ),
+                            )
+
+                            def reassessment_run_row(label, run):
+                                years = run.operating_forecast.years
+                                per_share = run.per_share_value
+                                return {
+                                    "Run": label,
+                                    "Intrinsic / Share": (
+                                        per_share.intrinsic_value_per_share
+                                        if per_share is not None else None
+                                    ),
+                                    "Enterprise Value (B)": run.enterprise_value.enterprise_value / 1e9,
+                                    "Equity Value (B)": run.equity_value.equity_value / 1e9,
+                                    "TV / EV": run.enterprise_value.terminal_value_share,
+                                    "Y1 Revenue (B)": years[0].revenue / 1e9,
+                                    "Y3 Revenue (B)": years[2].revenue / 1e9,
+                                    "Y5 Revenue (B)": years[4].revenue / 1e9,
+                                    "Final Revenue (B)": years[-1].revenue / 1e9,
+                                    "Terminal ROIC": run.assumptions.derived_terminal_roic,
+                                    "Terminal Reinvestment": run.assumptions.terminal_reinvestment_rate,
+                                }
+
+                            comparison_runs = (
+                                ("Existing Candidate", existing_run),
+                                ("Revised Candidate", revised_run),
+                                ("Growth only", growth_only),
+                                ("Mature margin only", margin_only),
+                                ("Sales-to-Capital only", sales_to_capital_only),
+                            )
+                            dcf_frame = pd.DataFrame([
+                                reassessment_run_row(label, run)
+                                for label, run in comparison_runs
+                            ]).set_index("Run")
+                            st.markdown("**Full-chain DCF and one-factor diagnostics**")
+                            st.dataframe(
+                                dcf_frame.style.format({
+                                    "Intrinsic / Share": "${:.2f}",
+                                    "Enterprise Value (B)": "{:.3f}",
+                                    "Equity Value (B)": "{:.3f}",
+                                    "TV / EV": "{:.2%}",
+                                    "Y1 Revenue (B)": "{:.3f}",
+                                    "Y3 Revenue (B)": "{:.3f}",
+                                    "Y5 Revenue (B)": "{:.3f}",
+                                    "Final Revenue (B)": "{:.3f}",
+                                    "Terminal ROIC": "{:.2%}",
+                                    "Terminal Reinvestment": "{:.2%}",
+                                }),
+                                width="stretch",
+                            )
+                            st.caption(
+                                "Each row reruns the complete DCF. One-factor rows "
+                                "are read-only diagnostics, not scenarios or causal attribution."
+                            )
+
                     with st.expander(
                         "Alphabet Segment, AI Infrastructure and Capital Context",
                         expanded=False,
@@ -3289,13 +4233,12 @@ def render_company_research_profile(
                 )
 
             if review_state is not None:
-                review_state = render_nvda_research_review(
-                    candidate_profile, review_state
-                )
-                render_reviewed_profile_application(
-                    candidate_profile.issuer_id,
+                render_one_click_profile_workflow(
+                    workflow_ticker,
+                    candidate_profile,
                     review_state,
                     current_assumptions,
+                    candidate_run,
                 )
 
             terminal = profile.terminal_framework
@@ -3319,12 +4262,12 @@ def render_company_research_profile(
                 else (
                     "Alphabet Research Candidate DCF Preview"
                     if profile.issuer_id == "ALPHABET_INC"
-                    else "Research Candidate DCF Preview"
+                    else f"{profile.company_name} Research Candidate DCF Preview"
                 )
             )
             st.markdown(f"**{preview_label}**")
             preview_run = candidate_run
-            if current_run is not None:
+            if preview_run is None and current_run is not None:
                 preview_run = run_multistage_dcf(
                     current_run.inputs, candidate
                 )
@@ -3364,6 +4307,73 @@ def render_company_research_profile(
                     f"Terminal ROIC {candidate.derived_terminal_roic:.2%} · "
                     f"Terminal Reinvestment {candidate.terminal_reinvestment_rate:.2%}"
                 )
+                implied_y4 = years[3].revenue_growth if len(years) >= 4 else None
+                implied_y5 = years[4].revenue_growth if len(years) >= 5 else None
+                st.caption(
+                    "Implied fade growth (not production inputs): "
+                    f"Y4 {implied_y4:.2%} · Y5 {implied_y5:.2%} · "
+                    f"Final explicit year {years[-1].revenue_growth:.2%} · "
+                    f"Terminal {candidate.terminal_growth:.2%}"
+                )
+                if current_price is not None and current_price > 0 and per_share is not None:
+                    st.caption(
+                        f"Post-assumption market diagnostic: Candidate DCF / Market Price "
+                        f"= {per_share.intrinsic_value_per_share / current_price:.2f}x "
+                        f"(${current_price:.2f}); absolute gap "
+                        f"${per_share.intrinsic_value_per_share - current_price:+.2f}. "
+                        "Market price is not an assumption input."
+                    )
+
+                sensitivity_expander = st.expander(
+                    "Research Candidate sensitivities", expanded=False
+                )
+                valuation_inputs = (
+                    current_run.inputs if current_run is not None else preview_run.inputs
+                )
+                sc_step = 0.05
+                sc_rows = []
+                for sc in (
+                    candidate.mature_sales_to_capital - 2 * sc_step,
+                    candidate.mature_sales_to_capital - sc_step,
+                    candidate.mature_sales_to_capital,
+                    candidate.mature_sales_to_capital + sc_step,
+                    candidate.mature_sales_to_capital + 2 * sc_step,
+                ):
+                    sensitivity_run = run_multistage_dcf(
+                        valuation_inputs,
+                        replace(candidate, mature_sales_to_capital=sc),
+                    )
+                    sc_rows.append({
+                        "Mature S/C": sc,
+                        "Terminal ROIC": sensitivity_run.assumptions.derived_terminal_roic,
+                        "Intrinsic / Share": sensitivity_run.per_share_value.intrinsic_value_per_share if sensitivity_run.per_share_value else None,
+                        "TV / EV": sensitivity_run.enterprise_value.terminal_value_share,
+                    })
+                sensitivity_expander.markdown("**Mature Sales-to-Capital — full-chain DCF**")
+                sensitivity_expander.dataframe(pd.DataFrame(sc_rows).set_index("Mature S/C").style.format({"Terminal ROIC": "{:.2%}", "Intrinsic / Share": "${:.2f}", "TV / EV": "{:.2%}"}), width="stretch")
+
+                y3_rows = []
+                for y3 in (
+                    candidate.near_term_revenue_growth[2] - 0.02,
+                    candidate.near_term_revenue_growth[2],
+                    candidate.near_term_revenue_growth[2] + 0.02,
+                ):
+                    growth = candidate.near_term_revenue_growth[:2] + (y3,)
+                    sensitivity_run = run_multistage_dcf(
+                        valuation_inputs,
+                        replace(candidate, near_term_revenue_growth=growth),
+                    )
+                    sensitivity_years = sensitivity_run.operating_forecast.years
+                    y3_rows.append({
+                        "Y3 Growth": y3,
+                        "Implied Y4": sensitivity_years[3].revenue_growth,
+                        "Implied Y5": sensitivity_years[4].revenue_growth,
+                        "Intrinsic / Share": sensitivity_run.per_share_value.intrinsic_value_per_share if sensitivity_run.per_share_value else None,
+                        "TV / EV": sensitivity_run.enterprise_value.terminal_value_share,
+                    })
+                sensitivity_expander.markdown("**Y3 duration — Y1/Y2 fixed, full-chain DCF**")
+                sensitivity_expander.dataframe(pd.DataFrame(y3_rows).set_index("Y3 Growth").style.format({"Implied Y4": "{:.2%}", "Implied Y5": "{:.2%}", "Intrinsic / Share": "${:.2f}", "TV / EV": "{:.2%}"}), width="stretch")
+                sensitivity_expander.caption("Read-only research support. No Base, review, application, or scenario state is changed.")
                 if current_run is not None:
                     current_value = (
                         current_run.per_share_value.intrinsic_value_per_share
@@ -4151,7 +5161,7 @@ def render_multistage_dcf_panel(ticker: str,
     if isinstance(applied_profile, ReviewedProfileApplication):
         if assumptions_match(assumptions, applied_profile.assumptions):
             st.success(
-                "Operating assumption status: Reviewed NVDA Research Profile applied"
+                "Operating assumption status: Reviewed Research Profile applied"
             )
             st.caption(
                 f"Reviewed at: {applied_profile.reviewed_at} · Applied at: "
@@ -4160,11 +5170,16 @@ def render_multistage_dcf_panel(ticker: str,
         else:
             st.warning(
                 "Operating assumption status: Current Base has diverged from the "
-                "previously applied Reviewed NVDA Research Profile."
+                "previously applied Reviewed Research Profile."
             )
 
     nvda_research = None
+    nvda_growth_reassessment = None
+    nvda_growth_comparison = None
     alphabet_research = None
+    hyperscaler_research = None
+    amazon_research = None
+    unified_research = None
     candidate_run = None
     if ticker.strip().upper() == "NVDA":
         beta_audit = None
@@ -4203,6 +5218,41 @@ def render_multistage_dcf_panel(ticker: str,
             candidate_run = run_real_company_multistage_dcf(
                 snapshot, history, translation.assumptions
             )
+            try:
+                consensus_points = tuple(
+                    ConsensusRevenuePoint(
+                        fiscal_year=f"FY{pd.Timestamp(point.fiscal_period).year}",
+                        period_end=pd.Timestamp(point.fiscal_period).date().isoformat(),
+                        revenue=float(point.revenue_estimate),
+                        implied_growth=(
+                            float(point.implied_revenue_growth)
+                            if point.implied_revenue_growth is not None else None
+                        ),
+                        analyst_count=point.analyst_count,
+                        source=point.source,
+                        retrieved_at=(
+                            pd.Timestamp(point.source_as_of).date().isoformat()
+                            if point.source_as_of is not None else "N/A"
+                        ),
+                    )
+                    for point in (revenue_anchors.points if revenue_anchors else ())
+                    if point.available and point.revenue_estimate is not None
+                )
+                ttm_period_end = run.inputs.starting_revenue_periods[-1]
+                nvda_growth_reassessment = build_nvda_growth_reassessment(
+                    translation.assumptions,
+                    ttm_revenue=run.inputs.starting_revenue,
+                    ttm_period_end=pd.Timestamp(ttm_period_end).date().isoformat(),
+                    consensus=consensus_points,
+                )
+                nvda_growth_comparison = compare_growth_duration_dcf(
+                    run.inputs, nvda_growth_reassessment
+                )
+            except (TypeError, ValueError, IndexError):
+                # The existing NVDA candidate remains fully available if the
+                # optional read-only reassessment cannot be constructed.
+                nvda_growth_reassessment = None
+                nvda_growth_comparison = None
     elif ticker.strip().upper() in {"GOOG", "GOOGL"}:
         beta_audit = None
         bottom_up = None
@@ -4238,6 +5288,69 @@ def render_multistage_dcf_panel(ticker: str,
             candidate_run = run_real_company_multistage_dcf(
                 snapshot, history, translation.assumptions
             )
+    elif ticker.strip().upper() in {"MSFT", "META"}:
+        builder = (
+            build_microsoft_research_profile
+            if ticker.strip().upper() == "MSFT"
+            else build_meta_research_profile
+        )
+        hyperscaler_research = builder(
+            assumptions,
+            history,
+            revenue_anchors=revenue_anchors,
+            wacc_audit=wacc_audit,
+            retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
+        )
+        profile_lookup = hyperscaler_research.lookup
+        translation = build_multistage_assumptions_from_profile(
+            profile_lookup.profile
+        )
+        if translation.available and translation.assumptions is not None:
+            candidate_run = run_real_company_multistage_dcf(
+                snapshot, history, translation.assumptions
+            )
+    elif ticker.strip().upper() == "AMZN":
+        try:
+            amazon_research = build_amazon_research_profile(
+                assumptions,
+                history,
+                wacc_audit=wacc_audit,
+                retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
+            )
+            profile_lookup = amazon_research.lookup
+            if profile_lookup.profile is not None:
+                amazon_preview = run_amazon_candidate_preview(
+                    run.inputs, profile_lookup.profile
+                )
+                amazon_research = replace(
+                    amazon_research, candidate_preview=amazon_preview
+                )
+                candidate_run = amazon_preview
+        except (TypeError, ValueError) as exc:
+            profile_lookup = CompanyProfileLookupResult(
+                None, False, f"amazon_candidate_unavailable:{exc}"
+            )
+    elif ticker.strip().upper() in {"MU", "AAPL", "AVGO"}:
+        builder = {
+            "MU": build_micron_research_profile,
+            "AAPL": build_apple_research_profile,
+            "AVGO": build_broadcom_research_profile,
+        }[ticker.strip().upper()]
+        unified_research = builder(
+            assumptions,
+            history,
+            revenue_anchors=revenue_anchors,
+            wacc_audit=wacc_audit,
+            retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
+        )
+        profile_lookup = unified_research.lookup
+        translation = build_multistage_assumptions_from_profile(
+            profile_lookup.profile
+        )
+        if translation.available and translation.assumptions is not None:
+            candidate_run = run_real_company_multistage_dcf(
+                snapshot, history, translation.assumptions
+            )
     else:
         profile_lookup = build_provisional_company_profile(
             ticker,
@@ -4253,7 +5366,13 @@ def render_multistage_dcf_panel(ticker: str,
         current_run=run,
         candidate_run=candidate_run,
         nvda_research=nvda_research,
+        nvda_growth_reassessment=nvda_growth_reassessment,
+        nvda_growth_comparison=nvda_growth_comparison,
         alphabet_research=alphabet_research,
+        hyperscaler_research=hyperscaler_research,
+        amazon_research=amazon_research,
+        unified_research=unified_research,
+        current_price=snapshot.price,
     )
 
     st.subheader("Valuation Output 假设对应估值")
@@ -4365,6 +5484,38 @@ def render_multistage_dcf_panel(ticker: str,
         )
 
     render_multistage_sensitivity(run, assumptions, sensitivity)
+
+    reverse_run = run
+    reverse_source = "Current Manual Base"
+    if isinstance(applied_profile, ReviewedProfileApplication):
+        if assumptions_match(assumptions, applied_profile.assumptions):
+            reverse_source = "Applied Reviewed Profile"
+        else:
+            # Existing app semantics make the editable, visibly diverged Base
+            # authoritative until the user explicitly reapplies a snapshot.
+            reverse_source = "Current Manual Base"
+    elif candidate_run is not None:
+        reverse_run = candidate_run
+        reverse_source = "Research Candidate"
+    profile = profile_lookup.profile if profile_lookup is not None else None
+    reverse_ranges = research_ranges_from_profile(profile)
+    range_items = tuple(
+        (variable, research_range.lower, research_range.upper)
+        for variable, research_range in sorted(reverse_ranges.items())
+    )
+    reverse_analysis = calculate_reverse_dcf_cached(
+        reverse_run.inputs,
+        reverse_run.assumptions,
+        snapshot.price,
+        ticker,
+        reverse_source,
+        range_items,
+    )
+    render_reverse_dcf(
+        reverse_analysis,
+        model_risk=profile.model_risk if profile is not None else None,
+        limitations=profile.uncertainty_notes if profile is not None else (),
+    )
 
     path_rows = []
     for operating, discounted in zip(

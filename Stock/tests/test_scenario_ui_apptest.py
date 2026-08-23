@@ -161,108 +161,64 @@ def test_nvda_candidate_does_not_change_main_dcf_value_or_add_recommendations():
             at.markdown, at.caption, at.info, at.warning
         ) for item in collection
     ).lower()
-    assert "apply profile" not in rendered
     assert "buy" not in rendered
     assert "sell" not in rendered
 
 
-def test_nvda_review_checklist_defaults_incomplete_and_groups_are_independent():
+def test_nvda_review_is_one_explicit_action_without_group_checkboxes():
     at = AppTest.from_file(str(FIXTURE_APP)).run(timeout=30)
     assert not at.exception
-    review_checks = {
-        item.key: item for item in at.checkbox
+    assert not [
+        item for item in at.checkbox
         if str(item.key).startswith("nvda_review_")
-    }
-    assert set(review_checks) == {
-        "nvda_review_revenue_checked",
-        "nvda_review_margin_checked",
-        "nvda_review_capital_checked",
-        "nvda_review_tax_checked",
-        "nvda_review_wacc_checked",
-        "nvda_review_terminal_checked",
-    }
-    assert all(not item.value for item in review_checks.values())
-    finalize = element_with_key(at.button, "nvda_review_finalize")
-    assert finalize.disabled
-
-    review_checks["nvda_review_revenue_checked"].set_value(True).run(timeout=30)
-    assert not at.exception
-    assert element_with_key(
-        at.checkbox, "nvda_review_revenue_checked"
-    ).value
-    assert not element_with_key(
-        at.checkbox, "nvda_review_margin_checked"
-    ).value
-    assert element_with_key(at.button, "nvda_review_finalize").disabled
+    ]
+    action = element_with_key(at.button, "one_click_review_apply_NVDA")
+    assert action.label == "Review & Apply Research Profile"
+    assert not action.disabled
+    assert any(
+        "Current Base vs Research Candidate" in str(item.value)
+        for item in at.markdown
+    )
 
 
-def test_nvda_full_review_creates_snapshot_without_changing_base():
+def test_nvda_one_click_creates_snapshot_and_applies_exact_candidate():
     at = AppTest.from_file(str(FIXTURE_APP)).run(timeout=30)
-    main_before = at.metric[0].value
-    element_with_key(
-        at.text_area, "nvda_review_revenue_note"
-    ).set_value("Revenue evidence and period alignment reviewed.")
-    element_with_key(
-        at.text_area, "nvda_review_overall_note"
-    ).set_value("Accepted the current research profile snapshot.")
-    for item in at.checkbox:
-        if str(item.key).startswith("nvda_review_"):
-            item.set_value(True)
-    at.run(timeout=30)
+    candidate_preview = next(
+        displayed_number(item.value)
+        for item in at.metric[1:]
+        if item.label == "Intrinsic Value / Share"
+    )
+    element_with_key(at.button, "one_click_review_apply_NVDA").click().run(timeout=30)
     assert not at.exception
-    finalize = element_with_key(at.button, "nvda_review_finalize")
-    assert not finalize.disabled
-
-    finalize.click().run(timeout=30)
-    assert not at.exception
-    assert at.metric[0].value == main_before
+    assert displayed_number(at.metric[0].value) == pytest.approx(
+        candidate_preview, abs=0.005
+    )
     captions = " ".join(str(item.value) for item in at.caption)
     success = " ".join(str(item.value) for item in at.success)
-    infos = " ".join(str(item.value) for item in at.info)
-    markdown = " ".join(str(item.value) for item in at.markdown)
-    assert "Issuer：NVDA · Status：Reviewed 已复核" in captions
     assert "Reviewed at:" in captions
-    assert "Status: Reviewed Research Profile" in success
-    assert "Review and application are separate actions" in infos
-    assert "Reviewed Research DCF Preview" in markdown
-    assert any(
-        item.label == "Reviewed notes" for item in at.expander
-    )
-    assert element_with_key(at.button, "nvda_review_reopen")
-    assert element_with_key(at.button, "nvda_reviewed_profile_apply").label == (
-        "Apply Reviewed NVDA Profile to Base DCF"
-    )
+    assert "Reviewed profile already applied" in success
+    snapshot = at.session_state["company_profile_review_NVDA"].reviewed_snapshot
+    application = at.session_state["reviewed_profile_application_NVDA"]
+    assert snapshot is not None
+    assert application.reviewed_at == snapshot.reviewed_at
+    assert application.issuer == snapshot.profile.issuer_id
 
 
 def test_nvda_explicit_apply_updates_base_sensitivity_and_scenario_then_reapplies():
     at = AppTest.from_file(str(FIXTURE_APP)).run(timeout=30)
-    original_base = displayed_number(at.metric[0].value)
-    for item in at.checkbox:
-        if str(item.key).startswith("nvda_review_"):
-            item.set_value(True)
-    at.run(timeout=30)
-    element_with_key(at.button, "nvda_review_finalize").click().run(timeout=30)
-
     reviewed_preview = next(
         displayed_number(item.value)
         for item in at.metric[1:]
         if item.label == "Intrinsic Value / Share"
     )
-    assert displayed_number(at.metric[0].value) == pytest.approx(original_base)
-    apply_button = element_with_key(at.button, "nvda_reviewed_profile_apply")
-    assert apply_button.label == "Apply Reviewed NVDA Profile to Base DCF"
-
-    apply_button.click().run(timeout=30)
+    element_with_key(at.button, "one_click_review_apply_NVDA").click().run(timeout=30)
     assert not at.exception
     applied_base = displayed_number(at.metric[0].value)
     assert applied_base == pytest.approx(reviewed_preview, abs=0.005)
     success = " ".join(str(item.value) for item in at.success)
     captions = " ".join(str(item.value) for item in at.caption)
-    assert "Reviewed NVDA Research Profile applied to Current Base DCF" in success
+    assert "Reviewed profile already applied" in success
     assert "Applied at:" in captions
-    already = element_with_key(at.button, "nvda_reviewed_profile_apply")
-    assert already.disabled
-    assert already.label == "Reviewed profile already applied"
 
     scenario = summary_frame(at)
     assert displayed_number(
@@ -277,9 +233,9 @@ def test_nvda_explicit_apply_updates_base_sensitivity_and_scenario_then_reapplie
     ).set_value(48.0).run(timeout=30)
     assert displayed_number(at.metric[0].value) != pytest.approx(applied_base)
     warnings = " ".join(str(item.value) for item in at.warning)
-    assert "modified since the reviewed profile was applied" in warnings
-    reapply = element_with_key(at.button, "nvda_reviewed_profile_apply")
-    assert reapply.label == "Reapply Reviewed NVDA Profile"
+    assert "diverged from the applied Reviewed Profile" in warnings
+    reapply = element_with_key(at.button, "one_click_reapply_NVDA")
+    assert reapply.label == "Reapply Reviewed Profile"
 
     reapply.click().run(timeout=30)
     assert not at.exception
@@ -288,25 +244,19 @@ def test_nvda_explicit_apply_updates_base_sensitivity_and_scenario_then_reapplie
     )
 
 
-def test_nvda_reopen_returns_to_research_without_applying_profile():
+def test_nvda_applied_state_is_idempotent_on_rerun():
     at = AppTest.from_file(str(FIXTURE_APP)).run(timeout=30)
-    main_before = at.metric[0].value
-    for item in at.checkbox:
-        if str(item.key).startswith("nvda_review_"):
-            item.set_value(True)
+    element_with_key(at.button, "one_click_review_apply_NVDA").click().run(timeout=30)
+    application = at.session_state["reviewed_profile_application_NVDA"]
     at.run(timeout=30)
-    element_with_key(at.button, "nvda_review_finalize").click().run(timeout=30)
-    element_with_key(at.button, "nvda_review_reopen").click().run(timeout=30)
-
     assert not at.exception
-    assert at.metric[0].value == main_before
-    captions = " ".join(str(item.value) for item in at.caption)
-    assert "Issuer：NVDA · Status：Research in progress 研究中" in captions
-    assert all(
-        not item.value for item in at.checkbox
-        if str(item.key).startswith("nvda_review_")
+    assert at.session_state["reviewed_profile_application_NVDA"].applied_at == (
+        application.applied_at
     )
-    assert element_with_key(at.button, "nvda_review_finalize").disabled
+    assert any(
+        "Reviewed profile already applied" in str(item.value)
+        for item in at.success
+    )
 
 
 def test_alphabet_share_classes_display_one_research_candidate_profile():
@@ -329,7 +279,11 @@ def test_alphabet_share_classes_display_one_research_candidate_profile():
         item.label == "Alphabet Segment, AI Infrastructure and Capital Context"
         for item in at.expander
     )
-    assert all("Apply" not in str(item.label) for item in at.button)
+    assert any(
+        item.label == "Alphabet Growth & Mature Economics Reassessment"
+        for item in at.expander
+    )
+    assert any("Review & Apply" in str(item.label) for item in at.button)
 
     at.selectbox[0].set_value("GOOG").run(timeout=30)
     goog_captions = " ".join(str(item.value) for item in at.caption)
@@ -340,7 +294,7 @@ def test_alphabet_share_classes_display_one_research_candidate_profile():
     assert "Issuer：ALPHABET_INC · Status：Research in progress 研究中" in goog_captions
     assert at.metric[0].value == googl_base
     assert goog_preview == googl_preview
-    assert all("Apply" not in str(item.label) for item in at.button)
+    assert any("Apply" in str(item.label) for item in at.button)
 
 
 def test_main_ui_source_contains_no_legacy_simple_dcf_controls():
