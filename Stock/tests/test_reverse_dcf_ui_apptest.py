@@ -12,11 +12,10 @@ def test_reverse_dcf_panel_is_read_only_and_explains_single_variable_semantics()
     assert not app.exception
     assert any(
         item.value == "Reverse DCF — Market-Implied Expectations"
-        for item in app.subheader
+        for item in app.header
     )
     captions = " ".join(str(item.value) for item in app.caption)
-    assert "一次只改变一个假设" in captions
-    assert "不会改写 Base" in captions
+    assert "Holding all other Research Base assumptions constant" in captions
     assert app.session_state["protected_base"].near_term_revenue_growth == (
         0.20, 0.15, 0.10
     )
@@ -28,7 +27,7 @@ def test_reverse_dcf_panel_identifies_base_source_and_market_context():
 
     assert not app.exception
     metrics = {item.label: item.value for item in app.metric}
-    assert metrics["Base Source"] == "Research Candidate"
-    assert metrics["Base DCF / Share"].startswith("$")
+    assert metrics["Reverse DCF Base"] == "Research Candidate"
+    assert metrics["Research Base DCF"].startswith("$")
     assert metrics["Market Price"].startswith("$")
     assert metrics["Price / Base DCF"] == "1.15x"

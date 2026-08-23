@@ -1673,7 +1673,7 @@ def render_fundamental_quality(ticker: str,
                                history: FundamentalHistory | None,
                                statement_currency: str | None = "USD") -> None:
     """Render existing fundamental-engine evidence without recalculation."""
-    st.header("🔎 Fundamental Quality 基本面质量")
+    st.header("Key Fundamentals")
     if history is None or history.annual.empty:
         st.warning(f"{ticker} 基本面质量指标数据不足。")
         return
@@ -1690,23 +1690,21 @@ def render_fundamental_quality(ticker: str,
         if pd.isna(value):
             return "数据不足"
         if kind == "amount":
-            return f"{float(value) / 1_000_000_000:.3f}B"
-        return f"{float(value) * 100:.2f}%"
+            return _diagnostic_display(
+                float(value), "amount", statement_currency
+            )
+        return f"{float(value) * 100:.1f}%"
 
     st.subheader("最新年度 Latest Annual")
     st.caption(f"财年截至 {latest_period.date()}")
     annual_metrics = [
         ("Revenue", REVENUE, "amount"),
         ("Revenue Growth", REVENUE_GROWTH, "percent"),
-        ("Gross Margin", GROSS_MARGIN, "percent"),
         ("Operating Margin", OPERATING_MARGIN, "percent"),
         ("FCF", FCF, "amount"),
         ("FCF Margin", FCF_MARGIN, "percent"),
         ("NOPAT", NOPAT, "amount"),
         ("ROIC", ROIC, "percent"),
-        ("简化净投资 Simplified Net Investment", NET_INVESTMENT, "amount"),
-        ("简化再投资率 Simplified Reinvestment Rate", REINVESTMENT_RATE, "percent"),
-        ("结构性增长能力 Fundamental Growth Capacity", FUNDAMENTAL_GROWTH_CAPACITY, "percent"),
     ]
     for start in range(0, len(annual_metrics), 4):
         batch = annual_metrics[start:start + 4]
@@ -1732,7 +1730,7 @@ def render_fundamental_quality(ticker: str,
     anchor_metrics = [
         ("Revenue CAGR 3Y", anchors.revenue_cagr.get(3), "percent"),
         (
-            "Sales-to-Capital 3Y",
+            "Sales-to-Capital (S/C) 3Y",
             anchors.normalized_sales_to_capital.get(3),
             "multiple",
         ),
@@ -1753,20 +1751,31 @@ def render_fundamental_quality(ticker: str,
                 reason = result.reason if result is not None else "unavailable"
                 st.write(f"数据不足（{reason}）")
                 continue
-            st.write(
-                f"期间：{result.start_period.date()} → {result.end_period.date()}"
+            period_start = (
+                result.start_period.date()
+                if result.start_period is not None else "N/A"
             )
+            period_end = (
+                result.end_period.date()
+                if result.end_period is not None else "N/A"
+            )
+            st.write(f"期间：{period_start} → {period_end}")
+            def optional_amount(value) -> str:
+                return (
+                    _diagnostic_display(value, "amount", statement_currency)
+                    if value is not None else "数据不足"
+                )
             st.write(
-                f"Revenue：{result.start_revenue / 1_000_000_000:.3f}B → "
-                f"{result.end_revenue / 1_000_000_000:.3f}B；"
-                f"ΔRevenue：{result.delta_revenue / 1_000_000_000:.3f}B"
+                f"Revenue：{optional_amount(result.start_revenue)} → "
+                f"{optional_amount(result.end_revenue)}；"
+                f"ΔRevenue：{optional_amount(result.delta_revenue)}"
             )
             st.write(
                 "Invested Capital："
-                f"{result.start_invested_capital / 1_000_000_000:.3f}B → "
-                f"{result.end_invested_capital / 1_000_000_000:.3f}B；"
+                f"{optional_amount(result.start_invested_capital)} → "
+                f"{optional_amount(result.end_invested_capital)}；"
                 "ΔInvested Capital："
-                f"{result.delta_invested_capital / 1_000_000_000:.3f}B"
+                f"{optional_amount(result.delta_invested_capital)}"
             )
             st.write(f"Sales-to-Capital：{result.value:.2f}x")
     st.caption(
@@ -1777,7 +1786,6 @@ def render_fundamental_quality(ticker: str,
     st.subheader("最近十二个月 TTM")
     ttm_metrics = [
         ("Revenue", REVENUE, "amount"),
-        ("Gross Margin", GROSS_MARGIN, "percent"),
         ("Operating Margin", OPERATING_MARGIN, "percent"),
         ("FCF", FCF, "amount"),
         ("FCF Margin", FCF_MARGIN, "percent"),
@@ -1789,9 +1797,11 @@ def render_fundamental_quality(ticker: str,
         if result is None or not result.available or result.value is None:
             formatted = "数据不足"
         elif kind == "amount":
-            formatted = f"{result.value / 1_000_000_000:.3f}B"
+            formatted = _diagnostic_display(
+                result.value, "amount", statement_currency
+            )
         else:
-            formatted = f"{result.value * 100:.2f}%"
+            formatted = f"{result.value * 100:.1f}%"
         column.metric(label, formatted)
         if result is not None and result.available and result.periods_used:
             period_groups.setdefault(result.periods_used, []).append(label)
@@ -1806,7 +1816,6 @@ def render_fundamental_quality(ticker: str,
 
     chart_specs = [
         (REVENUE_GROWTH, "Revenue Growth"),
-        (GROSS_MARGIN, "Gross Margin"),
         (OPERATING_MARGIN, "Operating Margin"),
         (FCF_MARGIN, "FCF Margin"),
         (ROIC, "ROIC"),
@@ -2344,29 +2353,27 @@ def render_reverse_dcf(
     limitations: tuple[str, ...] = (),
 ) -> None:
     """Render read-only market-implied expectations from a pure result."""
-    st.subheader("Reverse DCF — Market-Implied Expectations")
+    st.header("Reverse DCF — Market-Implied Expectations")
     st.caption(
-        "一次只改变一个假设，并在每个求解点完整重跑 production DCF；"
-        "结果是各自独立的市场隐含条件，不代表这些条件需要同时成立，也不会改写 Base。"
-        " Holding all other Research Base assumptions constant, each row asks "
-        "what one condition would reconcile DCF/share with market price."
+        "Holding all other Research Base assumptions constant, the following "
+        "values would individually reconcile the DCF with the current market price."
     )
     summary = st.columns(4)
-    summary[0].metric("Base Source", analysis.base_source)
-    summary[1].metric(
-        "Base DCF / Share",
+    summary[0].metric(
+        "Research Base DCF",
         f"${analysis.base_dcf_per_share:.2f}"
         if analysis.base_dcf_per_share is not None else "N/A",
     )
-    summary[2].metric(
+    summary[1].metric(
         "Market Price",
         f"${analysis.market_price:.2f}" if analysis.market_price is not None else "N/A",
     )
-    summary[3].metric(
+    summary[2].metric(
         "Price / Base DCF",
         f"{analysis.price_to_base_dcf:.2f}x"
         if analysis.price_to_base_dcf is not None else "N/A",
     )
+    summary[3].metric("Reverse DCF Base", analysis.base_source)
 
     labels = {
         GROWTH_UPLIFT: "Y1/Y2/Y3 equal growth uplift",
@@ -2389,39 +2396,52 @@ def render_reverse_dcf(
             f"{_reverse_value_label(result.variable, result.research_range.upper)}"
             if result.research_range is not None else "N/A"
         )
+        range_labels = {
+            "within_research_range": "Within Research Range",
+            "above_research_range": "Above Research Range",
+            "below_research_range": "Below Research Range",
+            "not_available": "",
+        }
+        relation = range_labels.get(result.range_relation, result.range_relation)
+        if relation:
+            research_range = f"{research_range} · {relation}"
+        status_labels = {
+            "SOLVED": "Solved",
+            "NO_BRACKET": "No single solution in tested range",
+            "OUTSIDE_REASONABLE_RANGE": "Outside reasonable search range",
+            "NON_MONOTONIC": "Non-monotonic relationship",
+            "AMBIGUOUS": "Multiple possible solutions",
+            "VALUATION_FAILED": "Valuation unavailable",
+            "INVALID_BASE_ASSUMPTIONS": "Invalid Base assumptions",
+            "MARKET_PRICE_UNAVAILABLE": "Market price unavailable",
+        }
         rows.append({
-            "Single Variable": labels[result.variable],
+            "Variable": labels[result.variable],
             "Research Base": _reverse_value_label(
                 result.variable, result.research_value
             ),
             "Market-Implied": implied_label,
-            "Status": result.status,
             "Gap": _reverse_gap_label(result),
             "Research Range": research_range,
-            "Range Relation": result.range_relation,
-            "Expectation Gap": result.expectation_gap,
-            "Solved DCF": (
-                f"${result.implied_dcf_value:.2f}"
-                if result.implied_dcf_value is not None else "N/A"
-            ),
-            "TV / EV": (
-                f"{result.terminal_value_share:.1%}"
-                if result.terminal_value_share is not None else "N/A"
-            ),
-            "Reason": result.reason or "",
+            "Status": status_labels.get(result.status, result.status),
         })
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     st.caption(
         "Search bounds：Growth Δ −30pp to +50pp · Mature Margin 0–80% · "
         "Mature S/C 0.1–5.0x · WACC terminal g + 0.5pp to 20%."
     )
+    st.info(
+        "Each Reverse DCF result is independent. The market does not need to "
+        "satisfy all implied assumptions simultaneously."
+    )
     if any(
         warning != "single_variable_results_are_not_joint_requirements"
         for warning in analysis.warnings
     ):
         st.warning(
-            "多个维度无法在合理单变量区间内得到唯一解；这表示市场价格不能被"
-            "安全地归因于某一个独立假设，而不是一个投资结论。"
+            "The current market price requires material changes to more than one "
+            "plausible economic assumption, or cannot be reconciled by a modest "
+            "single-variable change."
         )
     if model_risk or limitations:
         with st.expander("Reverse DCF model context", expanded=False):
@@ -2823,22 +2843,26 @@ def _diagnostic_display(value: float | None,
     if value is None or not np.isfinite(value):
         return "数据不足"
     if kind == "amount":
-        amount = value / 1_000_000_000
-        return (
-            f"${amount:.3f}B"
-            if currency == "USD"
-            else f"{currency or 'Statement currency'} {amount:.3f}B"
+        absolute = abs(float(value))
+        divisor, suffix = (
+            (1_000_000_000_000, "T")
+            if absolute >= 1_000_000_000_000
+            else (1_000_000_000, "B")
         )
+        amount = absolute / divisor
+        sign = "-" if value < 0 else ""
+        prefix = "$" if currency == "USD" else f"{currency or 'Statement currency'} "
+        return f"{sign}{prefix}{amount:.1f}{suffix}"
     if kind == "multiple":
         return f"{value:.2f}x"
-    return f"{value * 100:.2f}%"
+    return f"{value * 100:.1f}%"
 
 
 def _per_security_unavailable_message(reason: str | None) -> str:
     if reason == FOREIGN_LISTING_NORMALIZATION_UNSUPPORTED:
         return (
             "Per-security DCF valuation unavailable: foreign-listing currency / "
-            "ADR normalization is not supported in Phase 2."
+            "ADR normalization is not currently supported."
         )
     if reason == "valuation_currency_metadata_unavailable":
         return (
@@ -3021,6 +3045,8 @@ def render_one_click_profile_workflow(
     review_state: CompanyProfileReviewState,
     current_base: MultiStageDCFAssumptions,
     candidate_run: MultiStageDCFRunResult | None,
+    *,
+    show_comparison: bool = True,
 ) -> None:
     """Render the generic explicit one-click Review & Apply workflow."""
     st.markdown("### Research Profile Review & Apply")
@@ -3051,7 +3077,7 @@ def render_one_click_profile_workflow(
             "assumptions remain unchanged."
         )
 
-    if candidate is not None:
+    if candidate is not None and show_comparison:
         changes = []
         for field, label in PROFILE_APPLY_FIELD_LABELS.items():
             candidate_value = {
@@ -3639,6 +3665,337 @@ def render_nvda_growth_duration_reassessment(
             f"Growth-duration decision: {reassessment.decision}. The stored "
             "55% / 40% / 25% candidate remains unchanged."
         )
+
+
+FINAL_MODEL_LIMITATIONS = {
+    "AMZN": (
+        "Consolidated Sales-to-Capital (S/C) may not fully capture the timing gap between AI/AWS infrastructure spending and later utilization.",
+    ),
+    "MU": (
+        "AI/HBM structural demand reduces, but does not remove, memory pricing, utilization and cycle-normalization risk.",
+    ),
+    "AVGO": (
+        "Software/semiconductor mix, acquisition accounting and leverage make consolidated mature economics less directly observable.",
+    ),
+    "AAPL": (
+        "Economic S/C is a research interpretation because outsourced production, cash management and capital returns distort accounting invested capital.",
+    ),
+}
+
+
+def _research_details_confidence(research_details) -> dict[str, str]:
+    assessments = getattr(research_details, "confidence_assessments", ())
+    return {item.category: item.confidence for item in assessments}
+
+
+def _final_profile_status(
+    ticker: str,
+    current_assumptions: MultiStageDCFAssumptions,
+    review_state: CompanyProfileReviewState | None,
+) -> tuple[str, str]:
+    application = st.session_state.get(base_profile_application_key(ticker))
+    if isinstance(application, ReviewedProfileApplication):
+        if assumptions_match(current_assumptions, application.assumptions):
+            return "Applied Base", "Applied Reviewed Profile"
+        return "Manual Base Divergence", "Current Manual Base"
+    if review_state is not None and review_state.profile_status == "reviewed":
+        return "Reviewed", "Reviewed Profile — not yet applied"
+    return "Research Candidate", "Research Candidate"
+
+
+def render_final_company_header(
+    ticker: str,
+    snapshot: CompanySnapshot,
+    profile,
+    research_base_run: MultiStageDCFRunResult,
+    profile_state: str,
+    base_source: str,
+) -> None:
+    """Compact, neutral header for the final research workstation."""
+    name = profile.company_name if profile is not None else ticker
+    st.header(f"{name} · {ticker}")
+    per_share = research_base_run.per_share_value
+    dcf_value = per_share.intrinsic_value_per_share if per_share is not None else None
+    price = snapshot.price
+    ratio = dcf_value / price if dcf_value is not None and price and price > 0 else None
+    columns = st.columns(6)
+    columns[0].metric("Market Price", f"${price:.2f}" if price is not None else "N/A")
+    columns[1].metric("Research Base DCF", f"${dcf_value:.2f}" if dcf_value is not None else "N/A")
+    columns[2].metric("DCF / Market Price", f"{ratio:.2f}x" if ratio is not None else "N/A")
+    columns[3].metric("Profile State", profile_state)
+    columns[4].metric("Base Source", base_source)
+    columns[5].metric("Model Risk", profile.model_risk if profile and profile.model_risk else "N/A")
+    st.caption(
+        "Valuation gap is a neutral research diagnostic, not a recommendation or trading signal."
+    )
+
+
+def render_final_research_profile(
+    lookup: CompanyProfileLookupResult,
+    *,
+    ticker: str,
+    current_assumptions: MultiStageDCFAssumptions,
+    candidate_run: MultiStageDCFRunResult | None,
+    research_details=None,
+) -> tuple[str, str]:
+    """Concise final Profile summary with one Review & Apply control."""
+    st.header("Research Profile")
+    if (
+        not lookup.available
+        or lookup.profile is None
+        or lookup.profile.profile_status == "provisional"
+    ):
+        st.info(
+            "No researched Company Profile is available for this ticker. "
+            "The Manual Base workspace remains available; profile and market-implied "
+            "outputs are not presented as researched assumptions."
+        )
+        return "Manual Base", "Current Manual Base"
+
+    profile = lookup.profile
+    review_state = None
+    if profile.profile_status == "research_in_progress":
+        review_state = initialize_profile_review_session_state(
+            st.session_state, ticker, profile
+        )
+    profile_state, base_source = _final_profile_status(
+        ticker, current_assumptions, review_state
+    )
+    with st.container(border=True):
+        st.markdown(f"**{profile_state}** · {profile.company_name}")
+        st.caption(
+            f"Research Profile state: {profile.profile_status.replace('_', ' ').title()} · "
+            f"Base source: {base_source} · Model risk: {profile.model_risk or 'N/A'}"
+        )
+
+    translation = build_multistage_assumptions_from_profile(profile)
+    candidate = translation.assumptions
+    if candidate is None:
+        st.warning("Research Profile assumptions are incomplete; valuation remains unavailable.")
+        return profile_state, base_source
+
+    confidence = _research_details_confidence(research_details)
+    rows = (
+        ("Y1 Growth", f"{candidate.near_term_revenue_growth[0]:.1%}", confidence.get("Y1 Growth", "N/A")),
+        ("Y2 Growth", f"{candidate.near_term_revenue_growth[1]:.1%}", confidence.get("Y2 Growth", "N/A")),
+        ("Y3 Growth", f"{candidate.near_term_revenue_growth[2]:.1%}", confidence.get("Y3 Growth", "N/A")),
+        ("Mature Margin", f"{candidate.mature_operating_margin:.1%}", confidence.get("Mature Margin", "N/A")),
+        ("Mature S/C", f"{candidate.mature_sales_to_capital:.2f}x", confidence.get("Mature S/C", "N/A")),
+        ("Operating Tax", f"{candidate.operating_tax_rate:.1%}", "N/A"),
+        ("Research WACC", f"{candidate.wacc:.2%}", confidence.get("WACC", confidence.get("Research WACC", "N/A"))),
+        ("Terminal Growth", f"{candidate.terminal_growth:.1%}", confidence.get("Terminal Economics", "N/A")),
+        ("Terminal ROIC", f"{candidate.derived_terminal_roic:.1%}", confidence.get("Terminal Economics", "N/A")),
+    )
+    st.dataframe(
+        pd.DataFrame(rows, columns=("Assumption", "Research Candidate", "Confidence")),
+        width="stretch",
+        hide_index=True,
+    )
+    st.caption(
+        f"Forecast structure: Y1/Y2/Y3 → {candidate.revenue_fade_years}-year deterministic fade · "
+        f"{candidate.forecast_years}-year horizon. Confidence describes evidence strength, not investment quality."
+    )
+
+    if review_state is not None:
+        render_one_click_profile_workflow(
+            ticker,
+            profile,
+            review_state,
+            current_assumptions,
+            candidate_run,
+            show_comparison=False,
+        )
+    return profile_state, base_source
+
+
+def _final_evidence_value(item: ResearchEvidenceItem) -> str:
+    if not item.available or item.value is None:
+        return "N/A"
+    if isinstance(item.value, (int, float)):
+        if item.unit == "currency_amount":
+            return _diagnostic_display(float(item.value), "amount", "USD")
+        if item.unit == "ratio":
+            return f"{float(item.value):.1%}"
+        if item.unit in {"multiple", "x"}:
+            return f"{float(item.value):.2f}x"
+        return f"{float(item.value):,.2f}"
+    return str(item.value)
+
+
+def render_final_evidence(profile, research_details=None) -> None:
+    st.header("Evidence & Research Interpretation")
+    if profile is None:
+        st.info("Structured research evidence is unavailable for this ticker.")
+        return
+    category_labels = {
+        "historical_financial": "Revenue / Growth & Reported Financials",
+        "forward_consensus": "Revenue / Growth",
+        "management_guidance": "Revenue / Growth & Management Guidance",
+        "company_specific_research": "Margin & Capital Efficiency",
+        "market_risk": "WACC",
+        "industry_reference": "Terminal Economics",
+    }
+    type_labels = {
+        "historical_financial": "Reported / Disclosed",
+        "management_guidance": "Reported / Disclosed",
+        "forward_consensus": "External Evidence",
+        "company_specific_research": "Derived Metric",
+        "market_risk": "Derived Metric",
+        "industry_reference": "Research Context",
+    }
+    confidence = _research_details_confidence(research_details)
+    grouped: dict[str, list[dict]] = {}
+    for item in profile.evidence_items:
+        group = category_labels.get(item.category, "Other Evidence")
+        source_url = item.source if isinstance(item.source, str) and item.source.startswith(("http://", "https://")) else None
+        grouped.setdefault(group, []).append({
+            "Summary": item.label,
+            "Type": type_labels.get(item.category, "Evidence"),
+            "Value": _final_evidence_value(item),
+            "Period": item.period or "N/A",
+            "Source": "Open source" if source_url else item.source,
+            "Source URL": source_url,
+            "Research Interpretation": item.notes or "Evidence only; not automatically applied.",
+        })
+    for group in (
+        "Revenue / Growth & Reported Financials",
+        "Revenue / Growth",
+        "Revenue / Growth & Management Guidance",
+        "Margin & Capital Efficiency",
+        "WACC",
+        "Terminal Economics",
+        "Other Evidence",
+    ):
+        rows = grouped.get(group)
+        if not rows:
+            continue
+        with st.expander(group, expanded=False):
+            st.dataframe(
+                pd.DataFrame(rows),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Source URL": st.column_config.LinkColumn(
+                        "Source Link", display_text="Open"
+                    )
+                },
+            )
+    assumption_rows = []
+    translation = build_multistage_assumptions_from_profile(profile)
+    if translation.assumptions is not None:
+        model = translation.assumptions
+        assumption_rows = [
+            ("Y1 / Y2 / Y3 Growth", " / ".join(f"{value:.1%}" for value in model.near_term_revenue_growth)),
+            ("Mature Margin", f"{model.mature_operating_margin:.1%}"),
+            ("Mature S/C", f"{model.mature_sales_to_capital:.2f}x"),
+            ("Research WACC", f"{model.wacc:.2%}"),
+            ("Terminal Growth", f"{model.terminal_growth:.1%}"),
+        ]
+    if assumption_rows:
+        st.markdown("**Research Assumptions — researcher-selected, not disclosures**")
+        st.dataframe(
+            pd.DataFrame(assumption_rows, columns=("Assumption", "Selected Value")),
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def render_final_model_limitations(profile) -> None:
+    st.header("Model Limitations")
+    if profile is None:
+        st.info("No researched Company Profile is available; company-specific limitations are unavailable.")
+        return
+    ticker = profile.ticker.strip().upper()
+    notes = list(FINAL_MODEL_LIMITATIONS.get(ticker, ()))
+    for note in profile.uncertainty_notes:
+        if "phase" not in note.lower() and "hybrid" not in note.lower() and note not in notes:
+            notes.append(note)
+        if len(notes) >= 4:
+            break
+    if not notes:
+        notes.append(
+            "Long-horizon growth, mature economics and discount rates remain research assumptions rather than observable facts."
+        )
+    for note in notes:
+        st.write(f"• {note}")
+    st.caption(
+        "The unified production model favors transparent cross-company consistency over company-specific accounting detail."
+    )
+
+
+def render_final_forecast_chart(
+    run: MultiStageDCFRunResult,
+    statement_currency: str | None,
+) -> None:
+    years = [row.year_index for row in run.operating_forecast.years]
+    revenues = [row.revenue / 1e9 for row in run.operating_forecast.years]
+    fcff_values = [row.fcff / 1e9 for row in run.operating_forecast.years]
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(
+        x=years, y=revenues, mode="lines+markers", name="Revenue",
+    ))
+    figure.add_trace(go.Bar(
+        x=years, y=fcff_values, name="FCFF", opacity=0.45,
+    ))
+    figure.update_layout(
+        title="Forecast Revenue and FCFF",
+        xaxis_title="Forecast Year",
+        yaxis_title=f"{statement_currency or 'Statement currency'} B",
+        legend=dict(orientation="h"),
+    )
+    st.plotly_chart(figure, width="stretch")
+
+
+def render_final_advanced_diagnostics(
+    diagnostics,
+    assumptions: MultiStageDCFAssumptions,
+    statement_currency: str | None,
+) -> None:
+    with st.expander("Advanced Diagnostics", expanded=False):
+        st.caption(
+            "Detailed accounting anchors, terminal mechanics and data-quality flags."
+        )
+        revenue_diag, margin_diag, capital_diag = st.columns(3)
+        with revenue_diag:
+            st.markdown("**Revenue**")
+            st.write(f"Historical CAGR 3Y：{_diagnostic_display(diagnostics.revenue.historical_cagr_3y)}")
+            st.write(
+                "Y1 / Y2 / Y3："
+                + " / ".join(f"{value:.1%}" for value in assumptions.near_term_revenue_growth)
+            )
+            st.write(f"Year 5 Revenue：{_diagnostic_display(diagnostics.revenue.year_5_revenue, 'amount', statement_currency)}")
+            st.write(f"Final Revenue：{_diagnostic_display(diagnostics.revenue.final_forecast_revenue, 'amount', statement_currency)}")
+            st.write(f"Revenue Multiple：{_diagnostic_display(diagnostics.revenue.final_to_starting_revenue_multiple, 'multiple')}")
+        with margin_diag:
+            st.markdown("**Margin**")
+            st.write(f"Annual / TTM：{_diagnostic_display(diagnostics.operating_margin.latest_annual_margin)} / {_diagnostic_display(diagnostics.operating_margin.latest_ttm_margin)}")
+            st.write(f"Start / Year 5 / Mature：{_diagnostic_display(diagnostics.operating_margin.starting_forecast_margin)} / {_diagnostic_display(diagnostics.operating_margin.year_5_margin)} / {_diagnostic_display(diagnostics.operating_margin.mature_margin)}")
+        with capital_diag:
+            st.markdown("**Capital Efficiency**")
+            st.write(f"Latest / 3Y：{_diagnostic_display(diagnostics.sales_to_capital.latest_annual, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.historical_normalized_3y, 'multiple')}")
+            st.write(f"Start / Year 5 / Mature：{_diagnostic_display(diagnostics.sales_to_capital.starting_forecast, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.year_5, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.mature, 'multiple')}")
+
+        roic_diag, cash_diag, dependency_diag = st.columns(3)
+        with roic_diag:
+            st.markdown("**ROIC**")
+            st.write(f"Accounting：{_diagnostic_display(diagnostics.roic.current_accounting_roic)}")
+            st.write(f"Year 1 / Year 5 / Terminal：{_diagnostic_display(diagnostics.roic.year_1_implied_operating_roic)} / {_diagnostic_display(diagnostics.roic.year_5_implied_operating_roic)} / {_diagnostic_display(diagnostics.roic.terminal_derived_roic)}")
+        with cash_diag:
+            cash = diagnostics.cash_flow_economics
+            st.markdown("**Cash Flow**")
+            st.write(f"Historical TTM FCF Margin：{_diagnostic_display(cash.historical_fundamental_ttm_fcf_margin)}")
+            st.write(f"FCFF Margin Y1 / Y5 / Final：{_diagnostic_display(cash.year_1.fcff_margin)} / {_diagnostic_display(cash.year_5.fcff_margin if cash.year_5 else None)} / {_diagnostic_display(cash.final_year.fcff_margin)}")
+            st.write(f"Terminal Reinvestment Rate：{_diagnostic_display(cash.terminal_reinvestment_rate)}")
+        with dependency_diag:
+            dependency = diagnostics.terminal_dependency
+            st.markdown("**Valuation Dependency**")
+            st.write(f"Explicit PV：{_diagnostic_display(dependency.explicit_forecast_pv, 'amount', statement_currency)}")
+            st.write(f"Terminal PV：{_diagnostic_display(dependency.terminal_value_pv, 'amount', statement_currency)}")
+            st.write(f"Terminal / EV：{_diagnostic_display(dependency.terminal_value_share)}")
+        if diagnostics.flags:
+            st.markdown("**Objective informational flags**")
+            for flag in diagnostics.flags:
+                st.info(MULTISTAGE_FLAG_LABELS.get(flag, flag))
 
 
 def render_company_research_profile(
@@ -5034,16 +5391,19 @@ def render_scenario_analysis(
 def render_multistage_dcf_panel(ticker: str,
                                 snapshot: CompanySnapshot | None,
                                 history: FundamentalHistory | None,
-                                wacc_audit: WACCAuditResult | None = None) -> None:
+                                wacc_audit: WACCAuditResult | None = None,
+                                *,
+                                header_container=None,
+                                profile_container=None):
     """Collect assumptions, call pure engines, and render research diagnostics."""
-    st.header("Multi-Stage DCF 多阶段估值")
+    st.header("Research Base DCF")
     st.caption(
-        "以下均为可编辑的研究起始假设，不是推荐值。模型不会根据历史数据自动修改输入，"
-        "也不会与当前股价比较。"
+        "Unified production model: Y1/Y2/Y3 Growth → deterministic fade → "
+        "Mature Margin → Mature Sales-to-Capital (S/C) → standard reinvestment."
     )
     st.caption(
-        "Phase 2 每证券估值仅支持报表币种与证券币种、发行人股数与证券单位可直接对账的上市标的；"
-        "尚不支持外币 ADR/证券单位转换。"
+        "The editable Manual Base is a workspace. When an unapplied Research "
+        "Candidate exists, the finished research view uses that Candidate as its Research Base."
     )
     if snapshot is None or history is None:
         st.warning("公司快照或基本面历史不可用，暂时无法运行多阶段 DCF。")
@@ -5057,8 +5417,11 @@ def render_multistage_dcf_panel(ticker: str,
     prefix = f"multistage_{ticker.strip().upper()}_"
     research_keys = research_wacc_session_keys(ticker)
     provisional_default_wacc = multistage_initial_defaults(ticker, history)["wacc"] / 100
-    with st.container(border=True):
-        st.subheader("Assumptions 可编辑假设")
+    with st.expander("Manual Base Workspace", expanded=False):
+        st.caption(
+            "Optional editable workspace. It is not labeled as the Research Candidate "
+            "unless a reviewed profile is explicitly applied."
+        )
         revenue_column, margin_column, capital_column, terminal_column = st.columns(4)
         with revenue_column:
             st.markdown("**Revenue Growth**")
@@ -5125,12 +5488,12 @@ def render_multistage_dcf_panel(ticker: str,
             terminal_growth = st.number_input("Terminal Growth (%)", step=0.1, key=prefix + "terminal_growth")
             st.caption("Near-term explicit growth years：固定为 3 年。")
 
-    st.text_area(
-        "Research WACC rationale (optional, user-authored)",
-        key=research_keys["rationale"],
-        max_chars=500,
-        placeholder="Record the business or long-horizon risk judgment behind this WACC.",
-    )
+        st.text_area(
+            "Research WACC rationale (optional, user-authored)",
+            key=research_keys["rationale"],
+            max_chars=500,
+            placeholder="Record the business or long-horizon risk judgment behind this WACC.",
+        )
 
     try:
         ui_values = {
@@ -5158,20 +5521,6 @@ def render_multistage_dcf_panel(ticker: str,
         return
 
     applied_profile = st.session_state.get(base_profile_application_key(ticker))
-    if isinstance(applied_profile, ReviewedProfileApplication):
-        if assumptions_match(assumptions, applied_profile.assumptions):
-            st.success(
-                "Operating assumption status: Reviewed Research Profile applied"
-            )
-            st.caption(
-                f"Reviewed at: {applied_profile.reviewed_at} · Applied at: "
-                f"{applied_profile.applied_at} · source: {applied_profile.source}"
-            )
-        else:
-            st.warning(
-                "Operating assumption status: Current Base has diverged from the "
-                "previously applied Reviewed Research Profile."
-            )
 
     nvda_research = None
     nvda_growth_reassessment = None
@@ -5359,23 +5708,60 @@ def render_multistage_dcf_panel(ticker: str,
             revenue_anchors=revenue_anchors,
             wacc_audit=wacc_audit,
         )
-    render_company_research_profile(
-        profile_lookup,
-        statement_currency=run.inputs.statement_currency,
-        current_assumptions=assumptions,
-        current_run=run,
-        candidate_run=candidate_run,
-        nvda_research=nvda_research,
-        nvda_growth_reassessment=nvda_growth_reassessment,
-        nvda_growth_comparison=nvda_growth_comparison,
-        alphabet_research=alphabet_research,
-        hyperscaler_research=hyperscaler_research,
-        amazon_research=amazon_research,
-        unified_research=unified_research,
-        current_price=snapshot.price,
+    profile = profile_lookup.profile if profile_lookup is not None else None
+    research_details = (
+        nvda_research or alphabet_research or hyperscaler_research
+        or amazon_research or unified_research
     )
+    if isinstance(applied_profile, ReviewedProfileApplication):
+        if assumptions_match(assumptions, applied_profile.assumptions):
+            research_base_run = run
+            research_base_source = "Applied Reviewed Profile"
+        else:
+            research_base_run = run
+            research_base_source = "Current Manual Base"
+    elif candidate_run is not None:
+        research_base_run = candidate_run
+        research_base_source = "Research Candidate"
+    else:
+        research_base_run = run
+        research_base_source = "Current Manual Base"
 
-    st.subheader("Valuation Output 假设对应估值")
+    target_profile_container = profile_container or st.container()
+    with target_profile_container:
+        profile_state, displayed_source = render_final_research_profile(
+            profile_lookup,
+            ticker=ticker,
+            current_assumptions=assumptions,
+            candidate_run=candidate_run,
+            research_details=research_details,
+        )
+    # The explicit selection above is authoritative; the status renderer uses
+    # the same session semantics and should normally return the same source.
+    research_base_source = displayed_source if displayed_source else research_base_source
+    target_header_container = header_container or st.container()
+    with target_header_container:
+        render_final_company_header(
+            ticker,
+            snapshot,
+            profile,
+            research_base_run,
+            profile_state,
+            research_base_source,
+        )
+
+    # From this point onward every visible Base valuation, forecast,
+    # sensitivity, scenario and Reverse DCF consumes the same selected Research Base.
+    run = research_base_run
+    assumptions = run.assumptions
+    diagnostics = build_assumption_diagnostics(
+        history, run.inputs, assumptions, run.forecast_path,
+        run.operating_forecast, run.terminal_value, run.enterprise_value,
+    )
+    sensitivity = build_wacc_terminal_growth_sensitivity(run.inputs, assumptions)
+
+    st.subheader("Base Valuation")
+    st.caption(f"Research Base source: {research_base_source}")
     statement_currency = run.inputs.statement_currency
     security_currency = run.inputs.security_currency
     output_columns = st.columns(6)
@@ -5419,6 +5805,33 @@ def render_multistage_dcf_panel(ticker: str,
     else:
         st.warning("合并普通股数不可用；Enterprise Value 与 Equity Value 可用，但不显示每股价值。")
     st.caption(f"WACC − Terminal Growth：{(assumptions.wacc - assumptions.terminal_growth) * 100:.2f} percentage points")
+    st.markdown("**DCF Value Bridge**")
+    bridge_rows = [
+        ("Explicit FCFF PV", run.enterprise_value.explicit_forecast_pv),
+        ("+ Terminal PV", run.enterprise_value.terminal_value_pv),
+        ("= Enterprise Value", run.enterprise_value.enterprise_value),
+        ("− Net Debt", run.inputs.net_debt),
+        ("= Equity Value", run.equity_value.equity_value),
+    ]
+    bridge_frame = pd.DataFrame(
+        {
+            "Bridge Step": [label for label, _ in bridge_rows],
+            "Value": [
+                _diagnostic_display(value, "amount", statement_currency)
+                for _, value in bridge_rows
+            ],
+        }
+    )
+    if shares.available and per_share is not None:
+        bridge_frame.loc[len(bridge_frame)] = (
+            "÷ Shares",
+            f"{shares.shares_outstanding / 1_000_000_000:.2f}B",
+        )
+        bridge_frame.loc[len(bridge_frame)] = (
+            "= Research Base DCF / Share",
+            f"${per_share.intrinsic_value_per_share:.2f}",
+        )
+    st.dataframe(bridge_frame, width="stretch", hide_index=True)
 
     if wacc_audit is not None and wacc_audit.available:
         with st.expander("WACC Calculation Details", expanded=False):
@@ -5467,55 +5880,6 @@ def render_multistage_dcf_panel(ticker: str,
                 st.caption("Fallbacks：" + "；".join(wacc_audit.fallbacks_used))
             else:
                 st.caption("Fallbacks：none")
-        historical_beta_audit = render_beta_robustness(
-            ticker, wacc_audit, assumptions.wacc
-        )
-        bottom_up_audit = render_bottom_up_beta(
-            ticker, wacc_audit, assumptions, run, historical_beta_audit
-        )
-        render_research_wacc_decision(
-            ticker,
-            wacc_audit,
-            historical_beta_audit,
-            bottom_up_audit,
-            assumptions,
-            provisional_default_wacc,
-            sensitivity,
-        )
-
-    render_multistage_sensitivity(run, assumptions, sensitivity)
-
-    reverse_run = run
-    reverse_source = "Current Manual Base"
-    if isinstance(applied_profile, ReviewedProfileApplication):
-        if assumptions_match(assumptions, applied_profile.assumptions):
-            reverse_source = "Applied Reviewed Profile"
-        else:
-            # Existing app semantics make the editable, visibly diverged Base
-            # authoritative until the user explicitly reapplies a snapshot.
-            reverse_source = "Current Manual Base"
-    elif candidate_run is not None:
-        reverse_run = candidate_run
-        reverse_source = "Research Candidate"
-    profile = profile_lookup.profile if profile_lookup is not None else None
-    reverse_ranges = research_ranges_from_profile(profile)
-    range_items = tuple(
-        (variable, research_range.lower, research_range.upper)
-        for variable, research_range in sorted(reverse_ranges.items())
-    )
-    reverse_analysis = calculate_reverse_dcf_cached(
-        reverse_run.inputs,
-        reverse_run.assumptions,
-        snapshot.price,
-        ticker,
-        reverse_source,
-        range_items,
-    )
-    render_reverse_dcf(
-        reverse_analysis,
-        model_risk=profile.model_risk if profile is not None else None,
-        limitations=profile.uncertainty_notes if profile is not None else (),
-    )
 
     path_rows = []
     for operating, discounted in zip(
@@ -5526,23 +5890,20 @@ def render_multistage_dcf_panel(ticker: str,
             "Revenue Growth": operating.revenue_growth,
             "Revenue (B)": operating.revenue / 1e9,
             "Operating Margin": operating.operating_margin,
-            "Operating Income (B)": operating.operating_income / 1e9,
             "NOPAT (B)": operating.nopat / 1e9,
-            "Sales-to-Capital": operating.sales_to_capital,
+            "S/C": operating.sales_to_capital,
             "Reinvestment (B)": operating.reinvestment / 1e9,
             "FCFF (B)": operating.fcff / 1e9,
-            "Discount Factor": discounted.discount_factor,
-            "PV FCFF (B)": discounted.present_value_fcff / 1e9,
         })
     path_frame = pd.DataFrame(path_rows).set_index("Year")
-    with st.expander("Forecast Path 年度预测表", expanded=True):
+    st.subheader("Forecast & Assumption Diagnostics")
+    with st.expander("Annual Forecast Path", expanded=True):
         st.dataframe(
             path_frame.style.format({
-                "Revenue Growth": "{:.2%}", "Revenue (B)": "{:.3f}",
-                "Operating Margin": "{:.2%}", "Operating Income (B)": "{:.3f}",
-                "NOPAT (B)": "{:.3f}", "Sales-to-Capital": "{:.3f}",
-                "Reinvestment (B)": "{:.3f}", "FCFF (B)": "{:.3f}",
-                "Discount Factor": "{:.4f}", "PV FCFF (B)": "{:.3f}",
+                "Revenue Growth": "{:.1%}", "Revenue (B)": "{:.1f}",
+                "Operating Margin": "{:.1%}", "NOPAT (B)": "{:.1f}",
+                "S/C": "{:.2f}x", "Reinvestment (B)": "{:.1f}",
+                "FCFF (B)": "{:.1f}",
             }),
             width="stretch",
         )
@@ -5641,81 +6002,62 @@ def render_multistage_dcf_panel(ticker: str,
             if revenue_anchors.warnings:
                 st.write("Warnings：" + ", ".join(revenue_anchors.warnings))
 
-    chart_1, chart_2, chart_3 = st.columns(3)
-    years = [row.year_index for row in run.operating_forecast.years]
-    revenues = [row.revenue / 1e9 for row in run.operating_forecast.years]
-    margins = [row.operating_margin * 100 for row in run.operating_forecast.years]
-    fcff_margins = [row.fcff / row.revenue * 100 for row in run.operating_forecast.years]
-    implied_roic = [row.operating_margin * (1 - assumptions.operating_tax_rate) * row.sales_to_capital * 100 for row in run.operating_forecast.years]
-    stc_path = [row.sales_to_capital for row in run.operating_forecast.years]
-    with chart_1:
-        figure = go.Figure(go.Scatter(x=years, y=revenues, mode="lines+markers"))
-        figure.update_layout(title="Revenue Path", xaxis_title="Year", yaxis_title="B")
-        st.plotly_chart(figure, width="stretch")
-    with chart_2:
-        figure = go.Figure()
-        figure.add_trace(go.Scatter(x=years, y=margins, name="Operating Margin"))
-        figure.add_trace(go.Scatter(x=years, y=fcff_margins, name="FCFF Margin"))
-        figure.update_layout(title="Margin Path", xaxis_title="Year", yaxis_title="%")
-        st.plotly_chart(figure, width="stretch")
-    with chart_3:
-        figure = go.Figure()
-        figure.add_trace(go.Scatter(x=years, y=implied_roic, name="Implied ROIC"))
-        figure.add_trace(go.Scatter(x=years, y=stc_path, name="Sales-to-Capital", yaxis="y2"))
-        figure.update_layout(title="ROIC / Capital Efficiency", xaxis_title="Year", yaxis_title="ROIC %", yaxis2=dict(title="S/C", overlaying="y", side="right"))
-        st.plotly_chart(figure, width="stretch")
+    render_final_forecast_chart(run, statement_currency)
+    render_final_advanced_diagnostics(
+        diagnostics, assumptions, statement_currency
+    )
 
-    st.subheader("Assumption Diagnostics 假设诊断")
-    revenue_diag, margin_diag, capital_diag = st.columns(3)
-    with revenue_diag:
-        st.markdown("**Revenue**")
-        st.write(f"Historical CAGR 3Y：{_diagnostic_display(diagnostics.revenue.historical_cagr_3y)}")
-        st.write(f"Y1 / Y2 / Y3：{y1:.1f}% / {y2:.1f}% / {y3:.1f}%")
-        st.write(f"Year 5 Revenue：{_diagnostic_display(diagnostics.revenue.year_5_revenue, 'amount', statement_currency)}")
-        st.write(f"Final Revenue：{_diagnostic_display(diagnostics.revenue.final_forecast_revenue, 'amount', statement_currency)}")
-        st.write(f"Revenue Multiple：{_diagnostic_display(diagnostics.revenue.final_to_starting_revenue_multiple, 'multiple')}")
-    with margin_diag:
-        st.markdown("**Margin**")
-        st.write(f"Annual / TTM：{_diagnostic_display(diagnostics.operating_margin.latest_annual_margin)} / {_diagnostic_display(diagnostics.operating_margin.latest_ttm_margin)}")
-        st.write(f"Start / Year 5 / Mature：{_diagnostic_display(diagnostics.operating_margin.starting_forecast_margin)} / {_diagnostic_display(diagnostics.operating_margin.year_5_margin)} / {_diagnostic_display(diagnostics.operating_margin.mature_margin)}")
-    with capital_diag:
-        st.markdown("**Capital Efficiency**")
-        st.write(f"Latest / 3Y：{_diagnostic_display(diagnostics.sales_to_capital.latest_annual, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.historical_normalized_3y, 'multiple')}")
-        st.write(f"Start / Year 5 / Mature：{_diagnostic_display(diagnostics.sales_to_capital.starting_forecast, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.year_5, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.mature, 'multiple')}")
-
-    roic_diag, cash_diag, dependency_diag = st.columns(3)
-    with roic_diag:
-        st.markdown("**ROIC**")
-        st.write(f"Accounting：{_diagnostic_display(diagnostics.roic.current_accounting_roic)}")
-        st.write(f"Year 1 / Year 5 / Terminal：{_diagnostic_display(diagnostics.roic.year_1_implied_operating_roic)} / {_diagnostic_display(diagnostics.roic.year_5_implied_operating_roic)} / {_diagnostic_display(diagnostics.roic.terminal_derived_roic)}")
-    with cash_diag:
-        cash = diagnostics.cash_flow_economics
-        st.markdown("**Cash Flow**")
-        st.write(f"Historical TTM FCF Margin：{_diagnostic_display(cash.historical_fundamental_ttm_fcf_margin)}")
-        st.write(f"FCFF Margin Y1 / Y5 / Final：{_diagnostic_display(cash.year_1.fcff_margin)} / {_diagnostic_display(cash.year_5.fcff_margin if cash.year_5 else None)} / {_diagnostic_display(cash.final_year.fcff_margin)}")
-        st.write(f"FCFF/NOPAT Y1 / Y5 / Final：{_diagnostic_display(cash.year_1.fcff_to_nopat)} / {_diagnostic_display(cash.year_5.fcff_to_nopat if cash.year_5 else None)} / {_diagnostic_display(cash.final_year.fcff_to_nopat)}")
-        st.write(f"Terminal Reinvestment Rate：{_diagnostic_display(cash.terminal_reinvestment_rate)}")
-        st.caption("Historical fundamental FCF Margin 与 forecast FCFF Margin 口径不同。")
-    with dependency_diag:
-        dependency = diagnostics.terminal_dependency
-        st.markdown("**Valuation Dependency**")
-        st.write(f"Explicit PV：{_diagnostic_display(dependency.explicit_forecast_pv, 'amount', statement_currency)}")
-        st.write(f"Terminal PV：{_diagnostic_display(dependency.terminal_value_pv, 'amount', statement_currency)}")
-        st.write(f"Terminal / EV：{_diagnostic_display(dependency.terminal_value_share)}")
-    if diagnostics.flags:
-        st.markdown("**Objective informational flags**")
-        for flag in diagnostics.flags:
-            st.info(MULTISTAGE_FLAG_LABELS.get(flag, flag))
-
+    st.subheader("Sensitivity & Scenario Diagnostics")
+    render_multistage_sensitivity(run, assumptions, sensitivity)
     render_scenario_analysis(
         ticker, history, assumptions, run, statement_currency
     )
 
+    reverse_analysis = None
+    if profile is None or profile.profile_status == "provisional":
+        st.header("Reverse DCF — Market-Implied Expectations")
+        st.info(
+            "Reverse DCF is unavailable because this ticker does not have a "
+            "researched Company Profile. The Manual Base remains available above."
+        )
+    else:
+        reverse_ranges = research_ranges_from_profile(profile)
+        range_items = tuple(
+            (variable, research_range.lower, research_range.upper)
+            for variable, research_range in sorted(reverse_ranges.items())
+        )
+        reverse_analysis = calculate_reverse_dcf_cached(
+            run.inputs,
+            assumptions,
+            snapshot.price,
+            ticker,
+            research_base_source,
+            range_items,
+        )
+        render_reverse_dcf(
+            reverse_analysis,
+            model_risk=profile.model_risk if profile is not None else None,
+            limitations=FINAL_MODEL_LIMITATIONS.get(ticker.strip().upper(), ()),
+        )
+    return {
+        "profile": (
+            profile
+            if profile is not None and profile.profile_status != "provisional"
+            else None
+        ),
+        "research_details": research_details,
+        "research_base_run": run,
+        "base_source": research_base_source,
+        "reverse_analysis": reverse_analysis,
+    }
+
 # ================= 4. Streamlit UI =================
 def main():
-    st.set_page_config(page_title="美股基本面分析器", layout="wide")
-    st.title("📊 美股基本面与 DCF 分析器")
-    st.markdown("> 财报趋势 + 运营体检 + DCF 参数投影与敏感性分析")
+    st.set_page_config(page_title="Stock Valuation Research Workstation", layout="wide")
+    st.title("Stock Valuation Research Workstation")
+    st.caption(
+        "Fundamentals → Research Base DCF → Sensitivity → Reverse DCF → Evidence"
+    )
 
     # 侧边栏：参数输入
     with st.sidebar:
@@ -5734,24 +6076,35 @@ def main():
             wacc_audit = build_wacc_audit_result(ticker, wacc_reference)
             annual_financials, quarterly_financials, health_checks = pd.DataFrame(), pd.DataFrame(), []
             fundamental_history = None
-            st.warning(f"yfinance 公司数据读取失败: {exc}")
-        st.caption("估值假设统一在主页面的 Multi-Stage DCF 面板中管理。")
+            st.warning("Company data could not be loaded. Valuation is unavailable until the data source recovers.")
+            with st.expander("Technical details", expanded=False):
+                st.code(str(exc), language=None)
+        st.caption("Research assumptions and diagnostics are managed on the main page.")
 
-    st.divider()
+    header_slot = st.container()
+    profile_slot = st.container()
     statement_currency = snapshot.financial_currency if snapshot else None
-    render_financial_trends(
-        ticker, annual_financials, quarterly_financials, statement_currency
-    )
     st.divider()
     render_fundamental_quality(
         ticker, fundamental_history, statement_currency
     )
     st.divider()
-    render_multistage_dcf_panel(
-        ticker, snapshot, fundamental_history, wacc_audit
+    render_health_checks(ticker, health_checks)
+    st.divider()
+    context = render_multistage_dcf_panel(
+        ticker,
+        snapshot,
+        fundamental_history,
+        wacc_audit,
+        header_container=header_slot,
+        profile_container=profile_slot,
     )
     st.divider()
-    render_health_checks(ticker, health_checks)
+    profile = context.get("profile") if context else None
+    research_details = context.get("research_details") if context else None
+    render_final_evidence(profile, research_details)
+    st.divider()
+    render_final_model_limitations(profile)
 
 if __name__ == "__main__":
     main()
