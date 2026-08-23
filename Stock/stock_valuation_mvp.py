@@ -800,7 +800,7 @@ def _financial_trend_frame(income: pd.DataFrame,
         periods=periods,
         include_revenue_growth=False,
     )
-    series = {
+    amount_series = {
         "Revenue": fundamentals[REVENUE].dropna(),
         "Gross Profit": fundamentals[GROSS_PROFIT].dropna(),
         "Operating Income": fundamentals[OPERATING_INCOME].dropna(),
@@ -809,10 +809,26 @@ def _financial_trend_frame(income: pd.DataFrame,
         "Retained Earnings": _statement_series(balance, "retained_earnings"),
         "Shares Outstanding": _statement_series(balance, "shares_outstanding"),
     }
-    available = {name: values for name, values in series.items() if not values.empty}
-    if not available:
+    ratio_series = {
+        "Gross Margin": fundamentals[GROSS_MARGIN].dropna(),
+        "Operating Margin": fundamentals[OPERATING_MARGIN].dropna(),
+    }
+    available_amounts = {
+        name: values for name, values in amount_series.items() if not values.empty
+    }
+    available_ratios = {
+        name: values for name, values in ratio_series.items() if not values.empty
+    }
+    if not available_amounts and not available_ratios:
         return pd.DataFrame()
-    return pd.concat(available, axis=1).sort_index() / 1_000_000_000
+    frames = []
+    if available_amounts:
+        frames.append(
+            pd.concat(available_amounts, axis=1) / 1_000_000_000
+        )
+    if available_ratios:
+        frames.append(pd.concat(available_ratios, axis=1))
+    return pd.concat(frames, axis=1).sort_index()
 
 
 def _latest_flow_value(quarterly: pd.Series,
@@ -1553,15 +1569,17 @@ def _margin_of_safety(intrinsic_value: float,
     return (intrinsic_value - current_price) / current_price * 100
 
 
-def render_financial_trends(ticker: str,
-                            annual: pd.DataFrame,
-                            quarterly: pd.DataFrame,
-                            statement_currency: str | None = "USD") -> None:
-    """绘制年度/季度财报趋势面板。"""
-    st.header("📚 财报趋势")
+def _render_financial_trends_content(
+    ticker: str,
+    annual: pd.DataFrame,
+    quarterly: pd.DataFrame,
+    statement_currency: str | None = "USD",
+) -> None:
+    """绘制已展开的年度/季度财报趋势内容。"""
     currency = statement_currency or "报表原始币种"
     st.caption(
-        f"损益、现金流和留存收益均以 {currency} 十亿为单位；股本为十亿股。"
+        f"损益、现金流和留存收益均以 {currency} 十亿为单位；"
+        "Margin 使用百分比；股本为十亿股。"
     )
     period = st.radio(
         "报告周期",
@@ -1579,28 +1597,36 @@ def render_financial_trends(ticker: str,
     operating_metrics = [
         "Revenue",
         "Gross Profit",
+        "Gross Margin",
         "Operating Income",
+        "Operating Margin",
         "Net Income",
         "Free Cash Flow",
     ]
     metric_labels = {
         "Revenue": "营业收入 Revenue",
         "Gross Profit": "毛利润 Gross Profit",
+        "Gross Margin": "毛利率 Gross Margin",
         "Operating Income": "营业利润 Operating Income",
+        "Operating Margin": "营业利润率 Operating Margin",
         "Net Income": "净利润 Net Income",
         "Free Cash Flow": "自由现金流 Free Cash Flow",
     }
     colors = {
         "Revenue": "#4C78A8",
         "Gross Profit": "#72B7B2",
+        "Gross Margin": "#76B7B2",
         "Operating Income": "#F2CF5B",
+        "Operating Margin": "#EDC948",
         "Net Income": "#59A14F",
         "Free Cash Flow": "#E45756",
     }
+    percentage_metrics = {"Gross Margin", "Operating Margin"}
     available_metrics = [metric for metric in operating_metrics if metric in frame]
     if available_metrics:
+        rows = (len(available_metrics) + 1) // 2
         fig = make_subplots(
-            rows=3,
+            rows=rows,
             cols=2,
             vertical_spacing=0.12,
             horizontal_spacing=0.10,
@@ -1609,21 +1635,30 @@ def render_financial_trends(ticker: str,
         for index, metric in enumerate(available_metrics):
             row, col = divmod(index, 2)
             values = frame[metric].dropna()
+            is_percentage = metric in percentage_metrics
+            plotted_values = values * 100 if is_percentage else values
             fig.add_trace(
                 go.Bar(
                     x=values.index,
-                    y=values.values,
+                    y=plotted_values.values,
                     name=metric_labels[metric],
                     marker_color=colors[metric],
-                    text=[f"{value:.1f}" for value in values.values],
+                    text=[
+                        f"{value:.1f}%" if is_percentage else f"{value:.1f}"
+                        for value in plotted_values.values
+                    ],
                     textposition="outside",
                 ),
                 row=row + 1,
                 col=col + 1,
             )
-            fig.update_yaxes(title_text="B", row=row + 1, col=col + 1)
+            fig.update_yaxes(
+                title_text="%" if is_percentage else "B",
+                row=row + 1,
+                col=col + 1,
+            )
         fig.update_layout(
-            height=800,
+            height=max(520, rows * 260),
             showlegend=False,
             margin=dict(t=70, b=30),
         )
@@ -1666,7 +1701,26 @@ def render_financial_trends(ticker: str,
     with st.expander("查看财报数据表", expanded=False):
         display = frame.copy()
         display.index = pd.to_datetime(display.index).strftime("%Y-%m-%d")
-        st.dataframe(display.style.format("{:.2f}", na_rep="—"), width="stretch")
+        formatters = {
+            column: ("{:.1%}" if column in percentage_metrics else "{:.2f}")
+            for column in display.columns
+        }
+        st.dataframe(
+            display.style.format(formatters, na_rep="—"), width="stretch"
+        )
+
+
+def render_financial_trends(
+    ticker: str,
+    annual: pd.DataFrame,
+    quarterly: pd.DataFrame,
+    statement_currency: str | None = "USD",
+) -> None:
+    """以默认折叠状态展示年度/季度财报趋势面板。"""
+    with st.expander("📚 财报趋势（年度 / 季度）", expanded=False):
+        _render_financial_trends_content(
+            ticker, annual, quarterly, statement_currency
+        )
 
 
 def render_fundamental_quality(ticker: str,
@@ -6089,7 +6143,12 @@ def main():
         ticker, fundamental_history, statement_currency
     )
     st.divider()
-    render_health_checks(ticker, health_checks)
+    render_financial_trends(
+        ticker,
+        annual_financials,
+        quarterly_financials,
+        statement_currency,
+    )
     st.divider()
     context = render_multistage_dcf_panel(
         ticker,
@@ -6105,6 +6164,8 @@ def main():
     render_final_evidence(profile, research_details)
     st.divider()
     render_final_model_limitations(profile)
+    st.divider()
+    render_health_checks(ticker, health_checks)
 
 if __name__ == "__main__":
     main()

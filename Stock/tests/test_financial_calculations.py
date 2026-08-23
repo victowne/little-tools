@@ -5,6 +5,33 @@ import pytest
 from Stock import stock_valuation_mvp as app
 
 
+def test_financial_trend_frame_keeps_amounts_in_billions_and_margins_as_ratios():
+    period = pd.Timestamp("2026-06-30")
+    income = pd.DataFrame(
+        {
+            period: [
+                100_000_000_000.0,
+                40_000_000_000.0,
+                20_000_000_000.0,
+                15_000_000_000.0,
+            ]
+        },
+        index=["Total Revenue", "Gross Profit", "Operating Income", "Net Income"],
+    )
+    cashflow = pd.DataFrame(
+        {period: [30_000_000_000.0, -5_000_000_000.0]},
+        index=["Operating Cash Flow", "Capital Expenditure"],
+    )
+
+    result = app._financial_trend_frame(income, cashflow, pd.DataFrame())
+
+    assert result.loc[period, "Revenue"] == pytest.approx(100.0)
+    assert result.loc[period, "Gross Profit"] == pytest.approx(40.0)
+    assert result.loc[period, "Gross Margin"] == pytest.approx(0.40)
+    assert result.loc[period, "Operating Margin"] == pytest.approx(0.20)
+    assert result.loc[period, "Free Cash Flow"] == pytest.approx(25.0)
+
+
 def test_exact_field_name_is_resolved(statement_factory):
     statement = statement_factory(
         {
