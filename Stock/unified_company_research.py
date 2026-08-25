@@ -227,7 +227,7 @@ def _avgo_spec(retrieved_at: str) -> _Spec:
         ConfidenceAssessment("Terminal Economics", "Low", "Mixed-business economics require a consolidated research bridge."),
     )
     return _Spec(
-        "AVGO", "Broadcom Inc.", (.35, .22, .15), .46, (.40, .52),
+        "AVGO", "Broadcom Inc.", (.80, .60, .25), .46, (.40, .52),
         .65, .75, (.55, .95), .15, .095, .03, "High", context, evidence,
         (
             "35% recognizes Q3 guidance and AI growth while avoiding annualization of an 84% comparison.",
@@ -277,7 +277,7 @@ def _amd_spec(retrieved_at: str) -> _Spec:
         ConfidenceAssessment("Terminal Economics", "Low", "AI market structure and durable accelerator economics remain uncertain."),
     )
     return _Spec(
-        "AMD", "Advanced Micro Devices, Inc.", (.42, .36, .30), .28, (.24, .32),
+        "AMD", "Advanced Micro Devices, Inc.", (.46, .60, .35), .28, (.24, .32),
         1.30, 1.50, (1.10, 1.80), .15, .115, .03, "High", context, evidence,
         (
             "42% is anchored to 41% Q3 guidance, the 50% latest quarter and expected second-half Data Center acceleration without annualizing the 107% segment comparison.",

@@ -516,12 +516,12 @@ def build_nvda_research_profile(
             ))
 
     y1 = _assumption(
-        "year1_growth", 0.55,
+        "year1_growth", 0.60,
         "A 55% TTM-to-DCF-Year-1 step produces a Revenue level close to the live FY2027 consensus, while recognizing that the DCF year ends three months later; Q1 results and Q2 guidance support a strong near-term run-rate without annualizing one quarter.",
         ("ttm_revenue", "fy1_consensus_revenue", "q1_fy27_revenue", "q2_fy27_revenue_guidance", "rubin_product_cycle"),
     )
     y2 = _assumption(
-        "year2_growth", 0.40,
+        "year2_growth", 0.45,
         "FY2028 consensus, continuing hyperscaler capacity constraints, and the Rubin ramp support another high-growth year, but the larger base warrants a step down from Year 1.",
         ("fy2_consensus_revenue", "microsoft_ai_capex", "alphabet_ai_capex", "meta_ai_capex", "amazon_ai_capex", "rubin_product_cycle"),
     )
