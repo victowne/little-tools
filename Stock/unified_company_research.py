@@ -1,4 +1,4 @@
-"""Pure unified-production Research Candidates for MU, AAPL, and AVGO.
+"""Pure unified-production Research Candidates for MU, AAPL, AVGO, and AMD.
 
 Company differences are expressed only through researched assumptions,
 evidence, confidence, and model-risk disclosure.  Every translated candidate
@@ -46,6 +46,10 @@ AAPL_Q3_2026 = "https://www.apple.com/newsroom/2026/07/apple-reports-third-quart
 AAPL_Q3_2026_10Q = "https://www.sec.gov/Archives/edgar/data/320193/000032019326000020/aapl-20260627.htm"
 AVGO_Q2_2026 = "https://investors.broadcom.com/news-releases/news-release-details/broadcom-inc-announces-second-quarter-fiscal-year-2026-financial"
 AVGO_Q2_2026_10Q = "https://www.sec.gov/Archives/edgar/data/1730168/000173016826000054/avgo-20260503.htm"
+AMD_Q2_2026 = "https://ir.amd.com/news-events/press-releases/detail/1295/amd-reports-second-quarter-2026-financial-results"
+AMD_Q2_2026_10Q = "https://www.sec.gov/Archives/edgar/data/2488/000000248826000123/amd-20260627.htm"
+AMD_FAD_2025 = "https://ir.amd.com/news-events/press-releases/detail/1266/amd-unveils-strategy-to-lead-the-1-trillion-compute-market-and-accelerate-next-phase-of-growth"
+AMD_2025_10K = "https://ir.amd.com/financial-information/sec-filings/content/0000002488-26-000018/amd-20251227.htm"
 MU_Q3_2026_REMARKS = "https://investors.micron.com/static-files/631b1a32-5537-46ae-8f40-82e42fc79dfe"
 MU_FACTSET_CONSENSUS = "https://www.finanzen.net/schaetzungen/micron_technology"
 
@@ -238,6 +242,56 @@ def _avgo_spec(retrieved_at: str) -> _Spec:
     )
 
 
+def _amd_spec(retrieved_at: str) -> _Spec:
+    evidence = (
+        _e("latest_quarter", "Fiscal Q2 2026 Revenue", 11.536e9, "currency_amount", "quarter ended 2026-06-27", AMD_Q2_2026, "2026-08-04", retrieved_at, category="historical_financial", notes="Revenue increased 50% YoY and 13% sequentially."),
+        _e("gross_margin", "Fiscal Q2 2026 GAAP Gross Margin", .54, "ratio", "quarter ended 2026-06-27", AMD_Q2_2026, "2026-08-04", retrieved_at, category="historical_financial", notes="The prior-year comparison included MI308 export-control inventory charges."),
+        _e("q2_gaap_operating_margin", "Fiscal Q2 2026 GAAP Operating Margin", .17, "ratio", "quarter ended 2026-06-27", AMD_Q2_2026, "2026-08-04", retrieved_at, category="historical_financial"),
+        _e("q2_non_gaap_operating_margin", "Fiscal Q2 2026 Non-GAAP Operating Margin", .27, "ratio", "quarter ended 2026-06-27", AMD_Q2_2026, "2026-08-04", retrieved_at, category="historical_financial", notes="Company-disclosed adjusted metric shown as context only; the production profile remains GAAP-oriented."),
+        _e("q3_guidance", "Fiscal Q3 2026 Revenue guidance midpoint", 13e9, "currency_amount", "quarter ending 2026-09-26", AMD_Q2_2026, "2026-08-04", retrieved_at, category="management_guidance", notes="Approximately 41% YoY growth; guidance range $12.7B-$13.3B."),
+        _e("ai_revenue", "Fiscal Q2 2026 Data Center Revenue", 6.718e9, "currency_amount", "quarter ended 2026-06-27", AMD_Q2_2026_10Q, "2026-08-05", retrieved_at, category="historical_financial", notes="Data Center Revenue increased 107% YoY and represented about 58% of company Revenue."),
+        _e("business_mix", "Fiscal Q2 2026 segment Revenue mix", "Data Center 6.718B; Client and Gaming 3.841B; Embedded 0.977B", None, "quarter ended 2026-06-27", AMD_Q2_2026_10Q, "2026-08-05", retrieved_at, category="historical_financial"),
+        _e("analyst_day_growth", "AMD 3-5 year company Revenue target", ">35% CAGR", None, "three to five years from 2025 Analyst Day", AMD_FAD_2025, "2025-11-11", retrieved_at, category="management_guidance", notes="A management target, not a guaranteed forecast or a direct DCF-period match."),
+        _e("analyst_day_margin", "AMD long-term Non-GAAP Operating Margin target", ">35%", None, "three to five years from 2025 Analyst Day", AMD_FAD_2025, "2025-11-11", retrieved_at, category="management_guidance", notes="The production Mature Margin is lower because it is GAAP-oriented."),
+        _e("customer_commitments", "OpenAI and Meta deployment agreements", "Each customer intends to deploy up to 6 GW of AMD data-center GPUs.", None, "multi-year beginning with MI450 deployments", AMD_Q2_2026_10Q, "2026-08-05", retrieved_at, category="management_guidance", notes="Customer warrants create potential dilution and milestone/execution risk."),
+        _e("cash_generation", "First-half 2026 operating cash flow", 5.321e9, "currency_amount", "six months ended 2026-06-27", AMD_Q2_2026_10Q, "2026-08-05", retrieved_at, category="historical_financial"),
+        _e("capital_efficiency", "Outsourced manufacturing model", "AMD uses third-party wafer foundries and outsourced assembly/test while retaining material R&D, inventory, packaging and acquisition capital needs.", None, "current operating model", AMD_2025_10K, "2026-02-04", retrieved_at, category="company_specific_research"),
+        _e("terminal_macro", "Mature semiconductor nominal growth", "Terminal growth is set below AMD's current AI growth and management's medium-term target.", None, "terminal period", "Research framework", "2026-08-25", retrieved_at, category="industry_reference"),
+    )
+    context = BusinessContext(
+        business_model_summary="AMD is a fabless high-performance and adaptive computing company spanning data-center CPUs and accelerators, client processors, gaming and embedded products.",
+        primary_growth_drivers=("Instinct accelerators and Helios", "EPYC server share", "AI infrastructure", "Ryzen client share", "Embedded recovery"),
+        primary_margin_drivers=("Data Center mix", "accelerator scale", "gross margin", "R&D leverage", "stock compensation and acquired-intangible amortization"),
+        capital_intensity_notes=("Third-party foundries support asset-light economics, but advanced packaging, inventory, supply commitments, R&D and acquisitions remain economically material.",),
+        cyclicality_notes=("Client, gaming and embedded markets remain cyclical even as Data Center becomes the primary growth driver.",),
+        major_profile_risks=("AI accelerator execution", "NVIDIA and custom-silicon competition", "customer concentration", "TSMC and packaging supply", "export controls", "warrant dilution", "stock-price and beta volatility"),
+    )
+    confidence = (
+        ConfidenceAssessment("Revenue Base", "High", "Validated statements provide a four-quarter TTM base through June 2026."),
+        ConfidenceAssessment("Y1 Growth", "High", "Q3 guidance, Data Center acceleration and current run-rate support low-40s rolling growth."),
+        ConfidenceAssessment("Y2 Growth", "Medium", "The Analyst Day target and MI450/Helios customer commitments support duration, but deployment timing remains uncertain."),
+        ConfidenceAssessment("Y3 Growth", "Low", "Management targets remain strong, but competitive share, supply and customer timing widen the range."),
+        ConfidenceAssessment("Mature Margin", "Low", "The >35% target is Non-GAAP; the durable GAAP conversion is not disclosed."),
+        ConfidenceAssessment("Mature S/C", "Medium", "The fabless structure and historical 3Y anchor support the range, but acquisitions and working capital distort accounting capital."),
+        ConfidenceAssessment("WACC", "Low", "Raw beta produces an unusually high formula WACC; the research WACC uses a long-horizon normalization."),
+        ConfidenceAssessment("Terminal Economics", "Low", "AI market structure and durable accelerator economics remain uncertain."),
+    )
+    return _Spec(
+        "AMD", "Advanced Micro Devices, Inc.", (.42, .36, .30), .28, (.24, .32),
+        1.30, 1.50, (1.10, 1.80), .15, .115, .03, "High", context, evidence,
+        (
+            "42% is anchored to 41% Q3 guidance, the 50% latest quarter and expected second-half Data Center acceleration without annualizing the 107% segment comparison.",
+            "36% retains the company's >35% medium-term target while acknowledging deployment, supply and competitive timing risk.",
+            "30% begins normalization before the deterministic fade rather than assuming the management target is achieved every year.",
+        ),
+        "28% is a GAAP-oriented mature margin below AMD's >35% Non-GAAP target; it allows mix and scale benefits while retaining stock compensation, amortization and execution costs.",
+        "1.30x is anchored to the validated 3Y historical S/C near 1.29x rather than the latest single-year 1.67x.",
+        "1.50x reflects mature fabless economics while retaining advanced packaging, inventory, R&D and acquisition-related capital needs.",
+        "The unified consolidated model cannot separately represent GPU deployment timing, customer warrants, accelerator-system working capital or the GAAP/non-GAAP margin bridge.",
+        confidence,
+    )
+
+
 def _build(
     ticker: str,
     current: MultiStageDCFAssumptions,
@@ -257,6 +311,8 @@ def _build(
         spec = _aapl_spec(retrieved_at)
     elif normalized == "AVGO":
         spec = _avgo_spec(retrieved_at)
+    elif normalized == "AMD":
+        spec = _amd_spec(retrieved_at)
     else:
         raise ValueError("unsupported_unified_company_profile")
     if normalized != "MU":
@@ -284,13 +340,13 @@ def _build(
         return tuple(item for item in candidates if item in evidence_ids)
 
     start_margin_value = float(ttm_margin.value) if ttm_margin is not None else current.starting_operating_margin
-    y1 = _a("year1_growth", spec.growth[0], spec.growth_rationale[0], refs("aligned_y1", "latest_quarter", "q3_guidance", "q4_guidance", "fy2027_consensus"))
-    y2 = _a("year2_growth", spec.growth[1], spec.growth_rationale[1], refs("aligned_y2", "fy2028_consensus", "hbm4", "hbm4e", "strategic_customer_agreements", "installed_base", "ai_revenue", "business_mix"))
-    y3 = _a("year3_growth", spec.growth[2], spec.growth_rationale[2], refs("aligned_y3", "cycle_normalization", "supply_visibility", "capacity_expansion", "installed_base", "business_mix"))
+    y1 = _a("year1_growth", spec.growth[0], spec.growth_rationale[0], refs("aligned_y1", "latest_quarter", "q3_guidance", "q4_guidance", "fy2027_consensus", "analyst_day_growth"))
+    y2 = _a("year2_growth", spec.growth[1], spec.growth_rationale[1], refs("aligned_y2", "fy2028_consensus", "hbm4", "hbm4e", "strategic_customer_agreements", "installed_base", "ai_revenue", "business_mix", "analyst_day_growth", "customer_commitments"))
+    y3 = _a("year3_growth", spec.growth[2], spec.growth_rationale[2], refs("aligned_y3", "cycle_normalization", "supply_visibility", "capacity_expansion", "installed_base", "business_mix", "analyst_day_growth", "customer_commitments"))
     fade = _a("revenue_fade_years", 8, "Eight deterministic fade years follow Y1-Y3; no production Y4/Y5 assumptions exist.", refs("terminal_macro"))
     terminal_g = _a("terminal_growth", spec.terminal_growth, "Mature nominal-growth anchor independent of market price.", refs("terminal_macro"))
     start_margin = _a("starting_operating_margin", start_margin_value, "Validated TTM margin where available; it is an accounting starting point, not Mature Margin.", refs("ttm_operating_margin", "q3_operating_margin", "gross_margin"))
-    mature_margin = _a("mature_operating_margin", spec.mature_margin, spec.margin_rationale, refs("q3_operating_margin", "gross_margin", "business_mix", "cycle_normalization"))
+    mature_margin = _a("mature_operating_margin", spec.mature_margin, spec.margin_rationale, refs("q3_operating_margin", "q2_gaap_operating_margin", "q2_non_gaap_operating_margin", "analyst_day_margin", "gross_margin", "business_mix", "cycle_normalization"))
     start_sc = _a("starting_sales_to_capital", spec.starting_sc, spec.starting_sc_rationale, refs("capital_efficiency", "capex"))
     mature_sc = _a("mature_sales_to_capital", spec.mature_sc, spec.mature_sc_rationale, refs("capital_efficiency", "capex"))
     tax = _a("operating_tax_rate", spec.tax, "Normalized operating-tax assumption, not a single-quarter effective rate.", refs("latest_operating_tax_rate"))
@@ -391,3 +447,7 @@ def build_apple_research_profile(current_assumptions, history, *, revenue_anchor
 
 def build_broadcom_research_profile(current_assumptions, history, *, revenue_anchors=None, wacc_audit=None, retrieved_at="2026-08-23"):
     return _build("AVGO", current_assumptions, history, revenue_anchors=revenue_anchors, wacc_audit=wacc_audit, retrieved_at=retrieved_at)
+
+
+def build_amd_research_profile(current_assumptions, history, *, revenue_anchors=None, wacc_audit=None, retrieved_at="2026-08-25"):
+    return _build("AMD", current_assumptions, history, revenue_anchors=revenue_anchors, wacc_audit=wacc_audit, retrieved_at=retrieved_at)

@@ -131,6 +131,7 @@ from Stock.amazon_research import (
 )
 from Stock.unified_company_research import (
     UnifiedCompanyResearchResult,
+    build_amd_research_profile,
     build_apple_research_profile,
     build_broadcom_research_profile,
     build_micron_research_profile,
@@ -3734,6 +3735,9 @@ FINAL_MODEL_LIMITATIONS = {
     "AAPL": (
         "Economic S/C is a research interpretation because outsourced production, cash management and capital returns distort accounting invested capital.",
     ),
+    "AMD": (
+        "The consolidated model cannot separately capture GPU deployment timing, customer-warrant dilution, accelerator working capital or the GAAP/non-GAAP margin bridge.",
+    ),
 }
 
 
@@ -4085,7 +4089,7 @@ def render_company_research_profile(
     review_state = None
     if (
         candidate_profile.profile_status == "research_in_progress"
-        and candidate_profile.issuer_id in {"NVDA", "ALPHABET_INC", "MSFT", "META", "AMZN", "MU", "AAPL", "AVGO"}
+        and candidate_profile.issuer_id in {"NVDA", "ALPHABET_INC", "MSFT", "META", "AMZN", "MU", "AAPL", "AVGO", "AMD"}
     ):
         review_state = initialize_profile_review_session_state(
             st.session_state, workflow_ticker, candidate_profile
@@ -5733,11 +5737,12 @@ def render_multistage_dcf_panel(ticker: str,
             profile_lookup = CompanyProfileLookupResult(
                 None, False, f"amazon_candidate_unavailable:{exc}"
             )
-    elif ticker.strip().upper() in {"MU", "AAPL", "AVGO"}:
+    elif ticker.strip().upper() in {"MU", "AAPL", "AVGO", "AMD"}:
         builder = {
             "MU": build_micron_research_profile,
             "AAPL": build_apple_research_profile,
             "AVGO": build_broadcom_research_profile,
+            "AMD": build_amd_research_profile,
         }[ticker.strip().upper()]
         unified_research = builder(
             assumptions,

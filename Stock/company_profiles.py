@@ -315,6 +315,11 @@ COMPANY_PROFILE_DEFINITIONS: dict[str, CompanyProfileDefinition] = {
         "Broadcom consolidated unified-production research profile.",
         ("profile_contains_provisional_assumptions",),
     ),
+    "AMD": CompanyProfileDefinition(
+        "AMD", "AMD", "Advanced Micro Devices, Inc.",
+        "AMD consolidated unified-production research profile.",
+        ("profile_contains_provisional_assumptions",),
+    ),
 }
 
 

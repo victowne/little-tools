@@ -195,7 +195,7 @@ def test_candidate_reviewed_snapshot_and_applied_base_are_not_mutated():
 
 @pytest.mark.parametrize(
     "ticker",
-    ("NVDA", "GOOGL", "META", "MSFT", "AMZN", "MU", "AAPL", "AVGO"),
+    ("NVDA", "GOOGL", "META", "MSFT", "AMZN", "MU", "AAPL", "AVGO", "AMD"),
 )
 def test_all_target_tickers_use_the_same_generic_reverse_workflow(ticker):
     inputs = company_inputs(ticker)

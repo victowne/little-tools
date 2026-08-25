@@ -8,7 +8,8 @@ multi-stage DCF architecture: researched Y1/Y2/Y3 revenue growth, deterministic
 fade, mature operating margin, mature Sales-to-Capital, standard reinvestment,
 and a terminal-value framework.
 
-Eight researched Company Profiles currently support an explicit Review & Apply
+Nine researched Company Profiles (NVDA, GOOGL, META, MSFT, AMZN, MU, AAPL,
+AVGO, and AMD) currently support an explicit Review & Apply
 workflow. The workstation also provides Bear/Base/Bull diagnostics,
 WACC/terminal-growth sensitivity, and single-variable Reverse DCF market-implied
 expectations. Market price is diagnostic only: the application does not produce

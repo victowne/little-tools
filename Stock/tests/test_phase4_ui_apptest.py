@@ -15,7 +15,7 @@ def _button(app):
 
 def test_all_phase4_profiles_use_same_panel_without_auto_apply():
     app = AppTest.from_file(str(FIXTURE)).run(timeout=30)
-    for index, ticker in enumerate(("AMZN", "MU", "AAPL", "AVGO")):
+    for index, ticker in enumerate(("AMZN", "MU", "AAPL", "AVGO", "AMD")):
         if index:
             app.selectbox[0].select(ticker).run(timeout=30)
         assert not app.exception
@@ -33,7 +33,7 @@ def test_all_phase4_profiles_use_same_panel_without_auto_apply():
 
 
 def test_each_phase4_profile_can_use_one_click_review_and_apply():
-    for ticker in ("AMZN", "MU", "AAPL", "AVGO"):
+    for ticker in ("AMZN", "MU", "AAPL", "AVGO", "AMD"):
         app = AppTest.from_file(str(FIXTURE)).run(timeout=30)
         if ticker != "AMZN":
             app.selectbox[0].select(ticker).run(timeout=30)
