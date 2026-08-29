@@ -23,7 +23,6 @@ from Stock.fundamentals import (
     FundamentalHistory,
 )
 from Stock.valuation import MultiStageDCFAssumptions
-from Stock.research_wacc import ResearchWACCDecision
 from Stock.wacc_audit import WACCAuditResult, issuer_normalization_metadata
 
 
@@ -158,7 +157,6 @@ class WACCResearchFramework:
     """Profile reference to Phase 2 WACC evidence; contains no WACC formula."""
 
     wacc_audit: WACCAuditResult | None = None
-    wacc_decision: ResearchWACCDecision | None = None
     research_wacc: ResearchAssumption | None = None
     rationale: str = ""
     warnings: tuple[str, ...] = ()

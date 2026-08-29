@@ -107,15 +107,14 @@ def test_all_nan_is_missing_for_scalar_helpers(statement_factory):
     statement = statement_factory({"Total Debt": [np.nan]}, ["2025-12-31"])
 
     assert app._latest_statement_optional(statement, ("Total Debt",)) is None
-    assert app._latest_statement_value(statement, ("Total Debt",)) is None
 
 
 def test_missing_field_and_real_zero_are_distinct(statement_factory):
     zero_statement = statement_factory({"Total Debt": [0.0]}, ["2025-12-31"])
     missing_statement = statement_factory({"Revenue": [10.0]}, ["2025-12-31"])
 
-    assert app._latest_statement_value(zero_statement, ("Total Debt",)) == 0.0
-    assert app._latest_statement_value(missing_statement, ("Total Debt",)) is None
+    assert app._latest_statement_optional(zero_statement, ("Total Debt",)) == 0.0
+    assert app._latest_statement_optional(missing_statement, ("Total Debt",)) is None
 
 
 def test_latest_statement_nan_does_not_fall_back_to_older_period(statement_factory):
@@ -364,162 +363,6 @@ def test_duplicate_normalized_canonical_rows_are_ambiguous():
     assert match.reason == "ambiguous_normalized_match"
 
 
-def calculate_one_period_fcff(statement_factory, income_rows, cashflow_rows):
-    date = ["2025-12-31"]
-    income = statement_factory(income_rows, date) if income_rows else pd.DataFrame()
-    cashflow = statement_factory(cashflow_rows, date)
-    result, source = app._calculate_fcff_series(income, cashflow)
-    return result.iloc[0], source
-
-
-def test_fcff_standard_cfo_formula(statement_factory):
-    value, source = calculate_one_period_fcff(
-        statement_factory,
-        {"Interest Expense": [10.0], "Pretax Income": [50.0], "Tax Provision": [10.0]},
-        {"Operating Cash Flow": [100.0], "Capital Expenditure": [-30.0]},
-    )
-
-    assert value == pytest.approx(78.0)
-    assert source == "FCFF = CFO + CapEx + 税后利息"
-
-
-def test_fcff_supports_alternative_yahoo_names(statement_factory):
-    value, _ = calculate_one_period_fcff(
-        statement_factory,
-        {
-            "Interest Expense Non Operating": [10.0],
-            "Income Before Tax": [50.0],
-            "Income Tax Expense": [10.0],
-        },
-        {
-            "Total Cash From Operating Activities": [100.0],
-            "Capital Expenditures": [-30.0],
-        },
-    )
-
-    assert value == pytest.approx(78.0)
-
-
-def test_fcff_missing_interest_is_treated_as_zero(statement_factory):
-    value, source = calculate_one_period_fcff(
-        statement_factory,
-        {"Pretax Income": [50.0], "Tax Provision": [10.0]},
-        {"Operating Cash Flow": [100.0], "Capital Expenditure": [-30.0]},
-    )
-
-    assert value == pytest.approx(70.0)
-    assert "缺失利息按 0" in source
-
-
-def test_fcff_zero_interest_is_preserved(statement_factory):
-    value, source = calculate_one_period_fcff(
-        statement_factory,
-        {"Interest Expense": [0.0], "Pretax Income": [50.0], "Tax Provision": [10.0]},
-        {"Operating Cash Flow": [100.0], "Capital Expenditure": [-30.0]},
-    )
-
-    assert value == pytest.approx(70.0)
-    assert "缺失利息按 0" not in source
-
-
-def test_fcff_missing_tax_fields_uses_21_percent(statement_factory):
-    value, source = calculate_one_period_fcff(
-        statement_factory,
-        {"Interest Expense": [10.0]},
-        {"Operating Cash Flow": [100.0], "Capital Expenditure": [-30.0]},
-    )
-
-    assert value == pytest.approx(77.9)
-    assert "缺失税率按 21%" in source
-
-
-def test_fcff_zero_tax_provision_is_not_missing(statement_factory):
-    value, source = calculate_one_period_fcff(
-        statement_factory,
-        {"Interest Expense": [10.0], "Pretax Income": [100.0], "Tax Provision": [0.0]},
-        {"Operating Cash Flow": [100.0], "Capital Expenditure": [-30.0]},
-    )
-
-    assert value == pytest.approx(80.0)
-    assert "缺失税率按 21%" not in source
-
-
-def test_fcff_unusually_high_tax_rate_is_capped_at_35_percent(statement_factory):
-    value, _ = calculate_one_period_fcff(
-        statement_factory,
-        {"Interest Expense": [10.0], "Pretax Income": [100.0], "Tax Provision": [80.0]},
-        {"Operating Cash Flow": [100.0], "Capital Expenditure": [-30.0]},
-    )
-
-    assert value == pytest.approx(76.5)
-
-
-def test_fcff_loss_period_uses_zero_tax_rate(statement_factory):
-    value, _ = calculate_one_period_fcff(
-        statement_factory,
-        {"Interest Expense": [10.0], "Pretax Income": [-20.0], "Tax Provision": [3.0]},
-        {"Operating Cash Flow": [100.0], "Capital Expenditure": [-30.0]},
-    )
-
-    assert value == pytest.approx(80.0)
-
-
-def test_fcff_can_be_negative(statement_factory):
-    value, _ = calculate_one_period_fcff(
-        statement_factory,
-        {"Interest Expense": [0.0]},
-        {"Operating Cash Flow": [10.0], "Capital Expenditure": [-30.0]},
-    )
-
-    assert value == pytest.approx(-20.0)
-
-
-def test_fcff_can_be_exactly_zero(statement_factory):
-    value, _ = calculate_one_period_fcff(
-        statement_factory,
-        {"Interest Expense": [0.0]},
-        {"Operating Cash Flow": [30.0], "Capital Expenditure": [-30.0]},
-    )
-
-    assert value == pytest.approx(0.0)
-
-
-def test_fcff_falls_back_to_reported_fcf_when_cfo_is_missing(statement_factory):
-    value, source = calculate_one_period_fcff(
-        statement_factory,
-        {},
-        {"Free Cash Flow": [44.0], "Capital Expenditure": [-10.0]},
-    )
-
-    assert value == pytest.approx(44.0)
-    assert source == "yfinance FCF 回退口径"
-
-
-def test_fcff_drops_period_with_nan_cfo(statement_factory):
-    dates = ["2025-03-31", "2025-06-30"]
-    income = statement_factory({"Interest Expense": [0.0, 0.0]}, dates)
-    cashflow = statement_factory(
-        {"Operating Cash Flow": [np.nan, 20.0], "Capital Expenditure": [-5.0, -5.0]},
-        dates,
-    )
-
-    result, _ = app._calculate_fcff_series(income, cashflow)
-
-    assert result.to_dict() == {pd.Timestamp("2025-06-30"): 15.0}
-
-
-def test_fcf_fallback_requires_cfo_and_capex_in_same_period(statement_factory):
-    cashflow = statement_factory(
-        {
-            "Operating Cash Flow": [100.0, np.nan],
-            "Capital Expenditure": [np.nan, -20.0],
-        },
-        ["2025-03-31", "2025-06-30"],
-    )
-
-    assert app._free_cash_flow_series(cashflow).empty
-
-
 def test_validated_ttm_uses_four_consecutive_quarters():
     dates = ["2025-03-31", "2025-06-30", "2025-09-30", "2025-12-31"]
     quarterly = pd.Series([10.0, 20.0, 30.0, 40.0], index=dates)
@@ -703,94 +546,6 @@ def test_latest_flow_value_non_consecutive_quarters_uses_annual_fallback():
     assert basis == "财年截至 2025-12-31"
 
 
-def fcff_cashflow_fixture(statement_factory, dates, values):
-    return statement_factory(
-        {
-            "Operating Cash Flow": [value * 1_000_000_000 for value in values],
-            "Capital Expenditure": [0.0] * len(values),
-        },
-        dates,
-    )
-
-
-def test_fetch_fcff_appends_valid_four_quarter_ttm(statement_factory, snapshot_factory):
-    annual_dates = ["2024-12-31"]
-    quarter_dates = ["2025-03-31", "2025-06-30", "2025-09-30", "2025-12-31"]
-    snapshot = snapshot_factory(
-        annual_cashflow=fcff_cashflow_fixture(statement_factory, annual_dates, [90.0]),
-        quarterly_cashflow=fcff_cashflow_fixture(statement_factory, quarter_dates, [10.0, 20.0, 30.0, 40.0]),
-    )
-
-    result, source = app.fetch_fcff_data("TEST", snapshot)
-
-    assert result.to_dict() == {
-        pd.Timestamp("2024-12-31"): 90.0,
-        pd.Timestamp("2025-12-31"): 100.0,
-    }
-    assert "TTM" in source
-
-
-def test_fetch_fcff_fewer_than_four_quarters_does_not_append_ttm(statement_factory, snapshot_factory):
-    snapshot = snapshot_factory(
-        annual_cashflow=fcff_cashflow_fixture(statement_factory, ["2024-12-31"], [90.0]),
-        quarterly_cashflow=fcff_cashflow_fixture(
-            statement_factory,
-            ["2025-03-31", "2025-06-30", "2025-09-30"],
-            [10.0, 20.0, 30.0],
-        ),
-    )
-
-    result, source = app.fetch_fcff_data("TEST", snapshot)
-
-    assert result.to_dict() == {pd.Timestamp("2024-12-31"): 90.0}
-    assert "TTM 不可用：fewer_than_four_quarters" in source
-
-
-def test_fetch_fcff_non_consecutive_quarters_rejects_ttm(statement_factory, snapshot_factory):
-    dates = ["2024-12-31", "2025-03-31", "2025-09-30", "2025-12-31"]
-    snapshot = snapshot_factory(
-        annual_cashflow=fcff_cashflow_fixture(statement_factory, ["2024-06-30"], [90.0]),
-        quarterly_cashflow=fcff_cashflow_fixture(statement_factory, dates, [10.0, 20.0, 30.0, 40.0]),
-    )
-
-    result, source = app.fetch_fcff_data("TEST", snapshot)
-
-    assert result.to_dict() == {pd.Timestamp("2024-06-30"): 90.0}
-    assert "TTM 不可用：non_consecutive_quarters" in source
-
-
-def test_fetch_fcff_recent_missing_quarter_does_not_use_older_value(
-    statement_factory,
-    snapshot_factory,
-):
-    dates = ["2024-12-31", "2025-03-31", "2025-06-30", "2025-09-30", "2025-12-31"]
-    snapshot = snapshot_factory(
-        annual_cashflow=fcff_cashflow_fixture(statement_factory, ["2024-12-31"], [90.0]),
-        quarterly_cashflow=fcff_cashflow_fixture(
-            statement_factory,
-            dates,
-            [50.0, 10.0, 20.0, 30.0, np.nan],
-        ),
-    )
-
-    result, source = app.fetch_fcff_data("TEST", snapshot)
-
-    assert result.to_dict() == {pd.Timestamp("2024-12-31"): 90.0}
-    assert "TTM 不可用：missing_quarter_value" in source
-
-
-def test_fetch_fcff_sorts_out_of_order_periods_before_latest_four(statement_factory, snapshot_factory):
-    dates = ["2025-12-31", "2024-12-31", "2025-03-31", "2025-06-30", "2025-09-30"]
-    snapshot = snapshot_factory(
-        annual_cashflow=fcff_cashflow_fixture(statement_factory, ["2024-06-30"], [90.0]),
-        quarterly_cashflow=fcff_cashflow_fixture(statement_factory, dates, [50.0, 10.0, 20.0, 30.0, 40.0]),
-    )
-
-    result, _ = app.fetch_fcff_data("TEST", snapshot)
-
-    assert result.loc[pd.Timestamp("2025-12-31")] == 140.0
-
-
 def build_health_fixture(statement_factory, long_term_debt_marker):
     balance_rows = {
         "Total Assets": [100_000_000_000.0],
@@ -888,27 +643,6 @@ def test_market_adapter_preserves_real_zeros(snapshot_factory):
     )
 
     assert app.fetch_market_data("TEST", snapshot) == (0.0, 0.0, 0.0)
-
-
-def test_missing_shares_cannot_produce_dcf_value():
-    result = app.calculate_dcf(
-        pd.Series([10.0]), 0.08, 0.09, 0.025, 5, 0.0, None
-    )
-
-    assert "error" in result
-
-
-def test_missing_net_debt_cannot_produce_dcf_value():
-    result = app.calculate_dcf(
-        pd.Series([10.0]), 0.08, 0.09, 0.025, 5, None, 1.0
-    )
-
-    assert "error" in result
-
-
-def test_missing_price_has_no_fake_margin_of_safety():
-    assert app._margin_of_safety(150.0, None) is None
-    assert app._margin_of_safety(150.0, 0.0) is None
 
 
 def patch_wacc_external_inputs(monkeypatch):

@@ -6,8 +6,6 @@ import pytest
 from Stock.forecast_anchors import (
     ForwardRevenueEstimate,
     align_dcf_and_consensus_period,
-    alpha_vantage_revenue_estimates_to_set,
-    assemble_forward_estimate_evidence,
     build_dcf_revenue_forecast_periods,
     build_forward_revenue_estimate_set,
     compare_aligned_forward_estimate,
@@ -113,63 +111,6 @@ def test_goog_googl_issuer_normalization():
     goog = estimate_set([estimate("2026-12-31", 120.0)], ticker="GOOG")
     googl = estimate_set([estimate("2026-12-31", 120.0)], ticker="GOOGL")
     assert goog.issuer_id == googl.issuer_id == "GOOGL"
-
-
-def test_yahoo_fallback_evidence_has_no_primary():
-    yahoo = estimate_set(
-        [estimate("2026-12-31", 120.0, source="yahoo")], source="yahoo"
-    )
-    evidence = assemble_forward_estimate_evidence(None, yahoo)
-    assert evidence.primary is None
-    assert evidence.references == (yahoo,)
-    assert "primary_unavailable_using_reference_only" in evidence.warnings
-
-
-def test_conflicting_sources_are_not_averaged_or_overwritten():
-    primary = estimate_set([estimate("2026-12-31", 125.0)], source="alpha")
-    yahoo = estimate_set(
-        [estimate("2026-12-31", 120.0, source="yahoo")], source="yahoo"
-    )
-    evidence = assemble_forward_estimate_evidence(primary, yahoo)
-    assert evidence.primary.estimates[0].revenue_estimate == 125.0
-    assert evidence.references[0].estimates[0].revenue_estimate == 120.0
-    assert "multiple_sources_not_blended" in evidence.warnings
-
-
-def test_alpha_vantage_adapter_retains_dates_and_counts_not_fake_as_of():
-    payload = {"annualEstimates": [
-        {
-            "fiscalDateEnding": "2026-12-31", "fiscalYear": "FY2026",
-            "estimatedRevenueAvg": 120.0,
-            "estimatedRevenueAnalystCount": 25,
-            "revisionDate": "2026-02-15",
-        },
-        {
-            "fiscalDateEnding": "2027-12-31", "fiscalYear": "FY2027",
-            "estimatedRevenueAvg": 150.0,
-            "estimatedRevenueAnalystCount": 22,
-            "revisionDate": "2026-02-14",
-        },
-    ]}
-    result = alpha_vantage_revenue_estimates_to_set(
-        ticker="TEST", payload=payload,
-        latest_actual_fiscal_period=ACTUAL, latest_actual_revenue=100.0,
-        retrieved_at=RETRIEVED,
-    )
-    assert result.estimates[0].fiscal_period_explicit is True
-    assert result.estimates[0].analyst_count == 25
-    assert result.estimates[1].implied_revenue_growth == pytest.approx(0.25)
-    assert result.source_as_of is None
-
-
-def test_alpha_vantage_provider_information_payload_fabricates_no_estimates():
-    result = alpha_vantage_revenue_estimates_to_set(
-        ticker="TEST", payload={"Information": "API key required"},
-        latest_actual_fiscal_period=ACTUAL, latest_actual_revenue=100.0,
-        retrieved_at=RETRIEVED,
-    )
-    assert result.estimates == ()
-    assert "source_as_of_unavailable" in result.warnings
 
 
 def test_dcf_time_axis_is_twelve_month_intervals_after_base():

@@ -11,16 +11,6 @@ import math
 import pandas as pd
 
 from Stock.alphabet_research import ResearchRange, RevenueEvidenceRow, _annual_items, _latest_annual, _ttm
-from Stock.amazon_explicit_reinvestment_transition import (
-    AMAZON_2025_10K,
-    AMAZON_2026_Q2_10Q,
-    FROZEN_MATURE_MARGIN,
-    FROZEN_MATURE_SALES_TO_CAPITAL,
-    FROZEN_NEAR_TERM_GROWTH,
-    FROZEN_TAX_RATE,
-    FROZEN_TERMINAL_GROWTH,
-    FROZEN_WACC,
-)
 from Stock.company_profiles import (
     BusinessContext,
     CapitalEfficiencyResearchFramework,
@@ -49,6 +39,13 @@ VALIDATED_TTM_PERIODS = tuple(pd.Timestamp(value) for value in (
 STARTING_PPE_DEPRECIATION = 49.741e9
 MATURE_MARGIN_RANGE = (0.1233, 0.2389)
 MATURE_SALES_TO_CAPITAL_RANGE = (0.588, 1.095)
+FROZEN_MATURE_MARGIN = 0.1834
+FROZEN_MATURE_SALES_TO_CAPITAL = 0.824
+FROZEN_TAX_RATE = 0.21
+FROZEN_WACC = 0.105
+FROZEN_TERMINAL_GROWTH = 0.03
+AMAZON_2025_10K = "https://www.sec.gov/Archives/edgar/data/1018724/000101872426000004/amzn-20251231.htm"
+AMAZON_2026_Q2_10Q = "https://www.sec.gov/Archives/edgar/data/1018724/000101872426000026/amzn-20260630.htm"
 
 
 @dataclass(frozen=True)
