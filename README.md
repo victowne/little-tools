@@ -691,7 +691,6 @@ A high terminal-value share does not automatically invalidate a valuation, but i
 | U.S. 10-year Treasury | U.S. Treasury; `^TNX` fallback | Risk-free Rate |
 | ERP, industry WACC, and synthetic spreads | Damodaran datasets | WACC evidence and cross-checks |
 | Company research evidence | SEC filings, company IR, earnings releases, and guidance | Company Profile research |
-| Alpha Vantage adapter | Optional provider audit | Not required by the production UI |
 
 During one Streamlit page run, annual statements, quarterly statements, and market metadata are reused through a centralized company snapshot. Streamlit caching reduces repeated requests. Live values may change after a cache refresh, provider revision, or application restart.
 

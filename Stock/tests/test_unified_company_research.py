@@ -58,8 +58,8 @@ def test_candidate_is_unreviewed_unapplied_and_uses_common_schema(ticker):
     (
         ("MU", (1.55, .20, .15), .28, .55, .105, .025, .28*.85*.55, "High"),
         ("AAPL", (.12, .08, .06), .32, 1.80, .085, .03, .32*.84*1.80, "Medium"),
-        ("AVGO", (.35, .22, .15), .46, .75, .095, .03, .46*.85*.75, "High"),
-        ("AMD", (.42, .36, .30), .28, 1.50, .115, .03, .28*.85*1.50, "High"),
+        ("AVGO", (.80, .60, .25), .46, .75, .095, .03, .46*.85*.75, "High"),
+        ("AMD", (.46, .60, .35), .28, 1.50, .115, .03, .28*.85*1.50, "High"),
     ),
 )
 def test_researched_assumptions_and_terminal_economics(

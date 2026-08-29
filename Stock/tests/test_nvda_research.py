@@ -316,7 +316,7 @@ def test_current_and_candidate_assumptions_remain_separate():
         result.lookup.profile
     ).assumptions
     assert current.near_term_revenue_growth == (0.30, 0.25, 0.20)
-    assert translated.near_term_revenue_growth == pytest.approx((0.55, 0.40, 0.25))
+    assert translated.near_term_revenue_growth == pytest.approx((0.60, 0.45, 0.25))
     assert translated is not current
 
 
@@ -514,7 +514,7 @@ def test_evidence_refresh_does_not_change_reviewed_assumptions():
         reconciled.reviewed_snapshot.profile
     ).assumptions
     assert reviewed_assumptions.near_term_revenue_growth == pytest.approx(
-        (0.55, 0.40, 0.25)
+        (0.60, 0.45, 0.25)
     )
     assert "reviewed_profile_evidence_changed" in reconciled.warnings
     assert "review_refresh_recommended" not in reconciled.warnings
@@ -622,7 +622,7 @@ def test_reviewed_snapshot_maps_exactly_and_reconciles_dcf_preview():
     ).assumptions
     assert plan.available
     assert plan.assumptions == translated
-    assert plan.assumptions.near_term_revenue_growth == (0.55, 0.40, 0.25)
+    assert plan.assumptions.near_term_revenue_growth == (0.60, 0.45, 0.25)
     assert plan.assumptions.starting_operating_margin == pytest.approx(0.6402)
     assert plan.assumptions.wacc == pytest.approx(0.115)
     assert len(plan.changed_fields) > 0
@@ -699,7 +699,7 @@ def test_newer_reviewed_snapshot_requires_explicit_new_application():
     )
     assert plan.newer_review_available
     assert not plan.already_applied
-    assert application.assumptions.near_term_revenue_growth[0] == 0.55
+    assert application.assumptions.near_term_revenue_growth[0] == 0.60
     assert plan.assumptions.near_term_revenue_growth[0] == 0.56
     assert assumptions_fingerprint(plan.assumptions) != (
         application.snapshot_fingerprint

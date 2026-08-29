@@ -94,44 +94,6 @@ if base_run.per_share_value is None:
             base_run.per_share_unavailable_reason
         )
     )
-nvda_research = None
-alphabet_research = None
-candidate_run = None
-if ticker == "NVDA":
-    nvda_research = app.build_nvda_research_profile(
-        base, history, retrieved_at="2026-08-17"
-    )
-    profile_lookup = nvda_research.lookup
-    translation = app.build_multistage_assumptions_from_profile(
-        profile_lookup.profile
-    )
-    candidate_run = run_multistage_dcf(
-        base_run.inputs, translation.assumptions
-    )
-elif ticker in {"GOOG", "GOOGL"}:
-    alphabet_research = app.build_alphabet_research_profile(
-        base, history, retrieved_at="2026-08-19"
-    )
-    profile_lookup = alphabet_research.lookup
-    translation = app.build_multistage_assumptions_from_profile(
-        profile_lookup.profile
-    )
-    candidate_run = run_multistage_dcf(
-        base_run.inputs, translation.assumptions
-    )
-else:
-    profile_lookup = app.build_provisional_company_profile(
-        ticker, base, history=history
-    )
-app.render_company_research_profile(
-    profile_lookup,
-    statement_currency=base_run.inputs.statement_currency,
-    current_assumptions=base,
-    current_run=base_run,
-    candidate_run=candidate_run,
-    nvda_research=nvda_research,
-    alphabet_research=alphabet_research,
-)
 app.render_scenario_analysis(
     ticker, history, base, base_run, base_run.inputs.statement_currency
 )

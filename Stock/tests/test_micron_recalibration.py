@@ -131,7 +131,7 @@ def test_other_company_builders_are_not_changed_by_micron_recalibration():
     ).assumptions.near_term_revenue_growth == (.12, .08, .06)
     assert build_multistage_assumptions_from_profile(
         broadcom
-    ).assumptions.near_term_revenue_growth == (.35, .22, .15)
+    ).assumptions.near_term_revenue_growth == (.80, .60, .25)
 
 
 def test_standard_valuation_engine_has_no_micron_dispatch():

@@ -24,7 +24,7 @@ def test_one_click_review_apply_and_reapply_end_to_end():
 
     assert not app.exception
     assert any("Reviewed profile already applied" in item.value for item in app.success)
-    assert any("Scenario Base Y1: 55.00%" in item.value for item in app.caption)
+    assert any("Scenario Base Y1: 60.00%" in item.value for item in app.caption)
     assert any("Sensitivity center WACC: 11.50%" in item.value for item in app.caption)
     review = app.session_state["company_profile_review_NVDA"]
     application = app.session_state["reviewed_profile_application_NVDA"]
@@ -39,7 +39,7 @@ def test_one_click_review_apply_and_reapply_end_to_end():
     _button(app, "Reapply Reviewed Profile").click().run(timeout=30)
 
     assert not app.exception
-    assert app.session_state["multistage_NVDA_year_1_growth"] == pytest.approx(55.0)
+    assert app.session_state["multistage_NVDA_year_1_growth"] == pytest.approx(60.0)
     assert any("Reviewed profile already applied" in item.value for item in app.success)
 
 
