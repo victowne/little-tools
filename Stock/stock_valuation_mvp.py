@@ -9,8 +9,15 @@ import re
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from io import StringIO
+from pathlib import Path
 
 import requests
+
+# yfinance stores cookies, time-zone metadata, and ISIN lookups in SQLite.
+# Its OS-level default cache can be read-only in sandboxed/local app sessions,
+# so keep the cache in this repository's ignored, writable cache directory.
+YFINANCE_CACHE_DIR = Path(__file__).resolve().parents[1] / ".yfinance-cache"
+yf.set_tz_cache_location(str(YFINANCE_CACHE_DIR))
 
 from Stock.fundamentals import (
     FCF,
