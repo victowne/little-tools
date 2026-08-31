@@ -1,182 +1,200 @@
-# Agent Guidelines for Python Code Quality
+# Agent Guidelines for the Stock Valuation Project
 
-This document provides guidelines for maintaining high-quality Python code. These rules MUST be followed by all AI coding agents and contributors.
+These instructions apply to AI coding agents and contributors working in this
+repository. They are intended to protect financial correctness, preserve the
+project's unified valuation architecture, and keep changes reviewable.
 
-## Your Core Principles
+## Priorities
 
-All code you write MUST be fully optimized.
+Use this order when trade-offs arise:
 
-"Fully optimized" includes:
+1. Financial correctness and explicit missing-data semantics.
+2. Preservation of validated valuation behavior.
+3. Clear, maintainable code and focused changes.
+4. Deterministic tests and reproducible verification.
+5. Performance improvements supported by an observed need.
 
-- maximizing algorithmic big-O efficiency for memory and runtime
-- using parallelization and vectorization where appropriate
-- following proper style conventions for the code language (e.g. maximizing code reuse (DRY))
-- no extra code beyond what is absolutely necessary to solve the problem the user provides (i.e. no technical debt)
-  - If a Python library can be imported to significantly reduce the amount of new code required to implement a function at optimal performance, and the library itself is small and does not have much overhead, ALWAYS use the library instead.
+Do not optimize, parallelize, add dependencies, or redesign architecture merely
+to satisfy a generic best practice. Prefer the simplest approach that is correct
+for the project's small financial-statement datasets.
 
-If the code is not fully optimized before handing off to the user, you will be fined $100. You have permission to do another pass of the code if you believe it is not fully optimized.
+## Project Architecture
 
-## Preferred Tools
+- Keep data acquisition, financial normalization, pure calculations, and
+  Streamlit presentation separate where practical.
+- Keep valuation calculations independent of Streamlit and network access.
+- Reuse the existing multi-stage DCF calculation chain instead of duplicating
+  formulas in UI or research modules.
+- Use one production DCF architecture for all companies. Represent company
+  differences through researched assumptions, evidence, confidence, and model
+  limitations rather than ticker-specific valuation engines.
+- Avoid broad restructuring or unrelated cleanup while implementing a focused
+  request.
+- Preserve public behavior unless the task explicitly changes it. Report
+  intentional behavior changes.
 
-- Use `uv` for Python package management and to create a `.venv` if it is not present.
-- Ensure `ipykernel` and `ipywidgets` is installed in `.venv` for Jupyter Notebook compatability. This should not be in package requirements.
-- Use `tqdm` to track long-running loops within Jupyter Notebooks. The `description` of the progress bar should be contextually sensitive.
-- Use `orjson` for JSON loading/dumping.
-- When reporting error to the console, use `logger.error` instead of `print`.
-- If the project involves the creation of images (e.g. PNG/WEBP), you have permission to use the Read tool to verify the rendered images fit the user and application requirements.
-- For data science:
-  - **ALWAYS** use `polars` instead of `pandas` for data frame manipulation.
-  - If a `polars` dataframe will be printed, **NEVER** simultaneously print the number of entries in the dataframe nor the schema as it is redundant.
-  - **NEVER** ingest more than 10 rows of a data frame at a time. Only analyze subsets of code to avoid overloading your memory context.
-- For creating databases:
-  - Do not denormalized unless explicitly prompted to do so.
-  - Always use the most appropriate datatype, such as `DATETIME/TIMESTAMP` for datetime-related fields.
-  - Use `ARRAY` datatypes for nested fields. **NEVER** save as `TEXT/STRING`.
-- In Jupyter Notebooks, DataFrame objects within conditional blocks should be explicitly `print()` as they will not be printed automatically.
+## Financial Data Semantics
 
-## Code Style and Formatting
+- A genuine reported zero must remain `0.0`.
+- Missing fields, `NaN` values, failed lookups, and ambiguous matches must remain
+  unavailable, normally represented by `None` or a structured unavailable
+  result. Never use zero as a generic missing-data sentinel.
+- Financial statement matching must be conservative and use explicit aliases.
+  A missing value is preferable to a confidently wrong line item.
+- Validated TTM calculations must use four distinct consecutive fiscal quarters.
+  Do not silently skip a missing recent quarter and substitute an older one.
+- Keep assumptions separate from observed data. When a fallback assumption is
+  used, make it visible in code, diagnostics, or result metadata.
+- Do not use market price to tune Company Profile assumptions.
+- Preserve units explicitly, especially for percentages, currency values, and
+  share counts.
 
-- **MUST** use meaningful, descriptive variable and function names
-- **MUST** follow PEP 8 style guidelines
-- **MUST** use 4 spaces for indentation (never tabs)
-- **NEVER** use emoji, or unicode that emulates emoji (e.g. ✓, ✗). The only exception is when writing tests and testing the impact of multibyte characters.
-- Use snake_case for functions/variables, PascalCase for classes, UPPER_CASE for constants
-- Limit line length to 88 characters (ruff formatter standard)
-- **MUST** avoid including redundant comments which are tautological or self-demonstating (e.g. cases where it is easily parsable what the code does at a glance so the comment does)
-- **MUST** avoid including comments which leak what this file contains, or leak the original user prompt, ESPECIALLY if it's irrelevant to the output code.
+## Python Style
 
-## Documentation
+- Follow PEP 8 and use four spaces for indentation.
+- Use descriptive `snake_case` names for functions and variables,
+  `PascalCase` for classes, and `UPPER_CASE` for constants.
+- Prefer lines of approximately 88 characters, but allow longer URLs, user-facing
+  text, type declarations, or expressions when splitting would reduce clarity.
+- Avoid wildcard imports, mutable default arguments, bare `except` clauses,
+  commented-out code, debug prints, and committed breakpoints.
+- Use dataclasses for focused data containers when they clarify the model.
+- Prefer composition and small, single-purpose functions. Parameter count is a
+  design signal, not an absolute limit.
+- Do not add comments that merely repeat the code. Document financial reasoning,
+  units, non-obvious assumptions, and important compatibility behavior.
 
-- **MUST** include docstrings for all public functions, classes, and methods
-- **MUST** document function parameters, return values, and exceptions raised
-- Keep comments up-to-date with code changes
-- Include examples in docstrings for complex functions
+## Documentation and Type Hints
 
-Example docstring:
+- Add type hints to new or materially changed production functions.
+- Public financial calculation APIs and important result structures must have
+  clear docstrings.
+- Complex calculations should document inputs, outputs, units, assumptions, and
+  meaningful exceptions. Include an example only when it improves understanding.
+- Simple private helpers, Streamlit rendering helpers, and self-explanatory test
+  functions do not require ceremonial docstrings.
+- Prefer precise types and `T | None` for nullable values. Use `Any` only at
+  genuinely dynamic third-party or framework boundaries, and contain it locally.
+- Improve typing incrementally. Do not perform repository-wide annotation changes
+  as part of an unrelated task.
 
-```python
-def calculate_total(items: list[dict], tax_rate: float = 0.0) -> float:
-    """Calculate the total cost of items including tax.
+## DataFrame and Serialization Policy
 
-    Args:
-        items: List of item dictionaries with 'price' keys
-        tax_rate: Tax rate as decimal (e.g., 0.08 for 8%)
+- Pandas is an accepted project dependency because yfinance returns pandas
+  objects and Streamlit and Plotly integrate with them directly.
+- Do not migrate existing pandas code to Polars without a measured performance or
+  scale requirement. Polars may be introduced for future large, batch-oriented
+  datasets when it provides a clear benefit.
+- The standard-library `json` module is appropriate for normal project use.
+  Introduce `orjson` only when profiling demonstrates a meaningful need.
+- Avoid unnecessary conversions between dataframe libraries.
 
-    Returns:
-        Total cost including tax
+## Errors and Logging
 
-    Raises:
-        ValueError: If items is empty or tax_rate is negative
-    """
-```
+- Never silently swallow an exception.
+- Catch specific exceptions when their types are stable and known.
+- At external-provider or top-level UI boundaries, a final broad exception guard
+  is acceptable when it prevents the entire application from failing. It must
+  record useful diagnostics and return a clear unavailable state.
+- Do not expose secrets, API keys, sensitive URLs, or personal data in logs.
+- Use logging for errors and diagnostics. Normal command-line output intended for
+  users or machine consumption may use stdout.
+- Use context managers for resources that require deterministic cleanup.
 
-## Type Hints
+## Dependencies and Tooling
 
-- **MUST** use type hints for all function signatures (parameters and return values)
-- **NEVER** use `Any` type unless absolutely necessary
-- **MUST** run mypy and resolve all type errors
-- Use `Optional[T]` or `T | None` for nullable types
-
-## Error Handling
-
-- **NEVER** silently swallow exceptions without logging
-- **MUST** never use bare `except:` clauses
-- **MUST** catch specific exceptions rather than broad exception types
-- **MUST** use context managers (`with` statements) for resource cleanup
-- Provide meaningful error messages
-
-## Function Design
-
-- **MUST** keep functions focused on a single responsibility
-- **NEVER** use mutable objects (lists, dicts) as default argument values
-- Limit function parameters to 5 or fewer
-- Return early to reduce nesting
-
-## Class Design
-
-- **MUST** keep classes focused on a single responsibility
-- **MUST** keep `__init__` simple; avoid complex logic
-- Use dataclasses for simple data containers
-- Prefer composition over inheritance
-- Avoid creating additional class functions if they are not necessary
-- Use `@property` for computed attributes
+- Minimize dependencies. Add one only when it materially improves correctness,
+  maintainability, or required functionality.
+- Keep all runtime and development dependencies documented. Existing
+  `requirements.txt` and `requirements-dev.txt` remain valid until the project
+  deliberately adopts `pyproject.toml`.
+- `pyproject.toml` and a lockfile are recommended for future dependency
+  modernization, but introducing them must be a focused task rather than
+  incidental cleanup.
+- `uv` is recommended when available, but a working existing virtual environment
+  and pip workflow may be used.
+- Ruff is the preferred formatter and linter when configured. Apply it to changed
+  code and avoid mass-formatting unrelated historical files.
+- mypy is recommended first for pure financial and valuation modules. Adopt it
+  incrementally rather than requiring an immediate repository-wide strict pass.
 
 ## Testing
 
-- **MUST** write unit tests for all new functions and classes
-- **MUST** mock external dependencies (APIs, databases, file systems)
-- **MUST** use pytest as the testing framework
-- **NEVER** run tests you generate without first saving them as their own discrete file
-- **NEVER** delete files created as a part of testing.
-- Ensure the folder used for test outputs is present in `.gitignore`
-- Follow the Arrange-Act-Assert pattern
-- Do not commit commented-out tests
+- Use pytest.
+- Every new or changed financial calculation must have deterministic tests.
+- Mock network APIs, external providers, the filesystem, and other unstable
+  dependencies in the normal test suite.
+- Live-data checks may supplement deterministic tests but must not be required for
+  ordinary test success.
+- Add UI tests when Streamlit behavior, session state, controls, or displayed
+  financial results change materially.
+- Preserve existing regression tests unless product behavior intentionally
+  changes. Update expectations explicitly and explain the change.
+- Do not create tests solely to satisfy a numeric coverage target.
+- Keep generated test output and caches out of version control.
 
-## Imports and Dependencies
+## Performance
 
-- **MUST** avoid wildcard imports (`from module import *`)
-- **MUST** document dependencies in `pyproject.toml`
-- Use `uv` for fast package management and dependency resolution
-- Organize imports: standard library, third-party, local imports
-- Use `isort` to automate import formatting
-
-## Python Best Practices
-
-- **NEVER** use mutable default arguments
-- **MUST** use context managers (`with` statement) for file/resource management
-- **MUST** use `is` for comparing with `None`, `True`, `False`
-- **MUST** use f-strings for string formatting
-- Use list comprehensions and generator expressions
-- Use `enumerate()` instead of manual counter variables
-
-## Benchmarking and Optimization
-
-- **NEVER** run benchmarks in parallel, as the benchmarks will compete for resources and the results will be invalid
-- **NEVER** game the benchmarks. Do not manipulate the benchmarks themselves to satisfy any required performance constraints
-- If benchmarking against another crate or library, ensure the benchmarks are apples-to-apples comparisons
-- Ensure benchmark tests are independent. If the tests are dependent due to a feature (e.g. caching), ensure the feature is disabled
+- Optimize based on profiling or an observed bottleneck.
+- This application is usually network-bound. Prefer caching, deduplicated provider
+  requests, and lazy loading over premature computational optimization.
+- Do not parallelize provider calls blindly; consider rate limits, cache behavior,
+  reproducibility, and provider terms.
+- Use vectorization for genuinely large tabular operations when it improves both
+  clarity and performance. Simple operations on a few annual or quarterly periods
+  do not require special optimization.
+- Never alter benchmarks or tests to conceal a regression.
 
 ## Security
 
-- **NEVER** store secrets, API keys, or passwords in code. Only store them in `.env`
-  - Ensure `.env` is declared in `.gitignore`.
-  - **NEVER** print or log URLs to console if they contain an API key
-- **MUST** use environment variables for sensitive configuration
-- **NEVER** log sensitive information (passwords, tokens, PII)
+- Never store API keys, passwords, tokens, or credentials in source code.
+- Read secrets from environment variables or an ignored local `.env` file.
+- Ensure `.env` and generated credential files are ignored by Git.
+- Never log secrets or URLs containing API keys.
+- Do not commit user data or personally identifiable information.
 
-## Version Control
+## Version Control and Scope
 
-- **MUST** write clear, descriptive commit messages
-- **NEVER** commit commented-out code; delete it
-- **NEVER** commit debug print statements or breakpoints
-- **NEVER** commit credentials or sensitive data
+- Preserve unrelated user changes in a dirty worktree.
+- Do not use destructive Git commands unless explicitly authorized.
+- Keep changes narrowly scoped and use clear, descriptive commit messages.
+- Do not commit credentials, generated caches, debug output, commented-out code,
+  or breakpoints.
+- Before committing, inspect the diff and confirm that no unrelated files changed.
 
-## Tools
+## Verification Before Committing
 
-- **MUST** use Ruff for code formatting and linting (replaces Black, isort, flake8)
-- **MUST** use mypy for static type checking
-- Use `uv` for package management (faster alternative to pip)
-- Use pytest for testing
+Choose verification proportional to the change. For production code changes,
+normally confirm:
 
-## Before Committing
+- relevant focused tests pass;
+- the complete deterministic pytest suite passes when practical;
+- changed Python files compile;
+- formatting and lint checks pass when the project tools are configured;
+- type checks pass for modules currently covered by mypy;
+- `git diff --check` passes;
+- no hardcoded credentials, debug statements, or unrelated edits were introduced.
 
-- [ ] All tests pass
-- [ ] Type checking passes (mypy)
-- [ ] Code formatter and linter pass (Ruff)
-- [ ] All functions have docstrings and type hints
-- [ ] No commented-out code or debug statements
-- [ ] No hardcoded credentials
+Documentation-only changes do not require the full application test suite unless
+they affect executable examples or configuration.
 
-## Company Profile updates
+## Company Profile Updates
 
 Whenever a Company Profile is added or updated:
 
-1. Run the relevant focused tests, followed by the full test suite.
-2. Start or restart the local Streamlit application with the network access required by its live financial-data providers.
-3. Open `http://localhost:8501`, select the affected ticker, and verify that the Company Profile, fundamentals, evidence, and DCF sections render without a data-loading warning.
-4. Leave the local application running and give the user the local preview link so they can inspect the update.
-5. Keep the updated profile as a research candidate; do not apply it to the Base until the user has reviewed and approved it.
+1. Keep it as a research candidate. Do not automatically review or apply it to
+   the Base DCF.
+2. Document evidence, assumption confidence, and model limitations.
+3. Run the relevant focused tests, followed by the full deterministic test suite.
+4. Start or restart the local Streamlit application with the network access
+   required by its live financial-data providers.
+5. Open `http://localhost:8501`, select the affected ticker, and verify that the
+   Company Profile, fundamentals, evidence, and DCF sections render without an
+   unexpected data-loading warning.
+6. Leave the local application running and provide the preview link so the user
+   can review the candidate.
 
----
+## Guiding Principle
 
-**Remember:** Prioritize clarity and maintainability over cleverness. This is your core directive.
+Prioritize transparent financial reasoning, clarity, and maintainability over
+cleverness or rigid adherence to generic tooling rules.
