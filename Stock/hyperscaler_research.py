@@ -10,14 +10,17 @@ from dataclasses import dataclass
 import math
 
 from Stock.alphabet_research import (
-    ResearchRange,
-    RevenueEvidenceRow,
     _anchor,
     _annual_items,
     _forward_evidence,
     _latest_annual,
     _ttm,
     _wacc_evidence,
+)
+from Stock.company_research_types import (
+    ConfidenceAssessment,
+    ResearchRange,
+    RevenueEvidenceRow,
 )
 from Stock.company_profiles import (
     BusinessContext,
@@ -44,13 +47,6 @@ MICROSOFT_FY26_Q4 = "https://www.microsoft.com/en-us/Investor/earnings/FY-2026-Q
 MICROSOFT_FY26_Q3_METRICS = "https://www.microsoft.com/en-us/investor/earnings/fy-2026-q3/metrics"
 MICROSOFT_FY26_Q3_CALL = "https://www.microsoft.com/en-us/investor/events/fy-2026/earnings-fy-2026-q3"
 META_Q2_2026 = "https://investor.atmeta.com/investor-news/press-release-details/2026/Meta-Reports-Second-Quarter-2026-Results/default.aspx"
-
-
-@dataclass(frozen=True)
-class ConfidenceAssessment:
-    category: str
-    confidence: str
-    rationale: str
 
 
 @dataclass(frozen=True)

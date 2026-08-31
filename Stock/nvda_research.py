@@ -24,6 +24,7 @@ from Stock.company_profiles import (
     TerminalResearchFramework,
     WACCResearchFramework,
 )
+from Stock.company_research_types import ResearchRange, RevenueEvidenceRow
 from Stock.forecast_anchors import RevenueForecastAnchors
 from Stock.fundamentals import (
     GROSS_MARGIN,
@@ -67,29 +68,6 @@ AMD_2025_ANNUAL_URL = (
     "https://ir.amd.com/financial-information/sec-filings/content/"
     "0001193125-26-129106/0001193125-26-129106.pdf"
 )
-
-
-@dataclass(frozen=True)
-class ResearchRange:
-    assumption_id: str
-    low: float
-    central: float
-    high: float
-    rationale: str
-    evidence_references: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class RevenueEvidenceRow:
-    label: str
-    period: str | None
-    revenue: float | None
-    growth: float | None
-    source: str
-    source_date: str | None
-    retrieved_at: str | None
-    analyst_count: int | None = None
-    notes: str = ""
 
 
 @dataclass(frozen=True)

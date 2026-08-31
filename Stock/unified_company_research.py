@@ -8,14 +8,17 @@ uses the existing standard Sales-to-Capital production DCF.
 from dataclasses import dataclass
 
 from Stock.alphabet_research import (
-    ResearchRange,
-    RevenueEvidenceRow,
     _anchor,
     _annual_items,
     _forward_evidence,
     _latest_annual,
     _ttm,
     _wacc_evidence,
+)
+from Stock.company_research_types import (
+    ConfidenceAssessment,
+    ResearchRange,
+    RevenueEvidenceRow,
 )
 from Stock.company_profiles import (
     BusinessContext,
@@ -31,7 +34,6 @@ from Stock.company_profiles import (
 )
 from Stock.forecast_anchors import RevenueForecastAnchors
 from Stock.fundamentals import GROSS_MARGIN, OPERATING_MARGIN, OPERATING_TAX_RATE, REVENUE, REVENUE_GROWTH, ROIC, FundamentalHistory
-from Stock.hyperscaler_research import ConfidenceAssessment
 from Stock.micron_recalibration import (
     MicronPeriodAlignment,
     build_micron_period_alignment,

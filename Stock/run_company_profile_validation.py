@@ -12,65 +12,38 @@ import argparse
 import json
 from datetime import date
 
-from Stock.alphabet_research import build_alphabet_research_profile
-from Stock.amazon_research import (
-    build_amazon_research_profile,
-    run_amazon_candidate_preview,
+from Stock.amazon_research import run_amazon_candidate_preview
+from Stock.company_profile_registry import (
+    PRODUCTION_RESEARCH_TICKERS,
+    CompanyProfileBuildContext,
+    build_company_research_profile,
+    normalize_research_ticker,
 )
 from Stock.company_profiles import build_multistage_assumptions_from_profile
-from Stock.hyperscaler_research import (
-    build_meta_research_profile,
-    build_microsoft_research_profile,
-)
-from Stock.nvda_research import build_nvda_research_profile
+from Stock.multistage_integration import run_real_company_multistage_dcf
 from Stock.stock_valuation_mvp import (
     build_company_fundamentals,
     build_multistage_assumptions_from_ui,
     load_company_snapshot,
     multistage_initial_defaults,
 )
-from Stock.multistage_integration import run_real_company_multistage_dcf
-from Stock.unified_company_research import (
-    build_amd_research_profile,
-    build_apple_research_profile,
-    build_broadcom_research_profile,
-    build_micron_research_profile,
-)
-
-
-PRODUCTION_TICKERS = (
-    "NVDA", "GOOGL", "META", "MSFT", "AMZN", "MU", "AAPL", "AVGO", "AMD",
-)
-
-
-def _builder(ticker: str):
-    return {
-        "NVDA": build_nvda_research_profile,
-        "GOOGL": build_alphabet_research_profile,
-        "META": build_meta_research_profile,
-        "MSFT": build_microsoft_research_profile,
-        "AMZN": build_amazon_research_profile,
-        "MU": build_micron_research_profile,
-        "AAPL": build_apple_research_profile,
-        "AVGO": build_broadcom_research_profile,
-        "AMD": build_amd_research_profile,
-    }[ticker]
 
 
 def validate_ticker(ticker: str) -> dict:
-    normalized = "GOOGL" if ticker.strip().upper() == "GOOG" else ticker.strip().upper()
-    if normalized not in PRODUCTION_TICKERS:
-        raise ValueError(f"unsupported_profile:{normalized}")
+    normalized = normalize_research_ticker(ticker)
     snapshot = load_company_snapshot(normalized)
     history = build_company_fundamentals(snapshot)
     current = build_multistage_assumptions_from_ui(
         multistage_initial_defaults(normalized, history)
     )
     base_run = run_real_company_multistage_dcf(snapshot, history, current)
-    research = _builder(normalized)(
-        current,
-        history,
-        retrieved_at=date.today().isoformat(),
+    research = build_company_research_profile(
+        normalized,
+        CompanyProfileBuildContext(
+            current_assumptions=current,
+            history=history,
+            retrieved_at=date.today().isoformat(),
+        ),
     )
     profile = research.lookup.profile
     translation = build_multistage_assumptions_from_profile(profile)
@@ -106,7 +79,7 @@ def main() -> None:
     selection.add_argument("--ticker")
     selection.add_argument("--all", action="store_true")
     args = parser.parse_args()
-    tickers = PRODUCTION_TICKERS if args.all else (args.ticker,)
+    tickers = PRODUCTION_RESEARCH_TICKERS if args.all else (args.ticker,)
     results = []
     for ticker in tickers:
         try:

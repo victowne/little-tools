@@ -28,6 +28,11 @@ from Stock.company_profiles import (
     TerminalResearchFramework,
     WACCResearchFramework,
 )
+from Stock.company_research_types import (
+    ConfidenceAssessment,
+    ResearchRange,
+    RevenueEvidenceRow,
+)
 from Stock.forecast_anchors import RevenueForecastAnchors
 from Stock.fundamentals import (
     GROSS_MARGIN,
@@ -57,29 +62,6 @@ ALPHABET_2025_Q4_CALL_URL = (
 
 
 @dataclass(frozen=True)
-class ResearchRange:
-    assumption_id: str
-    low: float
-    central: float
-    high: float
-    rationale: str
-    evidence_references: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class RevenueEvidenceRow:
-    label: str
-    period: str | None
-    revenue: float | None
-    growth: float | None
-    source: str
-    source_date: str | None
-    retrieved_at: str | None
-    analyst_count: int | None = None
-    notes: str = ""
-
-
-@dataclass(frozen=True)
 class SegmentEvidenceRow:
     segment: str
     period: str
@@ -89,13 +71,6 @@ class SegmentEvidenceRow:
     operating_margin: float | None
     source: str
     notes: str = ""
-
-
-@dataclass(frozen=True)
-class ConfidenceAssessment:
-    category: str
-    confidence: str
-    rationale: str
 
 
 @dataclass(frozen=True)

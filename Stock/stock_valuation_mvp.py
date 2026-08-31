@@ -17,11 +17,7 @@ from curl_cffi.requests.exceptions import RequestException as CurlRequestExcepti
 from plotly.subplots import make_subplots
 from yfinance.exceptions import YFException
 
-from Stock.alphabet_research import build_alphabet_research_profile
-from Stock.amazon_research import (
-    build_amazon_research_profile,
-    run_amazon_candidate_preview,
-)
+from Stock.amazon_research import run_amazon_candidate_preview
 from Stock.assumption_diagnostics import build_assumption_diagnostics
 from Stock.beta_audit import (
     BetaRobustnessAudit,
@@ -44,6 +40,11 @@ from Stock.company_profile_application import (
     create_reviewed_profile_application,
 )
 from Stock.company_profile_one_click import build_one_click_review_apply
+from Stock.company_profile_registry import (
+    CompanyProfileBuildContext,
+    build_company_research_profile,
+    get_company_research_registration,
+)
 from Stock.company_profile_review import (
     CompanyProfileReviewState,
     candidate_assumption_signature,
@@ -80,15 +81,10 @@ from Stock.fundamentals import (
     build_period_fundamentals,
     build_validated_ttm,
 )
-from Stock.hyperscaler_research import (
-    build_meta_research_profile,
-    build_microsoft_research_profile,
-)
 from Stock.multistage_integration import (
     MultiStageDCFRunResult,
     run_real_company_multistage_dcf,
 )
-from Stock.nvda_research import build_nvda_research_profile
 from Stock.reverse_dcf import (
     GROWTH_UPLIFT,
     MATURE_MARGIN,
@@ -99,12 +95,6 @@ from Stock.reverse_dcf import (
     ReverseResearchRange,
     research_ranges_from_profile,
     run_reverse_dcf,
-)
-from Stock.unified_company_research import (
-    build_amd_research_profile,
-    build_apple_research_profile,
-    build_broadcom_research_profile,
-    build_micron_research_profile,
 )
 from Stock.valuation import MultiStageDCFAssumptions
 from Stock.valuation_scenarios import (
@@ -3893,16 +3883,18 @@ def render_multistage_dcf_panel(
 
     applied_profile = st.session_state.get(base_profile_application_key(ticker))
 
-    nvda_research = None
-    alphabet_research = None
-    hyperscaler_research = None
-    amazon_research = None
-    unified_research = None
+    normalized_ticker = ticker.strip().upper()
+    research_details = None
     candidate_run = None
-    if ticker.strip().upper() == "NVDA":
+    registration = get_company_research_registration(normalized_ticker)
+    if registration is not None:
         beta_audit = None
         bottom_up = None
-        if wacc_audit is not None and wacc_audit.available:
+        if (
+            normalized_ticker in {"NVDA", "GOOG", "GOOGL"}
+            and wacc_audit is not None
+            and wacc_audit.available
+        ):
             try:
                 beta_audit = load_beta_robustness_audit(
                     ticker,
@@ -3919,114 +3911,44 @@ def render_multistage_dcf_panel(
                 # evidence; missing diagnostics stay explicitly absent.
                 beta_audit = None
                 bottom_up = None
-        nvda_research = build_nvda_research_profile(
-            assumptions,
-            history,
+        build_context = CompanyProfileBuildContext(
+            current_assumptions=assumptions,
+            history=history,
             revenue_anchors=revenue_anchors,
             wacc_audit=wacc_audit,
             beta_audit=beta_audit,
             bottom_up_beta=bottom_up,
             retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
         )
-        profile_lookup = nvda_research.lookup
-        translation = build_multistage_assumptions_from_profile(profile_lookup.profile)
-        if translation.available and translation.assumptions is not None:
-            candidate_run = run_real_company_multistage_dcf(
-                snapshot, history, translation.assumptions
-            )
-    elif ticker.strip().upper() in {"GOOG", "GOOGL"}:
-        beta_audit = None
-        bottom_up = None
-        if wacc_audit is not None and wacc_audit.available:
+        if normalized_ticker == "AMZN":
             try:
-                beta_audit = load_beta_robustness_audit(
-                    ticker,
-                    wacc_audit.risk_free_rate,
-                    wacc_audit.equity_risk_premium,
-                    wacc_audit.after_tax_cost_of_debt,
-                    wacc_audit.equity_weight,
-                    wacc_audit.debt_weight,
-                    assumptions.wacc,
+                research_details = build_company_research_profile(
+                    normalized_ticker, build_context
                 )
-                bottom_up = load_bottom_up_beta_audit(ticker)
-            except EXPECTED_DATA_EXCEPTIONS:
-                beta_audit = None
-                bottom_up = None
-        alphabet_research = build_alphabet_research_profile(
-            assumptions,
-            history,
-            revenue_anchors=revenue_anchors,
-            wacc_audit=wacc_audit,
-            beta_audit=beta_audit,
-            bottom_up_beta=bottom_up,
-            retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
-        )
-        profile_lookup = alphabet_research.lookup
-        translation = build_multistage_assumptions_from_profile(profile_lookup.profile)
-        if translation.available and translation.assumptions is not None:
-            candidate_run = run_real_company_multistage_dcf(
-                snapshot, history, translation.assumptions
-            )
-    elif ticker.strip().upper() in {"MSFT", "META"}:
-        builder = (
-            build_microsoft_research_profile
-            if ticker.strip().upper() == "MSFT"
-            else build_meta_research_profile
-        )
-        hyperscaler_research = builder(
-            assumptions,
-            history,
-            revenue_anchors=revenue_anchors,
-            wacc_audit=wacc_audit,
-            retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
-        )
-        profile_lookup = hyperscaler_research.lookup
-        translation = build_multistage_assumptions_from_profile(profile_lookup.profile)
-        if translation.available and translation.assumptions is not None:
-            candidate_run = run_real_company_multistage_dcf(
-                snapshot, history, translation.assumptions
-            )
-    elif ticker.strip().upper() == "AMZN":
-        try:
-            amazon_research = build_amazon_research_profile(
-                assumptions,
-                history,
-                wacc_audit=wacc_audit,
-                retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
-            )
-            profile_lookup = amazon_research.lookup
-            if profile_lookup.profile is not None:
-                amazon_preview = run_amazon_candidate_preview(
-                    run.inputs, profile_lookup.profile
+            except (TypeError, ValueError) as exc:
+                profile_lookup = CompanyProfileLookupResult(
+                    None, False, f"amazon_candidate_unavailable:{exc}"
                 )
-                amazon_research = replace(
-                    amazon_research, candidate_preview=amazon_preview
+        else:
+            research_details = build_company_research_profile(
+                normalized_ticker, build_context
+            )
+
+        if research_details is not None:
+            profile_lookup = research_details.lookup
+            profile_candidate = profile_lookup.profile
+            if profile_candidate is not None:
+                translation = build_multistage_assumptions_from_profile(
+                    profile_candidate
                 )
-                candidate_run = amazon_preview
-        except (TypeError, ValueError) as exc:
-            profile_lookup = CompanyProfileLookupResult(
-                None, False, f"amazon_candidate_unavailable:{exc}"
-            )
-    elif ticker.strip().upper() in {"MU", "AAPL", "AVGO", "AMD"}:
-        builder = {
-            "MU": build_micron_research_profile,
-            "AAPL": build_apple_research_profile,
-            "AVGO": build_broadcom_research_profile,
-            "AMD": build_amd_research_profile,
-        }[ticker.strip().upper()]
-        unified_research = builder(
-            assumptions,
-            history,
-            revenue_anchors=revenue_anchors,
-            wacc_audit=wacc_audit,
-            retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
-        )
-        profile_lookup = unified_research.lookup
-        translation = build_multistage_assumptions_from_profile(profile_lookup.profile)
-        if translation.available and translation.assumptions is not None:
-            candidate_run = run_real_company_multistage_dcf(
-                snapshot, history, translation.assumptions
-            )
+                if translation.available and translation.assumptions is not None:
+                    candidate_run = (
+                        run_amazon_candidate_preview(run.inputs, profile_candidate)
+                        if normalized_ticker == "AMZN"
+                        else run_real_company_multistage_dcf(
+                            snapshot, history, translation.assumptions
+                        )
+                    )
     else:
         profile_lookup = build_provisional_company_profile(
             ticker,
@@ -4036,13 +3958,6 @@ def render_multistage_dcf_panel(
             wacc_audit=wacc_audit,
         )
     profile = profile_lookup.profile if profile_lookup is not None else None
-    research_details = (
-        nvda_research
-        or alphabet_research
-        or hyperscaler_research
-        or amazon_research
-        or unified_research
-    )
     if isinstance(applied_profile, ReviewedProfileApplication):
         if assumptions_match(assumptions, applied_profile.assumptions):
             research_base_run = run

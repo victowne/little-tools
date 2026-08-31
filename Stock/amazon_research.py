@@ -10,7 +10,12 @@ import math
 
 import pandas as pd
 
-from Stock.alphabet_research import ResearchRange, RevenueEvidenceRow, _annual_items, _latest_annual, _ttm
+from Stock.alphabet_research import _annual_items, _latest_annual, _ttm
+from Stock.company_research_types import (
+    ConfidenceAssessment,
+    ResearchRange,
+    RevenueEvidenceRow,
+)
 from Stock.company_profiles import (
     BusinessContext,
     CapitalEfficiencyResearchFramework,
@@ -25,7 +30,6 @@ from Stock.company_profiles import (
     build_multistage_assumptions_from_profile,
 )
 from Stock.fundamentals import GROSS_MARGIN, OPERATING_MARGIN, REVENUE, REVENUE_GROWTH, ROIC, FundamentalHistory
-from Stock.hyperscaler_research import ConfidenceAssessment
 from Stock.multistage_integration import MultiStageDCFRunResult, RealCompanyDCFInputs, run_multistage_dcf
 from Stock.valuation import MultiStageDCFAssumptions
 from Stock.wacc_audit import WACCAuditResult
