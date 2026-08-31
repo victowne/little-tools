@@ -1,24 +1,68 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import warnings
+import logging
 import re
+import warnings
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
+from html import escape
 from io import StringIO
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 import requests
+import streamlit as st
+import yfinance as yf
+from curl_cffi.requests.exceptions import RequestException as CurlRequestException
+from plotly.subplots import make_subplots
+from yfinance.exceptions import YFException
 
-# yfinance stores cookies, time-zone metadata, and ISIN lookups in SQLite.
-# Its OS-level default cache can be read-only in sandboxed/local app sessions,
-# so keep the cache in this repository's ignored, writable cache directory.
-YFINANCE_CACHE_DIR = Path(__file__).resolve().parents[1] / ".yfinance-cache"
-yf.set_tz_cache_location(str(YFINANCE_CACHE_DIR))
-
+from Stock.alphabet_research import build_alphabet_research_profile
+from Stock.amazon_research import (
+    build_amazon_research_profile,
+    run_amazon_candidate_preview,
+)
+from Stock.assumption_diagnostics import build_assumption_diagnostics
+from Stock.beta_audit import (
+    BetaRobustnessAudit,
+    BetaWACCContext,
+    build_beta_robustness_audit,
+    calculate_beta_estimate,
+    resample_adjusted_prices,
+)
+from Stock.bottom_up_beta import (
+    BottomUpBetaResult,
+    IndustryBetaReference,
+    PeerBetaInput,
+    build_bottom_up_beta_result,
+    peer_group_for_target,
+)
+from Stock.company_profile_application import (
+    ReviewedProfileApplication,
+    assumptions_match,
+    build_profile_apply_plan,
+    create_reviewed_profile_application,
+)
+from Stock.company_profile_one_click import build_one_click_review_apply
+from Stock.company_profile_review import (
+    CompanyProfileReviewState,
+    candidate_assumption_signature,
+    initialize_profile_review,
+    reconcile_review_state,
+)
+from Stock.company_profiles import (
+    CompanyProfileLookupResult,
+    ResearchEvidenceItem,
+    build_multistage_assumptions_from_profile,
+    build_provisional_company_profile,
+)
+from Stock.forecast_anchors import (
+    align_dcf_and_consensus_period,
+    build_dcf_revenue_forecast_periods,
+    compare_aligned_forward_estimate,
+    load_revenue_forecast_anchors,
+    revenue_anchors_to_forward_estimate_set,
+)
 from Stock.fundamentals import (
     FCF,
     FCF_MARGIN,
@@ -36,23 +80,15 @@ from Stock.fundamentals import (
     build_period_fundamentals,
     build_validated_ttm,
 )
-from Stock.assumption_diagnostics import build_assumption_diagnostics
-from Stock.forecast_anchors import (
-    align_dcf_and_consensus_period,
-    build_dcf_revenue_forecast_periods,
-    compare_aligned_forward_estimate,
-    load_revenue_forecast_anchors,
-    revenue_anchors_to_forward_estimate_set,
+from Stock.hyperscaler_research import (
+    build_meta_research_profile,
+    build_microsoft_research_profile,
 )
 from Stock.multistage_integration import (
     MultiStageDCFRunResult,
     run_real_company_multistage_dcf,
 )
-from Stock.valuation import MultiStageDCFAssumptions
-from Stock.valuation_sensitivity import (
-    WACCTerminalGrowthSensitivity,
-    build_wacc_terminal_growth_sensitivity,
-)
+from Stock.nvda_research import build_nvda_research_profile
 from Stock.reverse_dcf import (
     GROWTH_UPLIFT,
     MATURE_MARGIN,
@@ -64,76 +100,62 @@ from Stock.reverse_dcf import (
     research_ranges_from_profile,
     run_reverse_dcf,
 )
-from Stock.valuation_scenarios import (
-    MultiScenarioDCFResult,
-    ScenarioRunResult,
-    create_scenario_from_base,
-    run_multi_scenario_dcf,
-)
-from Stock.wacc_audit import (
-    WACCAuditResult,
-    build_wacc_audit_result,
-    issuer_normalization_metadata,
-)
-from Stock.beta_audit import (
-    BetaRobustnessAudit,
-    BetaWACCContext,
-    build_beta_robustness_audit,
-    calculate_beta_estimate,
-    resample_adjusted_prices,
-)
-from Stock.bottom_up_beta import (
-    BottomUpBetaResult,
-    IndustryBetaReference,
-    PeerBetaInput,
-    build_bottom_up_beta_result,
-    peer_group_for_target,
-)
-from Stock.valuation_support import (
-    FOREIGN_LISTING_NORMALIZATION_UNSUPPORTED,
-)
-from Stock.company_profiles import (
-    CompanyProfileLookupResult,
-    ResearchEvidenceItem,
-    build_multistage_assumptions_from_profile,
-    build_provisional_company_profile,
-)
-from Stock.nvda_research import build_nvda_research_profile
-from Stock.alphabet_research import build_alphabet_research_profile
-from Stock.hyperscaler_research import (
-    build_meta_research_profile,
-    build_microsoft_research_profile,
-)
-from Stock.amazon_research import (
-    build_amazon_research_profile,
-    run_amazon_candidate_preview,
-)
 from Stock.unified_company_research import (
     build_amd_research_profile,
     build_apple_research_profile,
     build_broadcom_research_profile,
     build_micron_research_profile,
 )
-from Stock.company_profile_review import (
-    CompanyProfileReviewState,
-    candidate_assumption_signature,
-    initialize_profile_review,
-    reconcile_review_state,
+from Stock.valuation import MultiStageDCFAssumptions
+from Stock.valuation_scenarios import (
+    MultiScenarioDCFResult,
+    ScenarioRunResult,
+    create_scenario_from_base,
+    run_multi_scenario_dcf,
 )
-from Stock.company_profile_application import (
-    ReviewedProfileApplication,
-    assumptions_match,
-    build_profile_apply_plan,
-    create_reviewed_profile_application,
+from Stock.valuation_sensitivity import (
+    WACCTerminalGrowthSensitivity,
+    build_wacc_terminal_growth_sensitivity,
 )
-from Stock.company_profile_one_click import build_one_click_review_apply
+from Stock.valuation_support import (
+    FOREIGN_LISTING_NORMALIZATION_UNSUPPORTED,
+)
+from Stock.wacc_audit import (
+    WACCAuditResult,
+    build_wacc_audit_result,
+    issuer_normalization_metadata,
+)
+
+# yfinance stores cookies, time-zone metadata, and ISIN lookups in SQLite.
+# Its OS-level default cache can be read-only in sandboxed/local app sessions,
+# so keep the cache in this repository's ignored, writable cache directory.
+YFINANCE_CACHE_DIR = Path(__file__).resolve().parents[1] / ".yfinance-cache"
+yf.set_tz_cache_location(str(YFINANCE_CACHE_DIR))
+
+LOGGER = logging.getLogger(__name__)
+EXPECTED_DATA_EXCEPTIONS = (
+    ArithmeticError,
+    AttributeError,
+    CurlRequestException,
+    IndexError,
+    KeyError,
+    OSError,
+    TypeError,
+    ValueError,
+    YFException,
+    pd.errors.ParserError,
+    re.error,
+    requests.RequestException,
+)
 
 warnings.filterwarnings("ignore")
+
 
 # ================= 1. 数据获取层 =================
 @dataclass(frozen=True)
 class CompanySnapshot:
     """一次页面运行所需的公司原始数据快照；金额保留报表原始币种。"""
+
     ticker: str
     price: float | None
     market_cap: float | None
@@ -168,6 +190,7 @@ class CompanySnapshot:
 @dataclass(frozen=True)
 class FinancialFieldMatch:
     """Explain which Yahoo row, if any, resolved a financial concept."""
+
     concept: str
     row: pd.Series | None
     row_name: str | None
@@ -277,7 +300,9 @@ def resolve_financial_field(
     """
     concept_name = concept if isinstance(concept, str) else "explicit_candidates"
     if statement is None or statement.empty:
-        return FinancialFieldMatch(str(concept_name), None, None, None, "empty_statement")
+        return FinancialFieldMatch(
+            str(concept_name), None, None, None, "empty_statement"
+        )
 
     if isinstance(concept, str):
         specification = FINANCIAL_FIELD_ALIASES.get(concept)
@@ -294,11 +319,15 @@ def resolve_financial_field(
 
     normalized_rows: dict[str, list] = {}
     for label in statement.index:
-        normalized_rows.setdefault(_normalize_financial_field(label), []).append(label)
+        normalized_rows.setdefault(_normalize_financial_field(str(label)), []).append(
+            label
+        )
 
     for tier, approved_names in ((1, (canonical,)), (2, tuple(aliases))):
         for approved_name in approved_names:
-            matches = normalized_rows.get(_normalize_financial_field(approved_name), [])
+            matches = normalized_rows.get(
+                _normalize_financial_field(str(approved_name)), []
+            )
             if len(matches) > 1:
                 return FinancialFieldMatch(
                     str(concept_name), None, None, None, "ambiguous_normalized_match"
@@ -317,14 +346,14 @@ def resolve_financial_field(
     return FinancialFieldMatch(str(concept_name), None, None, None, "not_found")
 
 
-def _find_statement_row(statement: pd.DataFrame,
-                        concept: str | tuple[str, ...]):
+def _find_statement_row(statement: pd.DataFrame, concept: str | tuple[str, ...]):
     """Compatibility wrapper returning only the conservatively resolved row."""
     return resolve_financial_field(statement, concept).row
 
 
-def _statement_series(statement: pd.DataFrame,
-                      concept: str | tuple[str, ...]) -> pd.Series:
+def _statement_series(
+    statement: pd.DataFrame, concept: str | tuple[str, ...]
+) -> pd.Series:
     """读取财务报表科目并按日期升序返回数值序列。"""
     if statement is None or statement.empty:
         return pd.Series(dtype=float)
@@ -334,8 +363,7 @@ def _statement_series(statement: pd.DataFrame,
     return pd.to_numeric(row, errors="coerce").dropna().sort_index()
 
 
-def _reported_statement_series(statement: pd.DataFrame,
-                               concept: str) -> pd.Series:
+def _reported_statement_series(statement: pd.DataFrame, concept: str) -> pd.Series:
     """Return the resolved reported row while preserving period-level NaN."""
     if statement is None or statement.empty:
         return pd.Series(dtype=float)
@@ -352,12 +380,8 @@ def _reported_statement_series(statement: pd.DataFrame,
             "order": np.arange(len(row)),
         }
     ).dropna(subset=["date"])
-    frame = frame.sort_values(["date", "order"]).drop_duplicates(
-        "date", keep="last"
-    )
-    return pd.Series(
-        frame["value"].to_numpy(), index=pd.DatetimeIndex(frame["date"])
-    )
+    frame = frame.sort_values(["date", "order"]).drop_duplicates("date", keep="last")
+    return pd.Series(frame["value"].to_numpy(), index=pd.DatetimeIndex(frame["date"]))
 
 
 def _optional_float(value) -> float | None:
@@ -369,8 +393,9 @@ def _optional_float(value) -> float | None:
         return None
 
 
-def _latest_statement_optional(statement: pd.DataFrame,
-                               concept: str | tuple[str, ...]) -> float | None:
+def _latest_statement_optional(
+    statement: pd.DataFrame, concept: str | tuple[str, ...]
+) -> float | None:
     """读取最近一期报表数值；字段缺失时返回 None 而不是零。"""
     if statement is None or statement.empty:
         return None
@@ -388,11 +413,13 @@ def _latest_statement_optional(statement: pd.DataFrame,
     return _optional_float(latest)
 
 
-def _derive_net_debt(reported_net_debt: float | None,
-                     statement_debt: float | None,
-                     statement_cash: float | None,
-                     info_debt: float | None,
-                     info_cash: float | None) -> float | None:
+def _derive_net_debt(
+    reported_net_debt: float | None,
+    statement_debt: float | None,
+    statement_cash: float | None,
+    info_debt: float | None,
+    info_cash: float | None,
+) -> float | None:
     """Preserve reported zero and derive net debt only from a complete pair."""
     if reported_net_debt is not None:
         return reported_net_debt
@@ -423,18 +450,18 @@ def load_company_snapshot(ticker: str) -> CompanySnapshot:
 
     try:
         fast_info = ticker_obj.fast_info
-    except Exception:
+    except EXPECTED_DATA_EXCEPTIONS:
         fast_info = {}
     try:
         info = ticker_obj.info or {}
-    except Exception:
+    except EXPECTED_DATA_EXCEPTIONS:
         info = {}
 
     def statement(method_name: str, frequency: str) -> pd.DataFrame:
         try:
             value = getattr(ticker_obj, method_name)(freq=frequency)
             return value if value is not None else pd.DataFrame()
-        except Exception:
+        except EXPECTED_DATA_EXCEPTIONS:
             return pd.DataFrame()
 
     annual_income = statement("get_income_stmt", "yearly")
@@ -448,7 +475,7 @@ def load_company_snapshot(ticker: str) -> CompanySnapshot:
         if revenue_estimates is None:
             revenue_estimates = pd.DataFrame()
         revenue_estimates_as_of = pd.Timestamp.now(tz="UTC")
-    except Exception:
+    except EXPECTED_DATA_EXCEPTIONS:
         revenue_estimates = pd.DataFrame()
         revenue_estimates_as_of = None
 
@@ -463,7 +490,7 @@ def load_company_snapshot(ticker: str) -> CompanySnapshot:
         try:
             closes = ticker_obj.history(period="5d")["Close"].dropna()
             price = float(closes.iloc[-1]) if not closes.empty else None
-        except Exception:
+        except EXPECTED_DATA_EXCEPTIONS:
             price = None
 
     market_cap = _optional_float(info.get("marketCap"))
@@ -477,9 +504,7 @@ def load_company_snapshot(ticker: str) -> CompanySnapshot:
     if shares is None:
         shares = fast_info_shares
     if shares is None:
-        shares = _latest_statement_optional(
-            annual_balance, "shares_outstanding"
-        )
+        shares = _latest_statement_optional(annual_balance, "shares_outstanding")
     if shares is None and market_cap is not None and price is not None and price > 0:
         shares = market_cap / price
     if market_cap is None and price is not None and shares is not None:
@@ -502,9 +527,7 @@ def load_company_snapshot(ticker: str) -> CompanySnapshot:
         total_debt_source = None
         total_debt_period = None
 
-    statement_cash = _latest_statement_optional(
-        annual_balance, "cash"
-    )
+    statement_cash = _latest_statement_optional(annual_balance, "cash")
     info_cash = _optional_float(info.get("totalCash"))
     cash = statement_cash if statement_cash is not None else info_cash
 
@@ -559,24 +582,26 @@ def load_company_snapshot(ticker: str) -> CompanySnapshot:
         total_debt_period=total_debt_period,
         financial_currency=(
             str(info.get("financialCurrency")).strip().upper()
-            if info.get("financialCurrency") else None
+            if info.get("financialCurrency")
+            else None
         ),
         price_currency=(
             str(info.get("currency") or fast_info.get("currency")).strip().upper()
-            if (info.get("currency") or fast_info.get("currency")) else None
+            if (info.get("currency") or fast_info.get("currency"))
+            else None
         ),
     )
 
 
 def build_company_fundamentals(snapshot: CompanySnapshot) -> FundamentalHistory:
     """Adapt one normalized company snapshot to the pure fundamentals engine."""
-    annual_periods = list(snapshot.annual_income.columns) + list(
-        snapshot.annual_cashflow.columns
-    ) + list(snapshot.annual_balance.columns)
+    annual_periods = (
+        list(snapshot.annual_income.columns)
+        + list(snapshot.annual_cashflow.columns)
+        + list(snapshot.annual_balance.columns)
+    )
     return build_fundamental_history(
-        annual_revenue=_reported_statement_series(
-            snapshot.annual_income, "revenue"
-        ),
+        annual_revenue=_reported_statement_series(snapshot.annual_income, "revenue"),
         annual_gross_profit=_reported_statement_series(
             snapshot.annual_income, "gross_profit"
         ),
@@ -601,9 +626,7 @@ def build_company_fundamentals(snapshot: CompanySnapshot) -> FundamentalHistory:
         annual_total_debt=_reported_statement_series(
             snapshot.annual_balance, "total_debt"
         ),
-        annual_cash=_reported_statement_series(
-            snapshot.annual_balance, "roic_cash"
-        ),
+        annual_cash=_reported_statement_series(snapshot.annual_balance, "roic_cash"),
         annual_depreciation_amortization=_reported_statement_series(
             snapshot.annual_cashflow, "depreciation_amortization"
         ),
@@ -628,9 +651,9 @@ def build_company_fundamentals(snapshot: CompanySnapshot) -> FundamentalHistory:
     )
 
 
-def _financial_trend_frame(income: pd.DataFrame,
-                           cashflow: pd.DataFrame,
-                           balance: pd.DataFrame) -> pd.DataFrame:
+def _financial_trend_frame(
+    income: pd.DataFrame, cashflow: pd.DataFrame, balance: pd.DataFrame
+) -> pd.DataFrame:
     """整理一组可直接绘图的财报指标，金额和股数统一为 billion。"""
     periods = list(income.columns if income is not None else []) + list(
         cashflow.columns if cashflow is not None else []
@@ -667,18 +690,18 @@ def _financial_trend_frame(income: pd.DataFrame,
         return pd.DataFrame()
     frames = []
     if available_amounts:
-        frames.append(
-            pd.concat(available_amounts, axis=1) / 1_000_000_000
-        )
+        frames.append(pd.concat(available_amounts, axis=1) / 1_000_000_000)
     if available_ratios:
         frames.append(pd.concat(available_ratios, axis=1))
     return pd.concat(frames, axis=1).sort_index()
 
 
-def _latest_flow_value(quarterly: pd.Series,
-                       annual: pd.Series,
-                       expected_periods=None,
-                       annual_expected_periods=None) -> tuple[float | None, str]:
+def _latest_flow_value(
+    quarterly: pd.Series,
+    annual: pd.Series,
+    expected_periods=None,
+    annual_expected_periods=None,
+) -> tuple[float | None, str]:
     """流量指标优先取最新四季 TTM，否则回退到最近财年。"""
     ttm = build_validated_ttm(quarterly, expected_periods)
     if ttm.available:
@@ -694,14 +717,20 @@ def _latest_flow_value(quarterly: pd.Series,
     return None, "无可用数据"
 
 
-def _build_health_checks(annual_income: pd.DataFrame,
-                         annual_cashflow: pd.DataFrame,
-                         annual_balance: pd.DataFrame,
-                         quarterly_income: pd.DataFrame,
-                         quarterly_cashflow: pd.DataFrame,
-                         quarterly_balance: pd.DataFrame) -> list[dict]:
+def _build_health_checks(
+    annual_income: pd.DataFrame,
+    annual_cashflow: pd.DataFrame,
+    annual_balance: pd.DataFrame,
+    quarterly_income: pd.DataFrame,
+    quarterly_cashflow: pd.DataFrame,
+    quarterly_balance: pd.DataFrame,
+) -> list[dict]:
     """基于最新资产负债表和 TTM/年度流量数据生成基础运营检查。"""
-    balance = quarterly_balance if quarterly_balance is not None and not quarterly_balance.empty else annual_balance
+    balance = (
+        quarterly_balance
+        if quarterly_balance is not None and not quarterly_balance.empty
+        else annual_balance
+    )
     balance_basis = "无可用数据"
     if balance is not None and not balance.empty:
         balance_dates = pd.to_datetime(balance.columns, errors="coerce").dropna()
@@ -709,17 +738,12 @@ def _build_health_checks(annual_income: pd.DataFrame,
             balance_basis = f"截至 {max(balance_dates).date()}"
 
     assets = _latest_statement_optional(balance, "total_assets")
-    liabilities = _latest_statement_optional(
-        balance, "total_liabilities"
-    )
+    liabilities = _latest_statement_optional(balance, "total_liabilities")
     asset_status = (
-        assets > liabilities
-        if assets is not None and liabilities is not None else None
+        assets > liabilities if assets is not None and liabilities is not None else None
     )
 
-    long_term_debt = _latest_statement_optional(
-        balance, "long_term_debt"
-    )
+    long_term_debt = _latest_statement_optional(balance, "long_term_debt")
     annual_net_income = _statement_series(annual_income, "net_income")
     quarterly_net_income = _statement_series(quarterly_income, "net_income")
     net_income, income_basis = _latest_flow_value(
@@ -736,7 +760,8 @@ def _build_health_checks(annual_income: pd.DataFrame,
     debt_status = (
         debt_ratio < 4
         if debt_ratio is not None
-        else False if long_term_debt is not None and net_income is not None
+        else False
+        if long_term_debt is not None and net_income is not None
         else None
     )
 
@@ -751,45 +776,58 @@ def _build_health_checks(annual_income: pd.DataFrame,
     operating_cf, cash_basis = flow_pair("operating_cash_flow")
     investing_cf, _ = flow_pair("investing_cash_flow")
     financing_cf, _ = flow_pair("financing_cash_flow")
-    cash_available = all(value is not None for value in (operating_cf, investing_cf, financing_cf))
-    cash_status = (
-        operating_cf > abs(investing_cf) and operating_cf > abs(financing_cf)
-        if cash_available else None
-    )
-
     billion = 1_000_000_000
+    if long_term_debt is not None and net_income is not None and debt_ratio is not None:
+        debt_detail = (
+            f"Long-term debt {long_term_debt / billion:.2f}B · "
+            f"Net income {net_income / billion:.2f}B · Ratio {debt_ratio:.2f}x"
+        )
+    elif long_term_debt is None or net_income is None:
+        debt_detail = "长期债务或净利润数据缺失"
+    else:
+        debt_detail = "净利润为负或为零，无法形成有效覆盖"
+
+    if (
+        operating_cf is not None
+        and investing_cf is not None
+        and financing_cf is not None
+    ):
+        cash_status = operating_cf > abs(investing_cf) and operating_cf > abs(
+            financing_cf
+        )
+        cash_detail = (
+            f"OCF {operating_cf / billion:.2f}B · "
+            f"ICF {investing_cf / billion:.2f}B · "
+            f"Financing CF {financing_cf / billion:.2f}B"
+        )
+    else:
+        cash_status = None
+        cash_detail = "Operating, investing or financing cash flow is unavailable"
+
     return [
         {
-            "title": "资产覆盖负债",
+            "title": "Asset Coverage",
             "rule": "Total Assets > Total Liabilities",
             "status": asset_status,
             "detail": (
-                f"资产 {assets / billion:.2f}B · 负债 {liabilities / billion:.2f}B"
-                if assets is not None and liabilities is not None else "资产或负债数据缺失"
+                f"Assets {assets / billion:.2f}B · Liabilities {liabilities / billion:.2f}B"
+                if assets is not None and liabilities is not None
+                else "Assets or liabilities are unavailable"
             ),
             "basis": balance_basis,
         },
         {
-            "title": "长期债务负担",
+            "title": "Long-Term Debt Burden",
             "rule": "Long-term Debt / Net Income < 4",
             "status": debt_status,
-            "detail": (
-                f"长期债务 {long_term_debt / billion:.2f}B · 净利润 {net_income / billion:.2f}B · 比率 {debt_ratio:.2f}x"
-                if debt_ratio is not None else
-                "长期债务或净利润数据缺失"
-                if long_term_debt is None or net_income is None else
-                "净利润为负或为零，无法形成有效覆盖"
-            ),
-            "basis": f"债务{balance_basis} · 净利润{income_basis}",
+            "detail": debt_detail,
+            "basis": f"Debt {balance_basis} · Net income {income_basis}",
         },
         {
-            "title": "经营现金流覆盖",
-            "rule": "OCF > |Investing CF| 且 OCF > |Financing CF|",
+            "title": "Operating Cash Flow Coverage",
+            "rule": "OCF > |Investing CF| and OCF > |Financing CF|",
             "status": cash_status,
-            "detail": (
-                f"OCF {operating_cf / billion:.2f}B · ICF {investing_cf / billion:.2f}B · Financing CF {financing_cf / billion:.2f}B"
-                if cash_available else "经营、投资或融资现金流数据缺失"
-            ),
+            "detail": cash_detail,
             "basis": cash_basis,
         },
     ]
@@ -811,9 +849,7 @@ def fetch_financial_overview(
         quarterly_income = snapshot.quarterly_income
         quarterly_cashflow = snapshot.quarterly_cashflow
         quarterly_balance = snapshot.quarterly_balance
-        annual = _financial_trend_frame(
-            annual_income, annual_cashflow, annual_balance
-        )
+        annual = _financial_trend_frame(annual_income, annual_cashflow, annual_balance)
         quarterly = _financial_trend_frame(
             quarterly_income, quarterly_cashflow, quarterly_balance
         )
@@ -826,13 +862,13 @@ def fetch_financial_overview(
             quarterly_balance,
         )
         return annual, quarterly, checks
-    except Exception:
+    except EXPECTED_DATA_EXCEPTIONS:
         return pd.DataFrame(), pd.DataFrame(), []
 
 
-def fetch_market_data(ticker: str,
-                      snapshot: CompanySnapshot | None = None
-                      ) -> tuple[float | None, float | None, float | None]:
+def fetch_market_data(
+    ticker: str, snapshot: CompanySnapshot | None = None
+) -> tuple[float | None, float | None, float | None]:
     """获取股价、净债务（十亿美元）和总股本（十亿股）。"""
     ticker = ticker.strip().upper()
     if not ticker:
@@ -840,12 +876,12 @@ def fetch_market_data(ticker: str,
 
     snapshot = snapshot or load_company_snapshot(ticker)
     net_debt = (
-        snapshot.net_debt / 1_000_000_000
-        if snapshot.net_debt is not None else None
+        snapshot.net_debt / 1_000_000_000 if snapshot.net_debt is not None else None
     )
     shares = (
         snapshot.shares_outstanding / 1_000_000_000
-        if snapshot.shares_outstanding is not None else None
+        if snapshot.shares_outstanding is not None
+        else None
     )
     return snapshot.price, net_debt, shares
 
@@ -890,15 +926,15 @@ def fetch_macro_assumptions() -> dict:
         treasury_date = latest["Date"].strftime("%Y-%m-%d")
         risk_free_source = "US_Treasury_daily_10_year_par_yield"
         risk_free_fallback_used = False
-    except Exception:
+    except EXPECTED_DATA_EXCEPTIONS:
         try:
             treasury_yield = yf.Ticker("^TNX").history(period="5d")["Close"].dropna()
             if not treasury_yield.empty:
                 risk_free = float(treasury_yield.iloc[-1]) / 100
                 treasury_date = "^TNX 回退"
                 risk_free_source = "yfinance_^TNX_5d_close_fallback"
-        except Exception:
-            pass
+        except EXPECTED_DATA_EXCEPTIONS:
+            LOGGER.debug("Treasury fallback data was unavailable", exc_info=True)
 
     try:
         response = requests.get(
@@ -908,19 +944,20 @@ def fetch_macro_assumptions() -> dict:
         response.raise_for_status()
         tables = pd.read_html(StringIO(response.text))
         country_table = next(
-            table for table in tables
+            table
+            for table in tables
             if any(table.iloc[:, 0].astype(str).eq("United States"))
         )
-        us_row = country_table[country_table.iloc[:, 0].astype(str).eq("United States")].iloc[0]
+        us_row = country_table[
+            country_table.iloc[:, 0].astype(str).eq("United States")
+        ].iloc[0]
         # 使用美国 ERP 减美国主权违约利差，得到与完整美债利率匹配的成熟市场 ERP。
         erp = _percent_value(us_row.iloc[4]) - _percent_value(us_row.iloc[2])
         erp_date = "Damodaran 2026"
-        erp_source = (
-            "Damodaran_US_total_equity_risk_premium_minus_country_risk_premium"
-        )
+        erp_source = "Damodaran_US_total_equity_risk_premium_minus_country_risk_premium"
         erp_fallback_used = False
-    except Exception:
-        pass
+    except EXPECTED_DATA_EXCEPTIONS:
+        LOGGER.debug("Equity risk premium data was unavailable", exc_info=True)
 
     return {
         "risk_free": risk_free,
@@ -937,23 +974,37 @@ def fetch_macro_assumptions() -> dict:
 def _default_spread(coverage: float, financial: bool = False) -> tuple[float, str]:
     """按 Damodaran 2026 利息保障倍数表返回违约利差和合成评级。"""
     non_financial = [
-        (0.20, 0.1900, "D2/D"), (0.65, 0.1600, "C2/C"),
-        (0.80, 0.1261, "Ca2/CC"), (1.25, 0.0885, "Caa/CCC"),
-        (1.50, 0.0509, "B3/B-"), (1.75, 0.0321, "B2/B"),
-        (2.00, 0.0275, "B1/B+"), (2.25, 0.0184, "Ba2/BB"),
-        (2.50, 0.0138, "Ba1/BB+"), (3.00, 0.0111, "Baa2/BBB"),
-        (4.25, 0.0089, "A3/A-"), (5.50, 0.0078, "A2/A"),
-        (6.50, 0.0070, "A1/A+"), (8.50, 0.0055, "Aa2/AA"),
+        (0.20, 0.1900, "D2/D"),
+        (0.65, 0.1600, "C2/C"),
+        (0.80, 0.1261, "Ca2/CC"),
+        (1.25, 0.0885, "Caa/CCC"),
+        (1.50, 0.0509, "B3/B-"),
+        (1.75, 0.0321, "B2/B"),
+        (2.00, 0.0275, "B1/B+"),
+        (2.25, 0.0184, "Ba2/BB"),
+        (2.50, 0.0138, "Ba1/BB+"),
+        (3.00, 0.0111, "Baa2/BBB"),
+        (4.25, 0.0089, "A3/A-"),
+        (5.50, 0.0078, "A2/A"),
+        (6.50, 0.0070, "A1/A+"),
+        (8.50, 0.0055, "Aa2/AA"),
         (np.inf, 0.0040, "Aaa/AAA"),
     ]
     financial_table = [
-        (0.05, 0.1900, "D2/D"), (0.10, 0.1600, "C2/C"),
-        (0.20, 0.1261, "Ca2/CC"), (0.30, 0.0885, "Caa/CCC"),
-        (0.40, 0.0509, "B3/B-"), (0.50, 0.0321, "B2/B"),
-        (0.60, 0.0275, "B1/B+"), (0.75, 0.0184, "Ba2/BB"),
-        (0.90, 0.0138, "Ba1/BB+"), (1.20, 0.0111, "Baa2/BBB"),
-        (1.50, 0.0089, "A3/A-"), (2.00, 0.0078, "A2/A"),
-        (2.50, 0.0070, "A1/A+"), (3.00, 0.0055, "Aa2/AA"),
+        (0.05, 0.1900, "D2/D"),
+        (0.10, 0.1600, "C2/C"),
+        (0.20, 0.1261, "Ca2/CC"),
+        (0.30, 0.0885, "Caa/CCC"),
+        (0.40, 0.0509, "B3/B-"),
+        (0.50, 0.0321, "B2/B"),
+        (0.60, 0.0275, "B1/B+"),
+        (0.75, 0.0184, "Ba2/BB"),
+        (0.90, 0.0138, "Ba1/BB+"),
+        (1.20, 0.0111, "Baa2/BBB"),
+        (1.50, 0.0089, "A3/A-"),
+        (2.00, 0.0078, "A2/A"),
+        (2.50, 0.0070, "A1/A+"),
+        (3.00, 0.0055, "Aa2/AA"),
         (np.inf, 0.0040, "Aaa/AAA"),
     ]
     rating_table = financial_table if financial else non_financial
@@ -967,8 +1018,12 @@ def _default_spread(coverage: float, financial: bool = False) -> tuple[float, st
 def _regression_beta(ticker: str) -> tuple[float | None, int]:
     """用五年月度收益率相对标普500计算回归 Beta。"""
     try:
-        stock = yf.Ticker(ticker).history(period="5y", interval="1mo", auto_adjust=True)["Close"]
-        market = yf.Ticker("^GSPC").history(period="5y", interval="1mo", auto_adjust=True)["Close"]
+        stock = yf.Ticker(ticker).history(
+            period="5y", interval="1mo", auto_adjust=True
+        )["Close"]
+        market = yf.Ticker("^GSPC").history(
+            period="5y", interval="1mo", auto_adjust=True
+        )["Close"]
         returns = pd.concat(
             {"stock": stock.pct_change(), "market": market.pct_change()}, axis=1
         ).dropna()
@@ -976,7 +1031,7 @@ def _regression_beta(ticker: str) -> tuple[float | None, int]:
             return None, len(returns)
         beta = returns["stock"].cov(returns["market"]) / returns["market"].var()
         return float(beta), len(returns)
-    except Exception:
+    except EXPECTED_DATA_EXCEPTIONS:
         return None, 0
 
 
@@ -1007,19 +1062,23 @@ def fetch_industry_wacc(industry: str) -> dict:
         names = table["Industry Name"].astype(str).tolist()
         matched = max(
             names,
-            key=lambda name: SequenceMatcher(None, target.lower(), name.lower()).ratio(),
+            key=lambda name: SequenceMatcher(
+                None, target.lower(), name.lower()
+            ).ratio(),
         )
         score = SequenceMatcher(None, target.lower(), matched.lower()).ratio()
         if score < 0.35:
             return {"wacc": None, "matched_industry": None}
         row = table[table["Industry Name"].astype(str).eq(matched)].iloc[0]
-        return {"wacc": _percent_value(row["Cost  of Capital"]), "matched_industry": matched}
-    except Exception:
+        return {
+            "wacc": _percent_value(row["Cost  of Capital"]),
+            "matched_industry": matched,
+        }
+    except EXPECTED_DATA_EXCEPTIONS:
         return {"wacc": None, "matched_industry": None}
 
 
-def fetch_wacc_reference(ticker: str,
-                         snapshot: CompanySnapshot | None = None) -> dict:
+def fetch_wacc_reference(ticker: str, snapshot: CompanySnapshot | None = None) -> dict:
     """计算公司级 WACC，并返回可解释的各项输入。"""
     empty = {"wacc": None, "error": "数据不足"}
     ticker = ticker.strip().upper()
@@ -1048,8 +1107,10 @@ def fetch_wacc_reference(ticker: str,
         market_cap = snapshot.market_cap
         if (
             market_cap is None
-            and price is not None and price > 0
-            and shares_b is not None and shares_b > 0
+            and price is not None
+            and price > 0
+            and shares_b is not None
+            and shares_b > 0
         ):
             market_cap = price * shares_b * 1_000_000_000
         if market_cap is None or market_cap <= 0:
@@ -1061,17 +1122,21 @@ def fetch_wacc_reference(ticker: str,
         interest = abs(interest_reported) if interest_reported is not None else 0.0
         pretax = _latest_statement_optional(income, "pretax_income")
         tax = _latest_statement_optional(income, "tax_provision")
-        tax_inputs_reported = (
-            pretax is not None and pretax > 0 and tax is not None and tax >= 0
-        )
-        tax_assumption_used = not tax_inputs_reported
-        raw_tax_rate = tax / pretax if tax_inputs_reported else 0.21
+        if pretax is not None and pretax > 0 and tax is not None and tax >= 0:
+            raw_tax_rate = tax / pretax
+            tax_assumption_used = False
+        else:
+            raw_tax_rate = 0.21
+            tax_assumption_used = True
         tax_rate = raw_tax_rate
         tax_rate = float(np.clip(tax_rate, 0.0, 0.35))
         tax_rate_clipped = not np.isclose(tax_rate, raw_tax_rate)
-        if interest > 0 and ebit is None:
-            return {"wacc": None, "error": "缺少 EBIT，无法计算利息覆盖率"}
-        coverage = ebit / interest if interest > 0 else np.inf
+        if interest > 0:
+            if ebit is None:
+                return {"wacc": None, "error": "缺少 EBIT，无法计算利息覆盖率"}
+            coverage = ebit / interest
+        else:
+            coverage = np.inf
         financial = snapshot.sector == "Financial Services"
         spread, rating = _default_spread(coverage, financial)
 
@@ -1122,13 +1187,11 @@ def fetch_wacc_reference(ticker: str,
             "erp_date": macro["erp_date"],
             "risk_free_source": macro.get("risk_free_source", "unknown"),
             "erp_source": macro.get("erp_source", "unknown"),
-            "risk_free_fallback_used": macro.get(
-                "risk_free_fallback_used", False
-            ),
+            "risk_free_fallback_used": macro.get("risk_free_fallback_used", False),
             "erp_fallback_used": macro.get("erp_fallback_used", False),
             "error": None,
         }
-    except Exception as exc:
+    except EXPECTED_DATA_EXCEPTIONS as exc:
         return {"wacc": None, "error": str(exc)}
 
 
@@ -1151,7 +1214,7 @@ def load_beta_robustness_audit(
                 period="5y", interval=interval, auto_adjust=True
             )["Close"]
             return result.dropna()
-        except Exception:
+        except EXPECTED_DATA_EXCEPTIONS:
             return pd.Series(dtype=float)
 
     monthly_stock = history(ticker, "1mo")
@@ -1238,31 +1301,44 @@ def load_damodaran_industry_beta_references(
             response.text,
             flags=re.IGNORECASE | re.DOTALL,
         )
-        source_date = (
-            re.search(r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}", date_match.group(0), re.IGNORECASE).group(0)
-            if date_match else None
+        source_date_match = (
+            re.search(
+                r"(January|February|March|April|May|June|July|August|"
+                r"September|October|November|December)\s+\d{4}",
+                date_match.group(0),
+                re.IGNORECASE,
+            )
+            if date_match
+            else None
         )
+        source_date = source_date_match.group(0) if source_date_match else None
         references = []
         for industry, note in group.damodaran_industries:
             normalized_industry = re.sub(r"\s+", " ", industry).strip()
-            normalized_rows = table[industry_column].astype(str).map(
-                lambda value: re.sub(r"\s+", " ", value).strip()
+            normalized_rows = (
+                table[industry_column]
+                .astype(str)
+                .map(lambda value: re.sub(r"\s+", " ", value).strip())
             )
             rows = table[normalized_rows.eq(normalized_industry)]
             if rows.empty:
                 continue
             row = rows.iloc[0]
-            references.append(IndustryBetaReference(
-                industry=industry,
-                number_of_firms=int(float(row[firms_column])) if pd.notna(row[firms_column]) else None,
-                levered_beta=_optional_float(row[beta_column]),
-                unlevered_beta=_optional_float(row[unlevered_column]),
-                debt_to_equity=_percent_value(row[de_column]),
-                source_date=source_date,
-                mapping_note=note,
-            ))
+            references.append(
+                IndustryBetaReference(
+                    industry=industry,
+                    number_of_firms=int(float(row[firms_column]))
+                    if pd.notna(row[firms_column])
+                    else None,
+                    levered_beta=_optional_float(row[beta_column]),
+                    unlevered_beta=_optional_float(row[unlevered_column]),
+                    debt_to_equity=_percent_value(row[de_column]),
+                    source_date=source_date,
+                    mapping_note=note,
+                )
+            )
         return tuple(references)
-    except Exception:
+    except EXPECTED_DATA_EXCEPTIONS:
         return ()
 
 
@@ -1276,17 +1352,21 @@ def _load_bottom_up_beta_audit_for_issuer(
     if group is None:
         return None
     target = load_company_snapshot(target_ticker)
-    market_prices = yf.Ticker("^GSPC").history(
-        period="5y", interval="1mo", auto_adjust=True
-    )["Close"].dropna()
+    market_prices = (
+        yf.Ticker("^GSPC")
+        .history(period="5y", interval="1mo", auto_adjust=True)["Close"]
+        .dropna()
+    )
     peer_inputs = []
     for definition in group.peers:
         snapshot = load_company_snapshot(definition.ticker)
         try:
-            peer_prices = yf.Ticker(definition.ticker).history(
-                period="5y", interval="1mo", auto_adjust=True
-            )["Close"].dropna()
-        except Exception:
+            peer_prices = (
+                yf.Ticker(definition.ticker)
+                .history(period="5y", interval="1mo", auto_adjust=True)["Close"]
+                .dropna()
+            )
+        except EXPECTED_DATA_EXCEPTIONS:
             peer_prices = pd.Series(dtype=float)
         estimate = calculate_beta_estimate(
             definition.ticker,
@@ -1297,18 +1377,22 @@ def _load_bottom_up_beta_audit_for_issuer(
             frequency="monthly",
             minimum_observations=24,
         )
-        peer_inputs.append(PeerBetaInput(
-            ticker=definition.ticker,
-            issuer=definition.issuer,
-            inclusion_rationale=definition.inclusion_rationale,
-            levered_beta=estimate.raw_beta if estimate.available else None,
-            adjusted_beta=estimate.adjusted_beta if estimate.available else None,
-            beta_method="5y_monthly_raw_regression_vs_sp500_adjusted_prices",
-            market_cap=snapshot.market_cap,
-            gross_debt=snapshot.total_debt,
-            tax_rate=_latest_valid_effective_tax_rate(snapshot.annual_income),
-            warnings=estimate.warnings if estimate.available else (estimate.reason,),
-        ))
+        peer_inputs.append(
+            PeerBetaInput(
+                ticker=definition.ticker,
+                issuer=definition.issuer,
+                inclusion_rationale=definition.inclusion_rationale,
+                levered_beta=estimate.raw_beta if estimate.available else None,
+                adjusted_beta=estimate.adjusted_beta if estimate.available else None,
+                beta_method="5y_monthly_raw_regression_vs_sp500_adjusted_prices",
+                market_cap=snapshot.market_cap,
+                gross_debt=snapshot.total_debt,
+                tax_rate=_latest_valid_effective_tax_rate(snapshot.annual_income),
+                warnings=estimate.warnings
+                if estimate.available
+                else (estimate.reason,),
+            )
+        )
 
     canonical_beta, _ = _regression_beta(target_ticker)
     return build_bottom_up_beta_result(
@@ -1341,22 +1425,24 @@ def _render_financial_trends_content(
     statement_currency: str | None = "USD",
 ) -> None:
     """绘制已展开的年度/季度财报趋势内容。"""
-    currency = statement_currency or "报表原始币种"
+    currency = statement_currency or "statement currency"
     st.caption(
-        f"损益、现金流和留存收益均以 {currency} 十亿为单位；"
-        "Margin 使用百分比；股本为十亿股。"
+        f"Income statement, cash flow and retained earnings are shown in "
+        f"{currency} billions; margins are percentages and shares are in billions."
     )
     period = st.radio(
-        "报告周期",
-        ("季度", "年度"),
+        "Reporting period",
+        ("Quarterly", "Annual"),
         horizontal=True,
         key=f"financial_period_{ticker}",
     )
-    frame = quarterly if period == "季度" else annual
-    limit = 8 if period == "季度" else 5
+    frame = quarterly if period == "Quarterly" else annual
+    limit = 8 if period == "Quarterly" else 5
     frame = frame.tail(limit)
     if frame.empty:
-        st.warning(f"yfinance 暂无 {ticker} 的{period}财报趋势数据。")
+        st.warning(
+            f"No {period.lower()} financial trend data is available for {ticker}."
+        )
         return
 
     operating_metrics = [
@@ -1369,13 +1455,13 @@ def _render_financial_trends_content(
         "Free Cash Flow",
     ]
     metric_labels = {
-        "Revenue": "营业收入 Revenue",
-        "Gross Profit": "毛利润 Gross Profit",
-        "Gross Margin": "毛利率 Gross Margin",
-        "Operating Income": "营业利润 Operating Income",
-        "Operating Margin": "营业利润率 Operating Margin",
-        "Net Income": "净利润 Net Income",
-        "Free Cash Flow": "自由现金流 Free Cash Flow",
+        "Revenue": "Revenue",
+        "Gross Profit": "Gross Profit",
+        "Gross Margin": "Gross Margin",
+        "Operating Income": "Operating Income",
+        "Operating Margin": "Operating Margin",
+        "Net Income": "Net Income",
+        "Free Cash Flow": "Free Cash Flow",
     }
     colors = {
         "Revenue": "#4C78A8",
@@ -1425,21 +1511,22 @@ def _render_financial_trends_content(
         fig.update_layout(
             height=max(520, rows * 260),
             showlegend=False,
-            margin=dict(t=70, b=30),
+            margin={"t": 70, "b": 30},
         )
         st.plotly_chart(fig, width="stretch")
     else:
-        st.warning("收入、利润和自由现金流指标暂不可用。")
+        st.warning("Revenue, profitability and free-cash-flow trends are unavailable.")
 
     balance_metrics = [
-        metric for metric in ("Retained Earnings", "Shares Outstanding")
+        metric
+        for metric in ("Retained Earnings", "Shares Outstanding")
         if metric in frame
     ]
     if balance_metrics:
-        st.subheader("🏦 留存收益与股本变化")
+        st.subheader("Retained Earnings & Share Count")
         balance_labels = {
-            "Retained Earnings": "留存收益 Retained Earnings",
-            "Shares Outstanding": "流通股本 Shares Outstanding",
+            "Retained Earnings": "Retained Earnings",
+            "Shares Outstanding": "Shares Outstanding",
         }
         fig_balance = make_subplots(
             rows=1,
@@ -1454,7 +1541,7 @@ def _render_financial_trends_content(
                     y=values.values,
                     mode="lines+markers",
                     name=balance_labels[metric],
-                    line=dict(width=3),
+                    line={"width": 3},
                 ),
                 row=1,
                 col=index + 1,
@@ -1463,16 +1550,14 @@ def _render_financial_trends_content(
         fig_balance.update_layout(height=360, showlegend=False)
         st.plotly_chart(fig_balance, width="stretch")
 
-    with st.expander("查看财报数据表", expanded=False):
+    with st.expander("View financial data table", expanded=False):
         display = frame.copy()
         display.index = pd.to_datetime(display.index).strftime("%Y-%m-%d")
         formatters = {
             column: ("{:.1%}" if column in percentage_metrics else "{:.2f}")
             for column in display.columns
         }
-        st.dataframe(
-            display.style.format(formatters, na_rep="—"), width="stretch"
-        )
+        st.dataframe(display.style.format(formatters, na_rep="—"), width="stretch")
 
 
 def render_financial_trends(
@@ -1482,40 +1567,38 @@ def render_financial_trends(
     statement_currency: str | None = "USD",
 ) -> None:
     """以默认折叠状态展示年度/季度财报趋势面板。"""
-    with st.expander("📚 财报趋势（年度 / 季度）", expanded=False):
-        _render_financial_trends_content(
-            ticker, annual, quarterly, statement_currency
-        )
+    with st.expander("Financial Statement Trends · Annual / Quarterly", expanded=False):
+        _render_financial_trends_content(ticker, annual, quarterly, statement_currency)
 
 
-def render_fundamental_quality(ticker: str,
-                               history: FundamentalHistory | None,
-                               statement_currency: str | None = "USD") -> None:
+def render_fundamental_quality(
+    ticker: str,
+    history: FundamentalHistory | None,
+    statement_currency: str | None = "USD",
+) -> None:
     """Render existing fundamental-engine evidence without recalculation."""
     st.header("Key Fundamentals")
     if history is None or history.annual.empty:
-        st.warning(f"{ticker} 基本面质量指标数据不足。")
+        st.warning(f"Fundamental quality metrics are unavailable for {ticker}.")
         return
 
     latest_period = pd.Timestamp(history.annual.index[-1])
     latest = history.annual.iloc[-1]
     st.caption(
-        f"金额指标以 {statement_currency or '报表原始币种'} 十亿为单位；"
-        "百分比和倍数不受币种显示影响。"
+        f"Amount metrics are shown in {statement_currency or 'statement currency'} "
+        "billions; percentages and multiples are currency-independent."
     )
 
     def display_value(metric: str, kind: str) -> str:
         value = latest.get(metric, np.nan)
         if pd.isna(value):
-            return "数据不足"
+            return "N/A"
         if kind == "amount":
-            return _diagnostic_display(
-                float(value), "amount", statement_currency
-            )
+            return _diagnostic_display(float(value), "amount", statement_currency)
         return f"{float(value) * 100:.1f}%"
 
-    st.subheader("最新年度 Latest Annual")
-    st.caption(f"财年截至 {latest_period.date()}")
+    st.subheader("Latest Annual")
+    st.caption(f"Fiscal year ended {latest_period.date()}")
     annual_metrics = [
         ("Revenue", REVENUE, "amount"),
         ("Revenue Growth", REVENUE_GROWTH, "percent"),
@@ -1526,22 +1609,23 @@ def render_fundamental_quality(ticker: str,
         ("ROIC", ROIC, "percent"),
     ]
     for start in range(0, len(annual_metrics), 4):
-        batch = annual_metrics[start:start + 4]
+        batch = annual_metrics[start : start + 4]
         columns = st.columns(len(batch))
         for column, (label, metric, kind) in zip(columns, batch):
             column.metric(label, display_value(metric, kind))
 
-    st.subheader("DCF 历史锚点")
+    st.subheader("Historical DCF Anchors")
     st.caption(
-        "3Y 指标是历史会计锚点，Latest Annual Sales-to-Capital 反映最近年度的"
-        "资本效率；两者都不是增长预测或建议参数。"
+        "Three-year metrics are historical accounting anchors. Latest Annual "
+        "Sales-to-Capital reflects recent capital efficiency; neither is a "
+        "forecast or a recommended assumption."
     )
     anchors = history.dcf_anchors
     latest_sales_to_capital = anchors.annual_sales_to_capital.get(latest_period)
 
     def anchor_value(result, kind: str) -> str:
         if result is None or not result.available or result.value is None:
-            return "数据不足"
+            return "N/A"
         if kind == "percent":
             return f"{result.value * 100:.2f}%"
         return f"{result.value:.2f}x"
@@ -1563,46 +1647,48 @@ def render_fundamental_quality(ticker: str,
         ("Latest Annual", latest_sales_to_capital),
         ("3Y Normalized", anchors.normalized_sales_to_capital.get(3)),
     ]
-    with st.expander("查看 Sales-to-Capital 计算明细", expanded=False):
+    with st.expander("View Sales-to-Capital calculation details", expanded=False):
         for label, result in observable_results:
             st.markdown(f"**{label}**")
             if result is None or not result.available:
                 reason = result.reason if result is not None else "unavailable"
-                st.write(f"数据不足（{reason}）")
+                st.write(f"Unavailable ({reason})")
                 continue
             period_start = (
-                result.start_period.date()
-                if result.start_period is not None else "N/A"
+                result.start_period.date() if result.start_period is not None else "N/A"
             )
             period_end = (
-                result.end_period.date()
-                if result.end_period is not None else "N/A"
+                result.end_period.date() if result.end_period is not None else "N/A"
             )
-            st.write(f"期间：{period_start} → {period_end}")
+            st.write(f"Period: {period_start} → {period_end}")
+
             def optional_amount(value) -> str:
                 return (
                     _diagnostic_display(value, "amount", statement_currency)
-                    if value is not None else "数据不足"
+                    if value is not None
+                    else "N/A"
                 )
+
             st.write(
-                f"Revenue：{optional_amount(result.start_revenue)} → "
+                f"Revenue: {optional_amount(result.start_revenue)} → "
                 f"{optional_amount(result.end_revenue)}；"
-                f"ΔRevenue：{optional_amount(result.delta_revenue)}"
+                f"ΔRevenue: {optional_amount(result.delta_revenue)}"
             )
             st.write(
-                "Invested Capital："
+                "Invested Capital: "
                 f"{optional_amount(result.start_invested_capital)} → "
                 f"{optional_amount(result.end_invested_capital)}；"
-                "ΔInvested Capital："
+                "ΔInvested Capital: "
                 f"{optional_amount(result.delta_invested_capital)}"
             )
-            st.write(f"Sales-to-Capital：{result.value:.2f}x")
+            st.write(f"Sales-to-Capital: {result.value:.2f}x")
     st.caption(
-        "Sales-to-Capital 是历史会计资本效率锚点，不是精确因果指标；全额扣除会计现金，"
-        "且可能受未资本化研发、收购与商誉、回购及营运资本时点影响。"
+        "Sales-to-Capital is a historical accounting anchor, not a precise causal "
+        "measure. It deducts reported cash in full and may be distorted by "
+        "uncapitalized R&D, acquisitions, goodwill, buybacks and working-capital timing."
     )
 
-    st.subheader("最近十二个月 TTM")
+    st.subheader("Trailing Twelve Months")
     ttm_metrics = [
         ("Revenue", REVENUE, "amount"),
         ("Operating Margin", OPERATING_MARGIN, "percent"),
@@ -1614,11 +1700,9 @@ def render_fundamental_quality(ticker: str,
     for column, (label, metric, kind) in zip(ttm_columns, ttm_metrics):
         result = history.ttm.get(metric)
         if result is None or not result.available or result.value is None:
-            formatted = "数据不足"
+            formatted = "N/A"
         elif kind == "amount":
-            formatted = _diagnostic_display(
-                result.value, "amount", statement_currency
-            )
+            formatted = _diagnostic_display(result.value, "amount", statement_currency)
         else:
             formatted = f"{result.value * 100:.1f}%"
         column.metric(label, formatted)
@@ -1626,11 +1710,11 @@ def render_fundamental_quality(ticker: str,
             period_groups.setdefault(result.periods_used, []).append(label)
 
     if period_groups:
-        with st.expander("查看 TTM 报告期间", expanded=False):
+        with st.expander("View TTM reporting periods", expanded=False):
             for periods, labels in period_groups.items():
                 st.write(
-                    f"{', '.join(labels)}：{periods[0].date()} → "
-                    f"{periods[-1].date()}（{len(periods)} 个季度）"
+                    f"{', '.join(labels)}: {periods[0].date()} → "
+                    f"{periods[-1].date()} ({len(periods)} quarters)"
                 )
 
     chart_specs = [
@@ -1646,7 +1730,7 @@ def render_fundamental_quality(ticker: str,
             if len(values) >= 2:
                 chart_data.append((metric, label, values))
     if chart_data:
-        st.subheader("年度质量趋势 Annual Quality Trends")
+        st.subheader("Annual Quality Trends")
         rows = (len(chart_data) + 1) // 2
         figure = make_subplots(
             rows=rows,
@@ -1663,7 +1747,7 @@ def render_fundamental_quality(ticker: str,
                     y=values.values * 100,
                     mode="lines+markers",
                     name=label,
-                    line=dict(width=3),
+                    line={"width": 3},
                 ),
                 row=row + 1,
                 col=col + 1,
@@ -1672,42 +1756,69 @@ def render_fundamental_quality(ticker: str,
         figure.update_layout(
             height=max(340, rows * 280),
             showlegend=False,
-            margin=dict(t=70, b=30),
+            margin={"t": 70, "b": 30},
         )
         st.plotly_chart(figure, width="stretch")
 
     st.caption(
-        "ROIC 为简化会计口径：全额扣除会计现金，未资本化研发，亦未单独估算超额现金；"
-        "资产轻型科技公司的 ROIC 可能显得异常高。"
+        "ROIC uses a simplified accounting definition: reported cash is deducted "
+        "in full, R&D is not capitalized and excess cash is not separately estimated. "
+        "Asset-light technology companies may therefore show unusually high ROIC."
     )
     st.caption(
-        "简化再投资率基于资本开支现金流出减 D&A，尚未包含营运资本变化或收购；"
-        "Fundamental Growth Capacity 是历史结构关系，不是增长预测。"
+        "The simplified reinvestment rate uses capital-expenditure cash outflow less "
+        "D&A and excludes working-capital changes and acquisitions. Fundamental Growth "
+        "Capacity is a historical structural relationship, not a growth forecast."
     )
 
 
 def render_health_checks(ticker: str, checks: list[dict]) -> None:
     """展示基础财务规则的通过、未通过或数据不足状态。"""
-    st.header("🩺 运营体检")
-    st.caption("这是快速筛查，不构成投资结论；行业特性、周期性和一次性项目仍需人工判断。")
+    st.header("Operating Health Checks")
+    st.caption(
+        "These are quick screening checks, not investment conclusions. Industry "
+        "structure, cyclicality and one-off items still require judgment."
+    )
     if not checks:
-        st.warning(f"yfinance 暂无足够的 {ticker} 财务数据用于体检。")
+        st.warning(f"Insufficient financial data is available to screen {ticker}.")
         return
 
-    columns = st.columns(len(checks))
-    for column, check in zip(columns, checks):
-        with column.container(border=True):
-            st.subheader(check["title"])
-            status = check["status"]
-            if status is True:
-                st.success("✅ 通过")
-            elif status is False:
-                st.warning("⚠️ 未通过")
-            else:
-                st.info("➖ 数据不足")
-            st.code(check["rule"], language=None)
-            st.write(check["detail"])
-            st.caption(check["basis"])
+    detail_translations = {
+        "长期债务或净利润数据缺失": "Long-term debt or net income is unavailable",
+        "净利润为负或为零，无法形成有效覆盖": (
+            "Net income is negative or zero; coverage is not meaningful"
+        ),
+    }
+    status_presentations = {
+        True: ("Pass", "pass"),
+        False: ("Review", "review"),
+        None: ("Insufficient data", "unknown"),
+    }
+    for check in checks:
+        status_label, status_class = status_presentations[check["status"]]
+        detail = detail_translations.get(check["detail"], check["detail"])
+        st.markdown(
+            f"""
+            <article class="health-check-card">
+                <div class="health-check-summary">
+                    <h3>{escape(str(check["title"]))}</h3>
+                    <span class="health-check-status health-check-status--{status_class}">
+                        {status_label}
+                    </span>
+                </div>
+                <div class="health-check-rule">
+                    <span class="health-check-label">Screening rule</span>
+                    <code>{escape(str(check["rule"]))}</code>
+                </div>
+                <div class="health-check-evidence">
+                    <span class="health-check-label">Current evidence</span>
+                    <p>{escape(str(detail))}</p>
+                    <small>{escape(str(check["basis"]))}</small>
+                </div>
+            </article>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 MULTISTAGE_GENERIC_DEFAULTS = {
@@ -1725,10 +1836,9 @@ MULTISTAGE_GENERIC_DEFAULTS = {
 }
 
 
-def _valid_history_value(history: FundamentalHistory | None,
-                         metric: str,
-                         *,
-                         ttm: bool = False) -> float | None:
+def _valid_history_value(
+    history: FundamentalHistory | None, metric: str, *, ttm: bool = False
+) -> float | None:
     """Read one existing fundamental metric without calculating a replacement."""
     if history is None:
         return None
@@ -1747,8 +1857,9 @@ def _valid_history_value(history: FundamentalHistory | None,
     return value if np.isfinite(value) else None
 
 
-def multistage_initial_defaults(ticker: str,
-                                history: FundamentalHistory | None) -> dict:
+def multistage_initial_defaults(
+    ticker: str, history: FundamentalHistory | None
+) -> dict:
     """Return editable initial assumptions; never mutate history or forecasts."""
     ticker = ticker.strip().upper()
     values = dict(MULTISTAGE_GENERIC_DEFAULTS)
@@ -1765,23 +1876,37 @@ def multistage_initial_defaults(ticker: str,
         values["tax_rate"] = annual_tax * 100
 
     if ticker == "NVDA":
-        values.update({
-            "year_1_growth": 30.0, "year_2_growth": 25.0,
-            "year_3_growth": 20.0, "forecast_years": 10,
-            "fade_years": 7, "terminal_growth": 3.5,
-            "mature_margin": 40.0, "starting_sales_to_capital": 1.5,
-            "mature_sales_to_capital": 1.2, "tax_rate": 16.0,
-            "wacc": 9.0,
-        })
+        values.update(
+            {
+                "year_1_growth": 30.0,
+                "year_2_growth": 25.0,
+                "year_3_growth": 20.0,
+                "forecast_years": 10,
+                "fade_years": 7,
+                "terminal_growth": 3.5,
+                "mature_margin": 40.0,
+                "starting_sales_to_capital": 1.5,
+                "mature_sales_to_capital": 1.2,
+                "tax_rate": 16.0,
+                "wacc": 9.0,
+            }
+        )
     elif ticker in {"GOOG", "GOOGL"}:
-        values.update({
-            "year_1_growth": 15.0, "year_2_growth": 13.0,
-            "year_3_growth": 11.0, "forecast_years": 10,
-            "fade_years": 7, "terminal_growth": 3.5,
-            "mature_margin": 30.0, "starting_sales_to_capital": 0.8,
-            "mature_sales_to_capital": 0.7, "tax_rate": 17.0,
-            "wacc": 8.5,
-        })
+        values.update(
+            {
+                "year_1_growth": 15.0,
+                "year_2_growth": 13.0,
+                "year_3_growth": 11.0,
+                "forecast_years": 10,
+                "fade_years": 7,
+                "terminal_growth": 3.5,
+                "mature_margin": 30.0,
+                "starting_sales_to_capital": 0.8,
+                "mature_sales_to_capital": 0.7,
+                "tax_rate": 17.0,
+                "wacc": 8.5,
+            }
+        )
     return values
 
 
@@ -1839,9 +1964,7 @@ def apply_reviewed_profile_to_base_session_state(
     plan = build_profile_apply_plan(
         snapshot, current_base, previous_application=previous
     )
-    application = create_reviewed_profile_application(
-        plan, applied_at=applied_at
-    )
+    application = create_reviewed_profile_application(plan, applied_at=applied_at)
     normalized_ticker = ticker.strip().upper()
     prefix = f"multistage_{normalized_ticker}_"
     values = _multistage_base_state_values(application.assumptions)
@@ -1905,24 +2028,27 @@ def review_and_apply_profile_to_base_session_state(
     values = _multistage_base_state_values(result.assumptions)
     normalized_ticker = ticker.strip().upper()
     prefix = f"multistage_{normalized_ticker}_"
-    updates = {
-        prefix + name: value
-        for name, value in values.items()
-        if name != "wacc"
+    updates: dict[str, object] = {
+        prefix + name: value for name, value in values.items() if name != "wacc"
     }
     wacc_keys = research_wacc_session_keys(ticker)
-    updates.update({
-        wacc_keys["value"]: values["wacc"],
-        wacc_keys["status"]: "user_reviewed",
-        wacc_keys["created_at"]: applied_at,
-        review_key: result.review_state,
-        application_key: result.application,
-    })
-    wacc_note = next((
-        item.user_note.strip()
-        for item in result.reviewed_snapshot.group_reviews
-        if item.group == "wacc" and item.user_note.strip()
-    ), "")
+    updates.update(
+        {
+            wacc_keys["value"]: values["wacc"],
+            wacc_keys["status"]: "user_reviewed",
+            wacc_keys["created_at"]: applied_at,
+            review_key: result.review_state,
+            application_key: result.application,
+        }
+    )
+    wacc_note = next(
+        (
+            item.user_note.strip()
+            for item in result.reviewed_snapshot.group_reviews
+            if item.group == "wacc" and item.user_note.strip()
+        ),
+        "",
+    )
     research_wacc = result.reviewed_snapshot.profile.wacc_framework.research_wacc
     updates[wacc_keys["rationale"]] = (
         wacc_note
@@ -1946,9 +2072,9 @@ def mark_research_wacc_reviewed(
     state[keys["created_at"]] = created_at or pd.Timestamp.now(tz="UTC").isoformat()
 
 
-def initialize_multistage_session_state(state,
-                                        ticker: str,
-                                        history: FundamentalHistory | None) -> dict:
+def initialize_multistage_session_state(
+    state, ticker: str, history: FundamentalHistory | None
+) -> dict:
     """Initialize ticker operating inputs and issuer-level Research WACC state."""
     normalized_ticker = ticker.strip().upper()
     defaults = multistage_initial_defaults(normalized_ticker, history)
@@ -1963,9 +2089,8 @@ def initialize_multistage_session_state(state,
         legacy_value = state.get(legacy_wacc_key, defaults["wacc"])
         state[keys["value"]] = legacy_value
         # A non-default legacy value can only have arisen from an earlier edit.
-        legacy_was_edited = (
-            legacy_wacc_key in state
-            and not np.isclose(float(legacy_value), float(defaults["wacc"]))
+        legacy_was_edited = legacy_wacc_key in state and not np.isclose(
+            float(legacy_value), float(defaults["wacc"])
         )
         state[keys["status"]] = (
             "user_reviewed" if legacy_was_edited else "provisional_default"
@@ -1975,11 +2100,7 @@ def initialize_multistage_session_state(state,
     state.setdefault(keys["rationale"], "")
     state.setdefault(keys["created_at"], None)
 
-    values = {
-        name: state[prefix + name]
-        for name in defaults
-        if name != "wacc"
-    }
+    values = {name: state[prefix + name] for name in defaults if name != "wacc"}
     values["wacc"] = state[keys["value"]]
     return values
 
@@ -2046,11 +2167,7 @@ def render_multistage_sensitivity(
         "表中范围只是所示参数网格的敏感性范围，不是概率区间。"
     )
     if not run.per_security_valuation_supported:
-        st.warning(
-            _per_security_unavailable_message(
-                run.per_share_unavailable_reason
-            )
-        )
+        st.warning(_per_security_unavailable_message(run.per_share_unavailable_reason))
 
     frame = build_sensitivity_display_frame(sensitivity)
     row_labels = {value: f"{value:.1%}" for value in frame.index}
@@ -2065,7 +2182,7 @@ def render_multistage_sensitivity(
     )
     st.dataframe(styled, width="stretch")
     st.caption(
-        f"Base case：WACC {sensitivity.base_wacc:.1%} · Terminal Growth "
+        f"Base case: WACC {sensitivity.base_wacc:.1%} · Terminal Growth "
         f"{sensitivity.base_terminal_growth:.1%} · Intrinsic Value "
         f"{_sensitivity_value_label(base.intrinsic_value_per_share)}"
     )
@@ -2074,8 +2191,16 @@ def render_multistage_sensitivity(
         ("Base Value", sensitivity.base_wacc, sensitivity.base_terminal_growth),
         ("WACC -50bp", sensitivity.base_wacc - 0.005, sensitivity.base_terminal_growth),
         ("WACC +50bp", sensitivity.base_wacc + 0.005, sensitivity.base_terminal_growth),
-        ("Terminal g -50bp", sensitivity.base_wacc, sensitivity.base_terminal_growth - 0.005),
-        ("Terminal g +50bp", sensitivity.base_wacc, sensitivity.base_terminal_growth + 0.005),
+        (
+            "Terminal g -50bp",
+            sensitivity.base_wacc,
+            sensitivity.base_terminal_growth - 0.005,
+        ),
+        (
+            "Terminal g +50bp",
+            sensitivity.base_wacc,
+            sensitivity.base_terminal_growth + 0.005,
+        ),
     )
     summary_columns = st.columns(5)
     for column, (label, wacc, growth) in zip(summary_columns, coordinates):
@@ -2089,9 +2214,15 @@ def render_multistage_sensitivity(
         )
 
     range_columns = st.columns(3)
-    range_columns[0].metric("Minimum Valid Value", _sensitivity_value_label(sensitivity.min_value_per_share))
-    range_columns[1].metric("Base Value", _sensitivity_value_label(base.intrinsic_value_per_share))
-    range_columns[2].metric("Maximum Valid Value", _sensitivity_value_label(sensitivity.max_value_per_share))
+    range_columns[0].metric(
+        "Minimum Valid Value", _sensitivity_value_label(sensitivity.min_value_per_share)
+    )
+    range_columns[1].metric(
+        "Base Value", _sensitivity_value_label(base.intrinsic_value_per_share)
+    )
+    range_columns[2].metric(
+        "Maximum Valid Value", _sensitivity_value_label(sensitivity.max_value_per_share)
+    )
     st.caption("Sensitivity range under displayed WACC / terminal-growth grid.")
 
     st.markdown("**Terminal Value / Enterprise Value context**")
@@ -2110,7 +2241,7 @@ def render_multistage_sensitivity(
             for point in sensitivity.points:
                 if not point.valid:
                     st.write(
-                        f"WACC {point.wacc:.2%} · g {point.terminal_growth:.2%}："
+                        f"WACC {point.wacc:.2%} · g {point.terminal_growth:.2%}: "
                         f"{point.reason}"
                     )
 
@@ -2181,7 +2312,8 @@ def render_reverse_dcf(
     summary[0].metric(
         "Research Base DCF",
         f"${analysis.base_dcf_per_share:.2f}"
-        if analysis.base_dcf_per_share is not None else "N/A",
+        if analysis.base_dcf_per_share is not None
+        else "N/A",
     )
     summary[1].metric(
         "Market Price",
@@ -2190,7 +2322,8 @@ def render_reverse_dcf(
     summary[2].metric(
         "Price / Base DCF",
         f"{analysis.price_to_base_dcf:.2f}x"
-        if analysis.price_to_base_dcf is not None else "N/A",
+        if analysis.price_to_base_dcf is not None
+        else "N/A",
     )
     summary[3].metric("Reverse DCF Base", analysis.base_source)
 
@@ -2213,7 +2346,8 @@ def render_reverse_dcf(
         research_range = (
             f"{_reverse_value_label(result.variable, result.research_range.lower)} – "
             f"{_reverse_value_label(result.variable, result.research_range.upper)}"
-            if result.research_range is not None else "N/A"
+            if result.research_range is not None
+            else "N/A"
         )
         range_labels = {
             "within_research_range": "Within Research Range",
@@ -2234,19 +2368,21 @@ def render_reverse_dcf(
             "INVALID_BASE_ASSUMPTIONS": "Invalid Base assumptions",
             "MARKET_PRICE_UNAVAILABLE": "Market price unavailable",
         }
-        rows.append({
-            "Variable": labels[result.variable],
-            "Research Base": _reverse_value_label(
-                result.variable, result.research_value
-            ),
-            "Market-Implied": implied_label,
-            "Gap": _reverse_gap_label(result),
-            "Research Range": research_range,
-            "Status": status_labels.get(result.status, result.status),
-        })
+        rows.append(
+            {
+                "Variable": labels[result.variable],
+                "Research Base": _reverse_value_label(
+                    result.variable, result.research_value
+                ),
+                "Market-Implied": implied_label,
+                "Gap": _reverse_gap_label(result),
+                "Research Range": research_range,
+                "Status": status_labels.get(result.status, result.status),
+            }
+        )
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     st.caption(
-        "Search bounds：Growth Δ −30pp to +50pp · Mature Margin 0–80% · "
+        "Search bounds: Growth Δ −30pp to +50pp · Mature Margin 0–80% · "
         "Mature S/C 0.1–5.0x · WACC terminal g + 0.5pp to 20%."
     )
     st.info(
@@ -2264,14 +2400,14 @@ def render_reverse_dcf(
         )
     if model_risk or limitations:
         with st.expander("Reverse DCF model context", expanded=False):
-            st.write(f"Company Profile model risk：{model_risk or 'N/A'}")
+            st.write(f"Company Profile model risk: {model_risk or 'N/A'}")
             for limitation in limitations:
                 st.write(f"• {limitation}")
 
 
-def _diagnostic_display(value: float | None,
-                        kind: str = "percent",
-                        currency: str | None = "USD") -> str:
+def _diagnostic_display(
+    value: float | None, kind: str = "percent", currency: str | None = "USD"
+) -> str:
     if value is None or not np.isfinite(value):
         return "数据不足"
     if kind == "amount":
@@ -2346,8 +2482,12 @@ def _one_click_review_apply_callback(
     reviewed_at = pd.Timestamp.now(tz="UTC").isoformat()
     applied_at = pd.Timestamp.now(tz="UTC").isoformat()
     review_and_apply_profile_to_base_session_state(
-        state, ticker, candidate_profile, current_base,
-        reviewed_at=reviewed_at, applied_at=applied_at,
+        state,
+        ticker,
+        candidate_profile,
+        current_base,
+        reviewed_at=reviewed_at,
+        applied_at=applied_at,
         preview_validated=preview_validated,
     )
 
@@ -2427,16 +2567,18 @@ def render_one_click_profile_workflow(
                 else np.isclose(float(base_value), float(candidate_value))
             )
             if not equal:
-                changes.append({
-                    "Assumption": label,
-                    "Current Base": _profile_apply_value(field, base_value),
-                    "Research Candidate": _profile_apply_value(field, candidate_value),
-                })
+                changes.append(
+                    {
+                        "Assumption": label,
+                        "Current Base": _profile_apply_value(field, base_value),
+                        "Research Candidate": _profile_apply_value(
+                            field, candidate_value
+                        ),
+                    }
+                )
         st.markdown("**Current Base vs Research Candidate — meaningful differences**")
         if changes:
-            st.dataframe(
-                pd.DataFrame(changes).set_index("Assumption"), width="stretch"
-            )
+            st.dataframe(pd.DataFrame(changes).set_index("Assumption"), width="stretch")
         else:
             st.caption("Current Base values already match the Research Candidate.")
 
@@ -2478,9 +2620,7 @@ def render_one_click_profile_workflow(
             )
             return
         if plan.base_diverged:
-            st.warning(
-                "Current Base has diverged from the applied Reviewed Profile."
-            )
+            st.warning("Current Base has diverged from the applied Reviewed Profile.")
             st.button(
                 "Reapply Reviewed Profile",
                 key=f"one_click_reapply_{candidate_profile.issuer_id}",
@@ -2528,7 +2668,7 @@ PROFILE_APPLY_FIELD_LABELS = {
 }
 
 
-def _profile_apply_value(field: str, value: float | int) -> str:
+def _profile_apply_value(field: str, value: float) -> str:
     if field in {"revenue_fade_years", "forecast_years"}:
         return str(int(value))
     if field in {"starting_sales_to_capital", "mature_sales_to_capital"}:
@@ -2600,21 +2740,41 @@ def render_final_company_header(
 ) -> None:
     """Compact, neutral header for the final research workstation."""
     name = profile.company_name if profile is not None else ticker
-    st.header(f"{name} · {ticker}")
     per_share = research_base_run.per_share_value
     dcf_value = per_share.intrinsic_value_per_share if per_share is not None else None
     price = snapshot.price
     ratio = dcf_value / price if dcf_value is not None and price and price > 0 else None
-    columns = st.columns(6)
-    columns[0].metric("Market Price", f"${price:.2f}" if price is not None else "N/A")
-    columns[1].metric("Research Base DCF", f"${dcf_value:.2f}" if dcf_value is not None else "N/A")
-    columns[2].metric("DCF / Market Price", f"{ratio:.2f}x" if ratio is not None else "N/A")
-    columns[3].metric("Profile State", profile_state)
-    columns[4].metric("Base Source", base_source)
-    columns[5].metric("Model Risk", profile.model_risk if profile and profile.model_risk else "N/A")
-    st.caption(
-        "Valuation gap is a neutral research diagnostic, not a recommendation or trading signal."
-    )
+    with st.container(key="company_hero"):
+        st.markdown(
+            '<p class="ui-hero-kicker">Valuation snapshot · live market context</p>',
+            unsafe_allow_html=True,
+        )
+        st.header(f"{name} · {ticker}")
+        with st.container(key="valuation_primary"):
+            primary_columns = st.columns(3)
+            primary_columns[0].metric(
+                "Market Price", f"${price:.2f}" if price is not None else "N/A"
+            )
+            primary_columns[1].metric(
+                "Research Base DCF",
+                f"${dcf_value:.2f}" if dcf_value is not None else "N/A",
+            )
+            primary_columns[2].metric(
+                "DCF / Market Price",
+                f"{ratio:.2f}x" if ratio is not None else "N/A",
+            )
+        with st.container(key="valuation_context"):
+            secondary_columns = st.columns(3)
+            secondary_columns[0].metric("Profile State", profile_state)
+            secondary_columns[1].metric("Base Source", base_source)
+            secondary_columns[2].metric(
+                "Model Risk",
+                profile.model_risk if profile and profile.model_risk else "N/A",
+            )
+        st.caption(
+            "Valuation gap is a neutral research diagnostic, not a recommendation "
+            "or trading signal."
+        )
 
 
 def render_final_research_profile(
@@ -2658,20 +2818,54 @@ def render_final_research_profile(
     translation = build_multistage_assumptions_from_profile(profile)
     candidate = translation.assumptions
     if candidate is None:
-        st.warning("Research Profile assumptions are incomplete; valuation remains unavailable.")
+        st.warning(
+            "Research Profile assumptions are incomplete; valuation remains unavailable."
+        )
         return profile_state, base_source
 
     confidence = _research_details_confidence(research_details)
     rows = (
-        ("Y1 Growth", f"{candidate.near_term_revenue_growth[0]:.1%}", confidence.get("Y1 Growth", "N/A")),
-        ("Y2 Growth", f"{candidate.near_term_revenue_growth[1]:.1%}", confidence.get("Y2 Growth", "N/A")),
-        ("Y3 Growth", f"{candidate.near_term_revenue_growth[2]:.1%}", confidence.get("Y3 Growth", "N/A")),
-        ("Mature Margin", f"{candidate.mature_operating_margin:.1%}", confidence.get("Mature Margin", "N/A")),
-        ("Mature S/C", f"{candidate.mature_sales_to_capital:.2f}x", confidence.get("Mature S/C", "N/A")),
+        (
+            "Y1 Growth",
+            f"{candidate.near_term_revenue_growth[0]:.1%}",
+            confidence.get("Y1 Growth", "N/A"),
+        ),
+        (
+            "Y2 Growth",
+            f"{candidate.near_term_revenue_growth[1]:.1%}",
+            confidence.get("Y2 Growth", "N/A"),
+        ),
+        (
+            "Y3 Growth",
+            f"{candidate.near_term_revenue_growth[2]:.1%}",
+            confidence.get("Y3 Growth", "N/A"),
+        ),
+        (
+            "Mature Margin",
+            f"{candidate.mature_operating_margin:.1%}",
+            confidence.get("Mature Margin", "N/A"),
+        ),
+        (
+            "Mature S/C",
+            f"{candidate.mature_sales_to_capital:.2f}x",
+            confidence.get("Mature S/C", "N/A"),
+        ),
         ("Operating Tax", f"{candidate.operating_tax_rate:.1%}", "N/A"),
-        ("Research WACC", f"{candidate.wacc:.2%}", confidence.get("WACC", confidence.get("Research WACC", "N/A"))),
-        ("Terminal Growth", f"{candidate.terminal_growth:.1%}", confidence.get("Terminal Economics", "N/A")),
-        ("Terminal ROIC", f"{candidate.derived_terminal_roic:.1%}", confidence.get("Terminal Economics", "N/A")),
+        (
+            "Research WACC",
+            f"{candidate.wacc:.2%}",
+            confidence.get("WACC", confidence.get("Research WACC", "N/A")),
+        ),
+        (
+            "Terminal Growth",
+            f"{candidate.terminal_growth:.1%}",
+            confidence.get("Terminal Economics", "N/A"),
+        ),
+        (
+            "Terminal ROIC",
+            f"{candidate.derived_terminal_roic:.1%}",
+            confidence.get("Terminal Economics", "N/A"),
+        ),
     )
     st.dataframe(
         pd.DataFrame(rows, columns=("Assumption", "Research Candidate", "Confidence")),
@@ -2730,20 +2924,27 @@ def render_final_evidence(profile, research_details=None) -> None:
         "market_risk": "Derived Metric",
         "industry_reference": "Research Context",
     }
-    confidence = _research_details_confidence(research_details)
     grouped: dict[str, list[dict]] = {}
     for item in profile.evidence_items:
         group = category_labels.get(item.category, "Other Evidence")
-        source_url = item.source if isinstance(item.source, str) and item.source.startswith(("http://", "https://")) else None
-        grouped.setdefault(group, []).append({
-            "Summary": item.label,
-            "Type": type_labels.get(item.category, "Evidence"),
-            "Value": _final_evidence_value(item),
-            "Period": item.period or "N/A",
-            "Source": "Open source" if source_url else item.source,
-            "Source URL": source_url,
-            "Research Interpretation": item.notes or "Evidence only; not automatically applied.",
-        })
+        source_url = (
+            item.source
+            if isinstance(item.source, str)
+            and item.source.startswith(("http://", "https://"))
+            else None
+        )
+        grouped.setdefault(group, []).append(
+            {
+                "Summary": item.label,
+                "Type": type_labels.get(item.category, "Evidence"),
+                "Value": _final_evidence_value(item),
+                "Period": item.period or "N/A",
+                "Source": "Open source" if source_url else item.source,
+                "Source URL": source_url,
+                "Research Interpretation": item.notes
+                or "Evidence only; not automatically applied.",
+            }
+        )
     for group in (
         "Revenue / Growth & Reported Financials",
         "Revenue / Growth",
@@ -2772,7 +2973,10 @@ def render_final_evidence(profile, research_details=None) -> None:
     if translation.assumptions is not None:
         model = translation.assumptions
         assumption_rows = [
-            ("Y1 / Y2 / Y3 Growth", " / ".join(f"{value:.1%}" for value in model.near_term_revenue_growth)),
+            (
+                "Y1 / Y2 / Y3 Growth",
+                " / ".join(f"{value:.1%}" for value in model.near_term_revenue_growth),
+            ),
             ("Mature Margin", f"{model.mature_operating_margin:.1%}"),
             ("Mature S/C", f"{model.mature_sales_to_capital:.2f}x"),
             ("Research WACC", f"{model.wacc:.2%}"),
@@ -2790,12 +2994,18 @@ def render_final_evidence(profile, research_details=None) -> None:
 def render_final_model_limitations(profile) -> None:
     st.header("Model Limitations")
     if profile is None:
-        st.info("No researched Company Profile is available; company-specific limitations are unavailable.")
+        st.info(
+            "No researched Company Profile is available; company-specific limitations are unavailable."
+        )
         return
     ticker = profile.ticker.strip().upper()
     notes = list(FINAL_MODEL_LIMITATIONS.get(ticker, ()))
     for note in profile.uncertainty_notes:
-        if "phase" not in note.lower() and "hybrid" not in note.lower() and note not in notes:
+        if (
+            "phase" not in note.lower()
+            and "hybrid" not in note.lower()
+            and note not in notes
+        ):
             notes.append(note)
         if len(notes) >= 4:
             break
@@ -2818,17 +3028,27 @@ def render_final_forecast_chart(
     revenues = [row.revenue / 1e9 for row in run.operating_forecast.years]
     fcff_values = [row.fcff / 1e9 for row in run.operating_forecast.years]
     figure = go.Figure()
-    figure.add_trace(go.Scatter(
-        x=years, y=revenues, mode="lines+markers", name="Revenue",
-    ))
-    figure.add_trace(go.Bar(
-        x=years, y=fcff_values, name="FCFF", opacity=0.45,
-    ))
+    figure.add_trace(
+        go.Scatter(
+            x=years,
+            y=revenues,
+            mode="lines+markers",
+            name="Revenue",
+        )
+    )
+    figure.add_trace(
+        go.Bar(
+            x=years,
+            y=fcff_values,
+            name="FCFF",
+            opacity=0.45,
+        )
+    )
     figure.update_layout(
         title="Forecast Revenue and FCFF",
         xaxis_title="Forecast Year",
         yaxis_title=f"{statement_currency or 'Statement currency'} B",
-        legend=dict(orientation="h"),
+        legend={"orientation": "h"},
     )
     st.plotly_chart(figure, width="stretch")
 
@@ -2845,40 +3065,74 @@ def render_final_advanced_diagnostics(
         revenue_diag, margin_diag, capital_diag = st.columns(3)
         with revenue_diag:
             st.markdown("**Revenue**")
-            st.write(f"Historical CAGR 3Y：{_diagnostic_display(diagnostics.revenue.historical_cagr_3y)}")
+            st.write(
+                f"Historical CAGR 3Y：{_diagnostic_display(diagnostics.revenue.historical_cagr_3y)}"
+            )
             st.write(
                 "Y1 / Y2 / Y3："
-                + " / ".join(f"{value:.1%}" for value in assumptions.near_term_revenue_growth)
+                + " / ".join(
+                    f"{value:.1%}" for value in assumptions.near_term_revenue_growth
+                )
             )
-            st.write(f"Year 5 Revenue：{_diagnostic_display(diagnostics.revenue.year_5_revenue, 'amount', statement_currency)}")
-            st.write(f"Final Revenue：{_diagnostic_display(diagnostics.revenue.final_forecast_revenue, 'amount', statement_currency)}")
-            st.write(f"Revenue Multiple：{_diagnostic_display(diagnostics.revenue.final_to_starting_revenue_multiple, 'multiple')}")
+            st.write(
+                f"Year 5 Revenue：{_diagnostic_display(diagnostics.revenue.year_5_revenue, 'amount', statement_currency)}"
+            )
+            st.write(
+                f"Final Revenue：{_diagnostic_display(diagnostics.revenue.final_forecast_revenue, 'amount', statement_currency)}"
+            )
+            st.write(
+                f"Revenue Multiple：{_diagnostic_display(diagnostics.revenue.final_to_starting_revenue_multiple, 'multiple')}"
+            )
         with margin_diag:
             st.markdown("**Margin**")
-            st.write(f"Annual / TTM：{_diagnostic_display(diagnostics.operating_margin.latest_annual_margin)} / {_diagnostic_display(diagnostics.operating_margin.latest_ttm_margin)}")
-            st.write(f"Start / Year 5 / Mature：{_diagnostic_display(diagnostics.operating_margin.starting_forecast_margin)} / {_diagnostic_display(diagnostics.operating_margin.year_5_margin)} / {_diagnostic_display(diagnostics.operating_margin.mature_margin)}")
+            st.write(
+                f"Annual / TTM：{_diagnostic_display(diagnostics.operating_margin.latest_annual_margin)} / {_diagnostic_display(diagnostics.operating_margin.latest_ttm_margin)}"
+            )
+            st.write(
+                f"Start / Year 5 / Mature：{_diagnostic_display(diagnostics.operating_margin.starting_forecast_margin)} / {_diagnostic_display(diagnostics.operating_margin.year_5_margin)} / {_diagnostic_display(diagnostics.operating_margin.mature_margin)}"
+            )
         with capital_diag:
             st.markdown("**Capital Efficiency**")
-            st.write(f"Latest / 3Y：{_diagnostic_display(diagnostics.sales_to_capital.latest_annual, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.historical_normalized_3y, 'multiple')}")
-            st.write(f"Start / Year 5 / Mature：{_diagnostic_display(diagnostics.sales_to_capital.starting_forecast, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.year_5, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.mature, 'multiple')}")
+            st.write(
+                f"Latest / 3Y：{_diagnostic_display(diagnostics.sales_to_capital.latest_annual, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.historical_normalized_3y, 'multiple')}"
+            )
+            st.write(
+                f"Start / Year 5 / Mature：{_diagnostic_display(diagnostics.sales_to_capital.starting_forecast, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.year_5, 'multiple')} / {_diagnostic_display(diagnostics.sales_to_capital.mature, 'multiple')}"
+            )
 
         roic_diag, cash_diag, dependency_diag = st.columns(3)
         with roic_diag:
             st.markdown("**ROIC**")
-            st.write(f"Accounting：{_diagnostic_display(diagnostics.roic.current_accounting_roic)}")
-            st.write(f"Year 1 / Year 5 / Terminal：{_diagnostic_display(diagnostics.roic.year_1_implied_operating_roic)} / {_diagnostic_display(diagnostics.roic.year_5_implied_operating_roic)} / {_diagnostic_display(diagnostics.roic.terminal_derived_roic)}")
+            st.write(
+                f"Accounting：{_diagnostic_display(diagnostics.roic.current_accounting_roic)}"
+            )
+            st.write(
+                f"Year 1 / Year 5 / Terminal：{_diagnostic_display(diagnostics.roic.year_1_implied_operating_roic)} / {_diagnostic_display(diagnostics.roic.year_5_implied_operating_roic)} / {_diagnostic_display(diagnostics.roic.terminal_derived_roic)}"
+            )
         with cash_diag:
             cash = diagnostics.cash_flow_economics
             st.markdown("**Cash Flow**")
-            st.write(f"Historical TTM FCF Margin：{_diagnostic_display(cash.historical_fundamental_ttm_fcf_margin)}")
-            st.write(f"FCFF Margin Y1 / Y5 / Final：{_diagnostic_display(cash.year_1.fcff_margin)} / {_diagnostic_display(cash.year_5.fcff_margin if cash.year_5 else None)} / {_diagnostic_display(cash.final_year.fcff_margin)}")
-            st.write(f"Terminal Reinvestment Rate：{_diagnostic_display(cash.terminal_reinvestment_rate)}")
+            st.write(
+                f"Historical TTM FCF Margin：{_diagnostic_display(cash.historical_fundamental_ttm_fcf_margin)}"
+            )
+            st.write(
+                f"FCFF Margin Y1 / Y5 / Final：{_diagnostic_display(cash.year_1.fcff_margin)} / {_diagnostic_display(cash.year_5.fcff_margin if cash.year_5 else None)} / {_diagnostic_display(cash.final_year.fcff_margin)}"
+            )
+            st.write(
+                f"Terminal Reinvestment Rate：{_diagnostic_display(cash.terminal_reinvestment_rate)}"
+            )
         with dependency_diag:
             dependency = diagnostics.terminal_dependency
             st.markdown("**Valuation Dependency**")
-            st.write(f"Explicit PV：{_diagnostic_display(dependency.explicit_forecast_pv, 'amount', statement_currency)}")
-            st.write(f"Terminal PV：{_diagnostic_display(dependency.terminal_value_pv, 'amount', statement_currency)}")
-            st.write(f"Terminal / EV：{_diagnostic_display(dependency.terminal_value_share)}")
+            st.write(
+                f"Explicit PV：{_diagnostic_display(dependency.explicit_forecast_pv, 'amount', statement_currency)}"
+            )
+            st.write(
+                f"Terminal PV：{_diagnostic_display(dependency.terminal_value_pv, 'amount', statement_currency)}"
+            )
+            st.write(
+                f"Terminal / EV：{_diagnostic_display(dependency.terminal_value_share)}"
+            )
         if diagnostics.flags:
             st.markdown("**Objective informational flags**")
             for flag in diagnostics.flags:
@@ -2892,17 +3146,17 @@ def build_company_revenue_forecast_anchors(
 ):
     """Adapt cached snapshot consensus data to source-independent anchors."""
     ttm_revenue = history.ttm.get(REVENUE)
+    current_base: float | None
     if ttm_revenue is not None and ttm_revenue.available and ttm_revenue.value:
         current_base = float(ttm_revenue.value)
-        base_period = (
-            ttm_revenue.periods_used[-1] if ttm_revenue.periods_used else None
-        )
+        base_period = ttm_revenue.periods_used[-1] if ttm_revenue.periods_used else None
         base_kind = "ttm"
     else:
         current_base = _valid_history_value(history, REVENUE)
         base_period = (
             pd.Timestamp(history.annual.index[-1])
-            if current_base is not None and not history.annual.empty else None
+            if current_base is not None and not history.annual.empty
+            else None
         )
         base_kind = "annual"
     if current_base is None:
@@ -2910,7 +3164,8 @@ def build_company_revenue_forecast_anchors(
     latest_annual = _valid_history_value(history, REVENUE)
     latest_annual_period = (
         pd.Timestamp(history.annual.index[-1])
-        if latest_annual is not None and not history.annual.empty else None
+        if latest_annual is not None and not history.annual.empty
+        else None
     )
     return load_revenue_forecast_anchors(
         ticker=ticker,
@@ -2954,10 +3209,12 @@ def scenario_session_keys(ticker: str, scenario: str) -> dict[str, str]:
     issuer_key, _ = issuer_normalization_metadata(ticker)
     prefix = f"scenario_{issuer_key}_{normalized_scenario}_"
     keys = {field: prefix + field for field in SCENARIO_EDITABLE_FIELDS}
-    keys.update({
-        "status": prefix + "status",
-        "rationale": prefix + "rationale",
-    })
+    keys.update(
+        {
+            "status": prefix + "status",
+            "rationale": prefix + "rationale",
+        }
+    )
     return keys
 
 
@@ -3003,9 +3260,7 @@ def provisional_scenario_values(
         "fade_years": fade_years,
         "terminal_growth": base.terminal_growth * 100 + terminal_offset,
         "mature_margin": base.mature_operating_margin * 100 + margin_offset,
-        "mature_sales_to_capital": (
-            base.mature_sales_to_capital + capital_offset
-        ),
+        "mature_sales_to_capital": (base.mature_sales_to_capital + capital_offset),
         "wacc": base.wacc * 100 + wacc_offset,
     }
 
@@ -3065,9 +3320,7 @@ def scenario_case_from_state(
         revenue_fade_years=int(state[keys["fade_years"]]),
         terminal_growth=float(state[keys["terminal_growth"]]) / 100,
         mature_operating_margin=float(state[keys["mature_margin"]]) / 100,
-        mature_sales_to_capital=float(
-            state[keys["mature_sales_to_capital"]]
-        ),
+        mature_sales_to_capital=float(state[keys["mature_sales_to_capital"]]),
         research_wacc=float(state[keys["wacc"]]) / 100,
     )
 
@@ -3087,9 +3340,7 @@ def build_scenario_summary_frame(
             "Enterprise Value (B)": (
                 metrics.enterprise_value / 1e9 if metrics else np.nan
             ),
-            "Equity Value (B)": (
-                metrics.equity_value / 1e9 if metrics else np.nan
-            ),
+            "Equity Value (B)": (metrics.equity_value / 1e9 if metrics else np.nan),
             "Terminal Value / EV": (
                 metrics.terminal_value_share if metrics else np.nan
             ),
@@ -3119,7 +3370,8 @@ def build_scenario_economic_frame(
             "Revenue Fade Years": metrics.revenue_fade_years if metrics else np.nan,
             "Year 5 Revenue (B)": (
                 metrics.year_5_revenue / 1e9
-                if metrics and metrics.year_5_revenue is not None else np.nan
+                if metrics and metrics.year_5_revenue is not None
+                else np.nan
             ),
             "Final Revenue (B)": (
                 metrics.final_forecast_revenue / 1e9 if metrics else np.nan
@@ -3129,14 +3381,16 @@ def build_scenario_economic_frame(
             ),
             "Year 5 Operating Margin": (
                 metrics.year_5_operating_margin
-                if metrics and metrics.year_5_operating_margin is not None else np.nan
+                if metrics and metrics.year_5_operating_margin is not None
+                else np.nan
             ),
             "Mature Operating Margin": (
                 metrics.mature_operating_margin if metrics else np.nan
             ),
             "Year 5 Sales-to-Capital": (
                 metrics.year_5_sales_to_capital
-                if metrics and metrics.year_5_sales_to_capital is not None else np.nan
+                if metrics and metrics.year_5_sales_to_capital is not None
+                else np.nan
             ),
             "Mature Sales-to-Capital": (
                 metrics.mature_sales_to_capital if metrics else np.nan
@@ -3144,15 +3398,18 @@ def build_scenario_economic_frame(
             "Terminal ROIC": metrics.terminal_roic if metrics else np.nan,
             "Year 5 FCFF Margin": (
                 metrics.year_5_fcff_margin
-                if metrics and metrics.year_5_fcff_margin is not None else np.nan
+                if metrics and metrics.year_5_fcff_margin is not None
+                else np.nan
             ),
             "Final FCFF Margin": (
                 metrics.final_year_fcff_margin
-                if metrics and metrics.final_year_fcff_margin is not None else np.nan
+                if metrics and metrics.final_year_fcff_margin is not None
+                else np.nan
             ),
             "Terminal FCFF / NOPAT": (
                 metrics.terminal_fcff_to_nopat
-                if metrics and metrics.terminal_fcff_to_nopat is not None else np.nan
+                if metrics and metrics.terminal_fcff_to_nopat is not None
+                else np.nan
             ),
         }
     return pd.DataFrame(rows)
@@ -3178,53 +3435,72 @@ def _render_scenario_editor(
         with revenue_column:
             st.markdown("**Revenue path**")
             st.number_input(
-                f"{label} Year 1 Growth (%)", step=0.5,
-                key=keys["year_1_growth"], on_change=callback,
+                f"{label} Year 1 Growth (%)",
+                step=0.5,
+                key=keys["year_1_growth"],
+                on_change=callback,
                 args=callback_args,
             )
             st.number_input(
-                f"{label} Year 2 Growth (%)", step=0.5,
-                key=keys["year_2_growth"], on_change=callback,
+                f"{label} Year 2 Growth (%)",
+                step=0.5,
+                key=keys["year_2_growth"],
+                on_change=callback,
                 args=callback_args,
             )
             st.number_input(
-                f"{label} Year 3 Growth (%)", step=0.5,
-                key=keys["year_3_growth"], on_change=callback,
+                f"{label} Year 3 Growth (%)",
+                step=0.5,
+                key=keys["year_3_growth"],
+                on_change=callback,
                 args=callback_args,
             )
             st.number_input(
-                f"{label} Revenue Fade Years", min_value=0,
+                f"{label} Revenue Fade Years",
+                min_value=0,
                 max_value=max(0, base.forecast_years - base.near_term_years),
-                step=1, key=keys["fade_years"], on_change=callback,
+                step=1,
+                key=keys["fade_years"],
+                on_change=callback,
                 args=callback_args,
             )
             st.number_input(
-                f"{label} Terminal Growth (%)", step=0.1,
-                key=keys["terminal_growth"], on_change=callback,
+                f"{label} Terminal Growth (%)",
+                step=0.1,
+                key=keys["terminal_growth"],
+                on_change=callback,
                 args=callback_args,
             )
         with economics_column:
             st.markdown("**Mature economics / risk**")
             st.number_input(
-                f"{label} Mature Operating Margin (%)", step=0.5,
-                key=keys["mature_margin"], on_change=callback,
+                f"{label} Mature Operating Margin (%)",
+                step=0.5,
+                key=keys["mature_margin"],
+                on_change=callback,
                 args=callback_args,
             )
             st.number_input(
-                f"{label} Mature Sales-to-Capital", step=0.05,
-                key=keys["mature_sales_to_capital"], on_change=callback,
+                f"{label} Mature Sales-to-Capital",
+                step=0.05,
+                key=keys["mature_sales_to_capital"],
+                on_change=callback,
                 args=callback_args,
             )
             st.number_input(
-                f"{label} Research WACC (%)", step=0.1,
-                key=keys["wacc"], on_change=callback,
+                f"{label} Research WACC (%)",
+                step=0.1,
+                key=keys["wacc"],
+                on_change=callback,
                 args=callback_args,
             )
         st.text_area(
             f"{label} rationale (optional, user-authored)",
-            key=keys["rationale"], max_chars=500,
+            key=keys["rationale"],
+            max_chars=500,
             placeholder="Record the economic path represented by this case.",
-            on_change=callback, args=callback_args,
+            on_change=callback,
+            args=callback_args,
         )
 
 
@@ -3241,9 +3517,7 @@ def render_scenario_analysis(
     statement_currency: str | None = "USD",
 ) -> MultiScenarioDCFResult:
     """Render compact scenario editing and comparison around the pure engine."""
-    initialize_scenario_session_state(
-        st.session_state, ticker, base_assumptions
-    )
+    initialize_scenario_session_state(st.session_state, ticker, base_assumptions)
     st.header("Bear / Base / Bull Scenario Analysis")
     st.caption(
         "Base is the current Multi-Stage DCF above. Bear and Bull are explicit "
@@ -3284,12 +3558,8 @@ def render_scenario_analysis(
     with bull_column:
         _render_scenario_editor(ticker, "bull", base_assumptions)
 
-    bear = scenario_case_from_state(
-        st.session_state, ticker, "bear", base_assumptions
-    )
-    bull = scenario_case_from_state(
-        st.session_state, ticker, "bull", base_assumptions
-    )
+    bear = scenario_case_from_state(st.session_state, ticker, "bear", base_assumptions)
+    bull = scenario_case_from_state(st.session_state, ticker, "bull", base_assumptions)
     base = create_scenario_from_base(
         "base", base_assumptions, rationale="Current main Multi-Stage DCF"
     )
@@ -3329,12 +3599,15 @@ def render_scenario_analysis(
             if pd.isna(value):
                 display = "N/A"
             elif row_name in {
-                "Terminal Value / EV", "Research WACC", "Terminal Growth",
+                "Terminal Value / EV",
+                "Research WACC",
+                "Terminal Growth",
                 "Value Delta vs Base (%)",
             }:
                 display = f"{value:.2%}"
             elif row_name in {
-                "Intrinsic Value / Share", "Value Delta vs Base ($)",
+                "Intrinsic Value / Share",
+                "Value Delta vs Base ($)",
             }:
                 display = f"${value:,.2f}"
             else:
@@ -3354,13 +3627,19 @@ def render_scenario_analysis(
         economic = build_scenario_economic_frame(result)
         economic_display = economic.astype(object)
         percentage_rows = {
-            "Y1 Revenue Growth", "Y2 Revenue Growth", "Y3 Revenue Growth",
-            "Year 5 Operating Margin", "Mature Operating Margin",
-            "Terminal ROIC", "Year 5 FCFF Margin", "Final FCFF Margin",
+            "Y1 Revenue Growth",
+            "Y2 Revenue Growth",
+            "Y3 Revenue Growth",
+            "Year 5 Operating Margin",
+            "Mature Operating Margin",
+            "Terminal ROIC",
+            "Year 5 FCFF Margin",
+            "Final FCFF Margin",
             "Terminal FCFF / NOPAT",
         }
         multiple_rows = {
-            "Final / Starting Revenue", "Year 5 Sales-to-Capital",
+            "Final / Starting Revenue",
+            "Year 5 Sales-to-Capital",
             "Mature Sales-to-Capital",
         }
         for row_name in economic.index:
@@ -3385,17 +3664,20 @@ def render_scenario_analysis(
     for scenario in result.scenarios:
         if scenario.dcf_result is not None:
             years = [
-                year.year_index
-                for year in scenario.dcf_result.operating_forecast.years
+                year.year_index for year in scenario.dcf_result.operating_forecast.years
             ]
             revenues = [
                 year.revenue / 1e9
                 for year in scenario.dcf_result.operating_forecast.years
             ]
-            revenue_figure.add_trace(go.Scatter(
-                x=years, y=revenues, mode="lines+markers",
-                name=scenario.name.title(),
-            ))
+            revenue_figure.add_trace(
+                go.Scatter(
+                    x=years,
+                    y=revenues,
+                    mode="lines+markers",
+                    name=scenario.name.title(),
+                )
+            )
         if (
             scenario.metrics is not None
             and scenario.metrics.intrinsic_value_per_share is not None
@@ -3405,14 +3687,18 @@ def render_scenario_analysis(
     chart_columns = st.columns(2)
     with chart_columns[0]:
         revenue_figure.update_layout(
-            title="Scenario Revenue Paths", xaxis_title="Forecast Year",
+            title="Scenario Revenue Paths",
+            xaxis_title="Forecast Year",
             yaxis_title="Revenue (B)",
         )
         st.plotly_chart(revenue_figure, width="stretch")
     with chart_columns[1]:
-        intrinsic_figure = go.Figure(go.Bar(
-            x=intrinsic_names, y=intrinsic_values,
-        ))
+        intrinsic_figure = go.Figure(
+            go.Bar(
+                x=intrinsic_names,
+                y=intrinsic_values,
+            )
+        )
         intrinsic_figure.update_layout(
             title="Intrinsic Value / Share by Scenario",
             yaxis_title="Intrinsic Value / Share",
@@ -3421,13 +3707,15 @@ def render_scenario_analysis(
     return result
 
 
-def render_multistage_dcf_panel(ticker: str,
-                                snapshot: CompanySnapshot | None,
-                                history: FundamentalHistory | None,
-                                wacc_audit: WACCAuditResult | None = None,
-                                *,
-                                header_container=None,
-                                profile_container=None):
+def render_multistage_dcf_panel(
+    ticker: str,
+    snapshot: CompanySnapshot | None,
+    history: FundamentalHistory | None,
+    wacc_audit: WACCAuditResult | None = None,
+    *,
+    header_container=None,
+    profile_container=None,
+):
     """Collect assumptions, call pure engines, and render research diagnostics."""
     st.header("Research Base DCF")
     st.caption(
@@ -3439,17 +3727,17 @@ def render_multistage_dcf_panel(ticker: str,
         "Candidate exists, the finished research view uses that Candidate as its Research Base."
     )
     if snapshot is None or history is None:
-        st.warning("公司快照或基本面历史不可用，暂时无法运行多阶段 DCF。")
+        st.warning(
+            "The company snapshot or fundamental history is unavailable, so the "
+            "multi-stage DCF cannot run."
+        )
         return
 
-    revenue_anchors = build_company_revenue_forecast_anchors(
-        ticker, snapshot, history
-    )
+    revenue_anchors = build_company_revenue_forecast_anchors(ticker, snapshot, history)
 
     initialize_multistage_session_state(st.session_state, ticker, history)
     prefix = f"multistage_{ticker.strip().upper()}_"
     research_keys = research_wacc_session_keys(ticker)
-    provisional_default_wacc = multistage_initial_defaults(ticker, history)["wacc"] / 100
     with st.expander("Manual Base Workspace", expanded=False):
         st.caption(
             "Optional editable workspace. It is not labeled as the Research Candidate "
@@ -3458,41 +3746,83 @@ def render_multistage_dcf_panel(ticker: str,
         revenue_column, margin_column, capital_column, terminal_column = st.columns(4)
         with revenue_column:
             st.markdown("**Revenue Growth**")
-            y1 = st.number_input("Year 1 Growth (%)", step=0.5, key=prefix + "year_1_growth")
+            y1 = st.number_input(
+                "Year 1 Growth (%)", step=0.5, key=prefix + "year_1_growth"
+            )
             if revenue_anchors is not None:
                 point = revenue_anchors.points[0]
                 st.caption(
-                    f"FY consensus anchor：{_diagnostic_display(point.implied_revenue_growth)}"
-                    if point.available else "FY consensus anchor：数据不足"
+                    f"FY consensus anchor: {_diagnostic_display(point.implied_revenue_growth)}"
+                    if point.available
+                    else "FY consensus anchor: N/A"
                 )
-            y2 = st.number_input("Year 2 Growth (%)", step=0.5, key=prefix + "year_2_growth")
+            y2 = st.number_input(
+                "Year 2 Growth (%)", step=0.5, key=prefix + "year_2_growth"
+            )
             if revenue_anchors is not None:
                 point = revenue_anchors.points[1]
                 st.caption(
-                    f"FY consensus anchor：{_diagnostic_display(point.implied_revenue_growth)}"
-                    if point.available else "FY consensus anchor：数据不足"
+                    f"FY consensus anchor: {_diagnostic_display(point.implied_revenue_growth)}"
+                    if point.available
+                    else "FY consensus anchor: N/A"
                 )
-            y3 = st.number_input("Year 3 Growth (%)", step=0.5, key=prefix + "year_3_growth")
+            y3 = st.number_input(
+                "Year 3 Growth (%)", step=0.5, key=prefix + "year_3_growth"
+            )
             if revenue_anchors is not None:
                 point = revenue_anchors.points[2]
                 st.caption(
-                    f"FY consensus anchor：{_diagnostic_display(point.implied_revenue_growth)}"
-                    if point.available else "FY consensus anchor：数据不足"
+                    f"FY consensus anchor: {_diagnostic_display(point.implied_revenue_growth)}"
+                    if point.available
+                    else "FY consensus anchor: N/A"
                 )
-            fade_years = st.number_input("Revenue Fade Years", min_value=0, max_value=17, step=1, key=prefix + "fade_years")
-            forecast_years = st.number_input("Forecast Years", min_value=3, max_value=20, step=1, key=prefix + "forecast_years")
+            fade_years = st.number_input(
+                "Revenue Fade Years",
+                min_value=0,
+                max_value=17,
+                step=1,
+                key=prefix + "fade_years",
+            )
+            forecast_years = st.number_input(
+                "Forecast Years",
+                min_value=3,
+                max_value=20,
+                step=1,
+                key=prefix + "forecast_years",
+            )
         with margin_column:
             st.markdown("**Operating Margin**")
-            starting_margin = st.number_input("Starting Margin (%)", step=0.5, key=prefix + "starting_margin")
-            mature_margin = st.number_input("Mature Margin (%)", step=0.5, key=prefix + "mature_margin")
-            st.caption("起始值仅首次从当前 TTM/年度 Margin 初始化。")
+            starting_margin = st.number_input(
+                "Starting Margin (%)", step=0.5, key=prefix + "starting_margin"
+            )
+            mature_margin = st.number_input(
+                "Mature Margin (%)", step=0.5, key=prefix + "mature_margin"
+            )
+            st.caption(
+                "The starting value is initialized from the latest TTM or annual "
+                "margin only once."
+            )
         with capital_column:
             st.markdown("**Sales-to-Capital**")
-            starting_stc = st.number_input("Starting Sales-to-Capital", step=0.05, key=prefix + "starting_sales_to_capital")
-            mature_stc = st.number_input("Mature Sales-to-Capital", step=0.05, key=prefix + "mature_sales_to_capital")
+            starting_stc = st.number_input(
+                "Starting Sales-to-Capital",
+                step=0.05,
+                key=prefix + "starting_sales_to_capital",
+            )
+            mature_stc = st.number_input(
+                "Mature Sales-to-Capital",
+                step=0.05,
+                key=prefix + "mature_sales_to_capital",
+            )
         with terminal_column:
             st.markdown("**Tax / WACC / Terminal**")
-            tax_rate = st.number_input("Operating Tax Rate (%)", min_value=0.0, max_value=100.0, step=0.5, key=prefix + "tax_rate")
+            tax_rate = st.number_input(
+                "Operating Tax Rate (%)",
+                min_value=0.0,
+                max_value=100.0,
+                step=0.5,
+                key=prefix + "tax_rate",
+            )
             wacc = st.number_input(
                 "Research WACC (%)",
                 step=0.1,
@@ -3518,8 +3848,10 @@ def render_multistage_dcf_panel(ticker: str,
                     f"Risk-free {wacc_audit.risk_free_rate:.2%} · "
                     f"ERP {wacc_audit.equity_risk_premium:.2%}"
                 )
-            terminal_growth = st.number_input("Terminal Growth (%)", step=0.1, key=prefix + "terminal_growth")
-            st.caption("Near-term explicit growth years：固定为 3 年。")
+            terminal_growth = st.number_input(
+                "Terminal Growth (%)", step=0.1, key=prefix + "terminal_growth"
+            )
+            st.caption("Near-term explicit growth years: fixed at three years.")
 
         st.text_area(
             "Research WACC rationale (optional, user-authored)",
@@ -3530,27 +3862,33 @@ def render_multistage_dcf_panel(ticker: str,
 
     try:
         ui_values = {
-            "year_1_growth": y1, "year_2_growth": y2,
-            "year_3_growth": y3, "fade_years": fade_years,
+            "year_1_growth": y1,
+            "year_2_growth": y2,
+            "year_3_growth": y3,
+            "fade_years": fade_years,
             "forecast_years": forecast_years,
             "starting_margin": starting_margin,
             "mature_margin": mature_margin,
             "starting_sales_to_capital": starting_stc,
             "mature_sales_to_capital": mature_stc,
-            "tax_rate": tax_rate, "wacc": wacc,
+            "tax_rate": tax_rate,
+            "wacc": wacc,
             "terminal_growth": terminal_growth,
         }
         assumptions = build_multistage_assumptions_from_ui(ui_values)
         run = run_real_company_multistage_dcf(snapshot, history, assumptions)
         diagnostics = build_assumption_diagnostics(
-            history, run.inputs, assumptions, run.forecast_path,
-            run.operating_forecast, run.terminal_value, run.enterprise_value,
+            history,
+            run.inputs,
+            assumptions,
+            run.forecast_path,
+            run.operating_forecast,
+            run.terminal_value,
+            run.enterprise_value,
         )
-        sensitivity = build_wacc_terminal_growth_sensitivity(
-            run.inputs, assumptions
-        )
+        sensitivity = build_wacc_terminal_growth_sensitivity(run.inputs, assumptions)
     except (TypeError, ValueError) as exc:
-        st.error(f"假设无法运行：{exc}")
+        st.error(f"The current assumptions cannot run: {exc}")
         return
 
     applied_profile = st.session_state.get(base_profile_application_key(ticker))
@@ -3576,7 +3914,7 @@ def render_multistage_dcf_panel(ticker: str,
                     assumptions.wacc,
                 )
                 bottom_up = load_bottom_up_beta_audit(ticker)
-            except Exception:
+            except EXPECTED_DATA_EXCEPTIONS:
                 # Research candidate remains usable with the available Phase 2
                 # evidence; missing diagnostics stay explicitly absent.
                 beta_audit = None
@@ -3591,9 +3929,7 @@ def render_multistage_dcf_panel(ticker: str,
             retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
         )
         profile_lookup = nvda_research.lookup
-        translation = build_multistage_assumptions_from_profile(
-            profile_lookup.profile
-        )
+        translation = build_multistage_assumptions_from_profile(profile_lookup.profile)
         if translation.available and translation.assumptions is not None:
             candidate_run = run_real_company_multistage_dcf(
                 snapshot, history, translation.assumptions
@@ -3613,7 +3949,7 @@ def render_multistage_dcf_panel(ticker: str,
                     assumptions.wacc,
                 )
                 bottom_up = load_bottom_up_beta_audit(ticker)
-            except Exception:
+            except EXPECTED_DATA_EXCEPTIONS:
                 beta_audit = None
                 bottom_up = None
         alphabet_research = build_alphabet_research_profile(
@@ -3626,9 +3962,7 @@ def render_multistage_dcf_panel(ticker: str,
             retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
         )
         profile_lookup = alphabet_research.lookup
-        translation = build_multistage_assumptions_from_profile(
-            profile_lookup.profile
-        )
+        translation = build_multistage_assumptions_from_profile(profile_lookup.profile)
         if translation.available and translation.assumptions is not None:
             candidate_run = run_real_company_multistage_dcf(
                 snapshot, history, translation.assumptions
@@ -3647,9 +3981,7 @@ def render_multistage_dcf_panel(ticker: str,
             retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
         )
         profile_lookup = hyperscaler_research.lookup
-        translation = build_multistage_assumptions_from_profile(
-            profile_lookup.profile
-        )
+        translation = build_multistage_assumptions_from_profile(profile_lookup.profile)
         if translation.available and translation.assumptions is not None:
             candidate_run = run_real_company_multistage_dcf(
                 snapshot, history, translation.assumptions
@@ -3690,9 +4022,7 @@ def render_multistage_dcf_panel(ticker: str,
             retrieved_at=pd.Timestamp.now(tz="UTC").date().isoformat(),
         )
         profile_lookup = unified_research.lookup
-        translation = build_multistage_assumptions_from_profile(
-            profile_lookup.profile
-        )
+        translation = build_multistage_assumptions_from_profile(profile_lookup.profile)
         if translation.available and translation.assumptions is not None:
             candidate_run = run_real_company_multistage_dcf(
                 snapshot, history, translation.assumptions
@@ -3707,8 +4037,11 @@ def render_multistage_dcf_panel(ticker: str,
         )
     profile = profile_lookup.profile if profile_lookup is not None else None
     research_details = (
-        nvda_research or alphabet_research or hyperscaler_research
-        or amazon_research or unified_research
+        nvda_research
+        or alphabet_research
+        or hyperscaler_research
+        or amazon_research
+        or unified_research
     )
     if isinstance(applied_profile, ReviewedProfileApplication):
         if assumptions_match(assumptions, applied_profile.assumptions):
@@ -3735,7 +4068,9 @@ def render_multistage_dcf_panel(ticker: str,
         )
     # The explicit selection above is authoritative; the status renderer uses
     # the same session semantics and should normally return the same source.
-    research_base_source = displayed_source if displayed_source else research_base_source
+    research_base_source = (
+        displayed_source if displayed_source else research_base_source
+    )
     target_header_container = header_container or st.container()
     with target_header_container:
         render_final_company_header(
@@ -3752,8 +4087,13 @@ def render_multistage_dcf_panel(ticker: str,
     run = research_base_run
     assumptions = run.assumptions
     diagnostics = build_assumption_diagnostics(
-        history, run.inputs, assumptions, run.forecast_path,
-        run.operating_forecast, run.terminal_value, run.enterprise_value,
+        history,
+        run.inputs,
+        assumptions,
+        run.forecast_path,
+        run.operating_forecast,
+        run.terminal_value,
+        run.enterprise_value,
     )
     sensitivity = build_wacc_terminal_growth_sensitivity(run.inputs, assumptions)
 
@@ -3761,7 +4101,7 @@ def render_multistage_dcf_panel(ticker: str,
     st.caption(f"Research Base source: {research_base_source}")
     statement_currency = run.inputs.statement_currency
     security_currency = run.inputs.security_currency
-    output_columns = st.columns(6)
+    output_columns = st.columns(3)
     per_share = run.per_share_value
     output_columns[0].metric(
         "Intrinsic Value / Share",
@@ -3770,38 +4110,73 @@ def render_multistage_dcf_panel(ticker: str,
             if per_share and security_currency == "USD"
             else (
                 f"{security_currency} {per_share.intrinsic_value_per_share:.2f}"
-                if per_share and security_currency else "N/A"
+                if per_share and security_currency
+                else "N/A"
             )
         ),
     )
-    output_columns[1].metric("Enterprise Value", _diagnostic_display(run.enterprise_value.enterprise_value, "amount", statement_currency))
-    output_columns[2].metric("Equity Value", _diagnostic_display(run.equity_value.equity_value, "amount", statement_currency))
-    output_columns[3].metric("Explicit Forecast PV", _diagnostic_display(run.enterprise_value.explicit_forecast_pv, "amount", statement_currency))
-    output_columns[4].metric("PV Terminal Value", _diagnostic_display(run.enterprise_value.terminal_value_pv, "amount", statement_currency))
-    output_columns[5].metric("Terminal Value / EV", _diagnostic_display(run.enterprise_value.terminal_value_share))
+    output_columns[1].metric(
+        "Enterprise Value",
+        _diagnostic_display(
+            run.enterprise_value.enterprise_value, "amount", statement_currency
+        ),
+    )
+    output_columns[2].metric(
+        "Equity Value",
+        _diagnostic_display(
+            run.equity_value.equity_value, "amount", statement_currency
+        ),
+    )
+    value_detail_columns = st.columns(3)
+    value_detail_columns[0].metric(
+        "Explicit Forecast PV",
+        _diagnostic_display(
+            run.enterprise_value.explicit_forecast_pv, "amount", statement_currency
+        ),
+    )
+    value_detail_columns[1].metric(
+        "PV Terminal Value",
+        _diagnostic_display(
+            run.enterprise_value.terminal_value_pv, "amount", statement_currency
+        ),
+    )
+    value_detail_columns[2].metric(
+        "Terminal Value / EV",
+        _diagnostic_display(run.enterprise_value.terminal_value_share),
+    )
     shares = run.inputs.normalized_share_count
-    share_period = shares.source_period.date() if shares.source_period is not None else "current metadata"
+    share_period = (
+        shares.source_period.date()
+        if shares.source_period is not None
+        else "current metadata"
+    )
     if not run.per_security_valuation_supported:
-        st.warning(
-            _per_security_unavailable_message(run.per_share_unavailable_reason)
-        )
+        st.warning(_per_security_unavailable_message(run.per_share_unavailable_reason))
         if shares.available:
             st.caption(
-                f"Observed issuer-share denominator："
+                f"Observed issuer-share denominator: "
                 f"{shares.shares_outstanding / 1_000_000_000:.6f}B · "
                 f"{shares.source} · {share_period}; it is not converted to the "
                 "displayed security unit."
             )
     elif shares.available:
         st.caption(
-            f"Per-share denominator：{shares.shares_outstanding / 1_000_000_000:.6f}B shares · "
+            f"Per-share denominator: {shares.shares_outstanding / 1_000_000_000:.6f}B shares · "
             f"{shares.scope} · {shares.source} · {share_period}"
         )
         if "multi_class_issuer" in shares.warnings:
-            st.info("使用合并普通股股数；未对不同投票权类别设置溢价或折价。")
+            st.info(
+                "The denominator uses consolidated common shares; no premium or "
+                "discount is assigned to different voting classes."
+            )
     else:
-        st.warning("合并普通股数不可用；Enterprise Value 与 Equity Value 可用，但不显示每股价值。")
-    st.caption(f"WACC − Terminal Growth：{(assumptions.wacc - assumptions.terminal_growth) * 100:.2f} percentage points")
+        st.warning(
+            "Consolidated common shares are unavailable. Enterprise Value and "
+            "Equity Value remain available, but per-share value is not shown."
+        )
+    st.caption(
+        f"WACC − Terminal Growth: {(assumptions.wacc - assumptions.terminal_growth) * 100:.2f} percentage points"
+    )
     st.markdown("**DCF Value Bridge**")
     bridge_rows = [
         ("Explicit FCFF PV", run.enterprise_value.explicit_forecast_pv),
@@ -3833,13 +4208,13 @@ def render_multistage_dcf_panel(ticker: str,
     if wacc_audit is not None and wacc_audit.available:
         with st.expander("WACC Calculation Details", expanded=False):
             st.markdown(
-                f"CAPM：{wacc_audit.risk_free_rate:.2%} + "
+                f"CAPM: {wacc_audit.risk_free_rate:.2%} + "
                 f"{wacc_audit.beta:.3f} × {wacc_audit.equity_risk_premium:.2%} "
                 f"= **{wacc_audit.cost_of_equity:.2%}**  \n"
-                f"Debt：{wacc_audit.pre_tax_cost_of_debt:.2%} × "
+                f"Debt: {wacc_audit.pre_tax_cost_of_debt:.2%} × "
                 f"(1 − {wacc_audit.tax_rate:.2%}) = "
                 f"**{wacc_audit.after_tax_cost_of_debt:.2%}**  \n"
-                f"WACC：{wacc_audit.equity_weight:.2%} × "
+                f"WACC: {wacc_audit.equity_weight:.2%} × "
                 f"{wacc_audit.cost_of_equity:.2%} + "
                 f"{wacc_audit.debt_weight:.2%} × "
                 f"{wacc_audit.after_tax_cost_of_debt:.2%} = "
@@ -3861,47 +4236,55 @@ def render_multistage_dcf_panel(ticker: str,
                 f"{(assumptions.wacc - wacc_audit.calculated_wacc) * 100:+.2f} pp",
             )
             st.caption(
-                f"Risk-free：{wacc_audit.risk_free_source} · "
+                f"Risk-free: {wacc_audit.risk_free_source} · "
                 f"{wacc_audit.risk_free_period or 'N/A'} | "
-                f"Beta：{wacc_audit.beta_source} · "
+                f"Beta: {wacc_audit.beta_source} · "
                 f"{wacc_audit.beta_observations} observations | "
-                f"ERP：{wacc_audit.erp_source} · {wacc_audit.erp_period or 'N/A'}"
+                f"ERP: {wacc_audit.erp_source} · {wacc_audit.erp_period or 'N/A'}"
             )
             st.caption(
-                f"Equity contribution：{wacc_audit.equity_contribution:.2%} · "
-                f"Debt contribution：{wacc_audit.debt_contribution:.2%} · "
-                f"Market cap：{_diagnostic_display(wacc_audit.market_cap, 'amount', security_currency)} · "
-                f"Gross debt：{_diagnostic_display(wacc_audit.debt_value, 'amount', statement_currency)}"
+                f"Equity contribution: {wacc_audit.equity_contribution:.2%} · "
+                f"Debt contribution: {wacc_audit.debt_contribution:.2%} · "
+                f"Market cap: {_diagnostic_display(wacc_audit.market_cap, 'amount', security_currency)} · "
+                f"Gross debt: {_diagnostic_display(wacc_audit.debt_value, 'amount', statement_currency)}"
             )
             if wacc_audit.fallbacks_used:
-                st.caption("Fallbacks：" + "；".join(wacc_audit.fallbacks_used))
+                st.caption("Fallbacks: " + "; ".join(wacc_audit.fallbacks_used))
             else:
-                st.caption("Fallbacks：none")
+                st.caption("Fallbacks: none")
 
     path_rows = []
     for operating, discounted in zip(
         run.operating_forecast.years, run.discounted_forecast.years
     ):
-        path_rows.append({
-            "Year": operating.year_index, "Stage": operating.stage,
-            "Revenue Growth": operating.revenue_growth,
-            "Revenue (B)": operating.revenue / 1e9,
-            "Operating Margin": operating.operating_margin,
-            "NOPAT (B)": operating.nopat / 1e9,
-            "S/C": operating.sales_to_capital,
-            "Reinvestment (B)": operating.reinvestment / 1e9,
-            "FCFF (B)": operating.fcff / 1e9,
-        })
+        path_rows.append(
+            {
+                "Year": operating.year_index,
+                "Stage": operating.stage,
+                "Revenue Growth": operating.revenue_growth,
+                "Revenue (B)": operating.revenue / 1e9,
+                "Operating Margin": operating.operating_margin,
+                "NOPAT (B)": operating.nopat / 1e9,
+                "S/C": operating.sales_to_capital,
+                "Reinvestment (B)": operating.reinvestment / 1e9,
+                "FCFF (B)": operating.fcff / 1e9,
+            }
+        )
     path_frame = pd.DataFrame(path_rows).set_index("Year")
     st.subheader("Forecast & Assumption Diagnostics")
     with st.expander("Annual Forecast Path", expanded=True):
         st.dataframe(
-            path_frame.style.format({
-                "Revenue Growth": "{:.1%}", "Revenue (B)": "{:.1f}",
-                "Operating Margin": "{:.1%}", "NOPAT (B)": "{:.1f}",
-                "S/C": "{:.2f}x", "Reinvestment (B)": "{:.1f}",
-                "FCFF (B)": "{:.1f}",
-            }),
+            path_frame.style.format(
+                {
+                    "Revenue Growth": "{:.1%}",
+                    "Revenue (B)": "{:.1f}",
+                    "Operating Margin": "{:.1%}",
+                    "NOPAT (B)": "{:.1f}",
+                    "S/C": "{:.2f}x",
+                    "Reinvestment (B)": "{:.1f}",
+                    "FCFF (B)": "{:.1f}",
+                }
+            ),
             width="stretch",
         )
 
@@ -3922,68 +4305,77 @@ def render_multistage_dcf_panel(ticker: str,
         prior_consensus_period = normalized_estimates.latest_actual_fiscal_period
         for dcf_period, estimate in zip(dcf_periods, normalized_estimates.estimates):
             alignment = align_dcf_and_consensus_period(
-                dcf_period, estimate, prior_consensus_period,
+                dcf_period,
+                estimate,
+                prior_consensus_period,
             )
-            point = compare_aligned_forward_estimate(
-                dcf_period, estimate, alignment
-            )
+            point = compare_aligned_forward_estimate(dcf_period, estimate, alignment)
             if estimate.fiscal_period_end is not None:
                 prior_consensus_period = estimate.fiscal_period_end
-            anchor_rows.append({
-                "DCF Year": point.forecast_year_index,
-                "DCF Period": (
-                    f"{alignment.dcf_period_start.date()} → "
-                    f"{alignment.dcf_period_end.date()}"
-                ),
-                "Fiscal Period": (
-                    point.fiscal_period.date() if point.fiscal_period else "N/A"
-                ),
-                "Consensus Revenue (B)": (
-                    point.consensus_revenue / 1e9
-                    if point.consensus_revenue is not None else np.nan
-                ),
-                "Consensus FY Growth": point.consensus_fiscal_growth,
-                "DCF Revenue (B)": point.dcf_revenue / 1e9,
-                "DCF Growth": point.dcf_growth,
-                "Growth Difference (pp)": (
-                    point.assumption_minus_consensus_growth * 100
-                    if point.assumption_minus_consensus_growth is not None
-                    else np.nan
-                ),
-                "Revenue Difference (B)": (
-                    point.dcf_minus_consensus_revenue / 1e9
-                    if point.dcf_minus_consensus_revenue is not None else np.nan
-                ),
-                "Analysts": estimate.analyst_count,
-                "Source": estimate.source,
-                "Provider As-of": (
-                    estimate.source_as_of.date()
-                    if estimate.source_as_of is not None else "N/A"
-                ),
-                "Retrieved At": (
-                    estimate.retrieved_at.date()
-                    if estimate.retrieved_at is not None else "N/A"
-                ),
-                "Overlap": alignment.overlap_fraction,
-                "Alignment": alignment.alignment_status,
-            })
+            anchor_rows.append(
+                {
+                    "DCF Year": point.forecast_year_index,
+                    "DCF Period": (
+                        f"{alignment.dcf_period_start.date()} → "
+                        f"{alignment.dcf_period_end.date()}"
+                    ),
+                    "Fiscal Period": (
+                        point.fiscal_period.date() if point.fiscal_period else "N/A"
+                    ),
+                    "Consensus Revenue (B)": (
+                        point.consensus_revenue / 1e9
+                        if point.consensus_revenue is not None
+                        else np.nan
+                    ),
+                    "Consensus FY Growth": point.consensus_fiscal_growth,
+                    "DCF Revenue (B)": point.dcf_revenue / 1e9,
+                    "DCF Growth": point.dcf_growth,
+                    "Growth Difference (pp)": (
+                        point.assumption_minus_consensus_growth * 100
+                        if point.assumption_minus_consensus_growth is not None
+                        else np.nan
+                    ),
+                    "Revenue Difference (B)": (
+                        point.dcf_minus_consensus_revenue / 1e9
+                        if point.dcf_minus_consensus_revenue is not None
+                        else np.nan
+                    ),
+                    "Analysts": estimate.analyst_count,
+                    "Source": estimate.source,
+                    "Provider As-of": (
+                        estimate.source_as_of.date()
+                        if estimate.source_as_of is not None
+                        else "N/A"
+                    ),
+                    "Retrieved At": (
+                        estimate.retrieved_at.date()
+                        if estimate.retrieved_at is not None
+                        else "N/A"
+                    ),
+                    "Overlap": alignment.overlap_fraction,
+                    "Alignment": alignment.alignment_status,
+                }
+            )
         anchor_frame = pd.DataFrame(anchor_rows).set_index("DCF Year")
         st.dataframe(
-            anchor_frame.style.format({
-                "Consensus Revenue (B)": "{:.3f}",
-                "Consensus FY Growth": "{:.2%}",
-                "DCF Revenue (B)": "{:.3f}",
-                "DCF Growth": "{:.2%}",
-                "Growth Difference (pp)": "{:+.2f}",
-                "Revenue Difference (B)": "{:+.3f}",
-                "Overlap": "{:.1%}",
-            }, na_rep="N/A"),
+            anchor_frame.style.format(
+                {
+                    "Consensus Revenue (B)": "{:.3f}",
+                    "Consensus FY Growth": "{:.2%}",
+                    "DCF Revenue (B)": "{:.3f}",
+                    "DCF Growth": "{:.2%}",
+                    "Growth Difference (pp)": "{:+.2f}",
+                    "Revenue Difference (B)": "{:+.3f}",
+                    "Overlap": "{:.1%}",
+                },
+                na_rep="N/A",
+            ),
             width="stretch",
         )
         with st.expander("Forecast anchor source details", expanded=False):
-            st.write(f"Issuer anchor ticker：{revenue_anchors.issuer_ticker}")
-            st.write(f"Source：{revenue_anchors.source}")
-            st.write("Statistic：mean analyst consensus Revenue")
+            st.write(f"Issuer anchor ticker: {revenue_anchors.issuer_ticker}")
+            st.write(f"Source: {revenue_anchors.source}")
+            st.write("Statistic: mean analyst consensus Revenue")
             for point in revenue_anchors.points:
                 period = point.fiscal_period.date() if point.fiscal_period else "N/A"
                 st.write(
@@ -3992,23 +4384,23 @@ def render_multistage_dcf_panel(ticker: str,
                     f"status: {'available' if point.available else point.reason}"
                 )
             as_of = next(
-                (point.source_as_of for point in revenue_anchors.points if point.source_as_of),
+                (
+                    point.source_as_of
+                    for point in revenue_anchors.points
+                    if point.source_as_of
+                ),
                 None,
             )
-            st.write(f"Retrieved as of：{as_of if as_of is not None else 'N/A'}")
+            st.write(f"Retrieved as of: {as_of if as_of is not None else 'N/A'}")
             if revenue_anchors.warnings:
-                st.write("Warnings：" + ", ".join(revenue_anchors.warnings))
+                st.write("Warnings: " + ", ".join(revenue_anchors.warnings))
 
     render_final_forecast_chart(run, statement_currency)
-    render_final_advanced_diagnostics(
-        diagnostics, assumptions, statement_currency
-    )
+    render_final_advanced_diagnostics(diagnostics, assumptions, statement_currency)
 
     st.subheader("Sensitivity & Scenario Diagnostics")
     render_multistage_sensitivity(run, assumptions, sensitivity)
-    render_scenario_analysis(
-        ticker, history, assumptions, run, statement_currency
-    )
+    render_scenario_analysis(ticker, history, assumptions, run, statement_currency)
 
     reverse_analysis = None
     if profile is None or profile.profile_status == "provisional":
@@ -4048,67 +4440,522 @@ def render_multistage_dcf_panel(ticker: str,
         "reverse_analysis": reverse_analysis,
     }
 
+
 # ================= 4. Streamlit UI =================
-def main():
-    st.set_page_config(page_title="Stock Valuation Research Workstation", layout="wide")
-    st.title("Stock Valuation Research Workstation")
-    st.caption(
-        "Fundamentals → Research Base DCF → Sensitivity → Reverse DCF → Evidence"
+def inject_research_workstation_theme() -> None:
+    """Apply a restrained research-terminal visual system without changing logic."""
+    st.markdown(
+        """
+        <style>
+        :root {
+            --ui-ink: #111b31;
+            --ui-muted: #647087;
+            --ui-blue: #3b82f6;
+            --ui-blue-soft: #eaf2ff;
+            --ui-navy: #0a1733;
+            --ui-navy-soft: #12264d;
+            --ui-cyan: #38bdf8;
+            --ui-border: #dce3ef;
+            --ui-surface: #ffffff;
+            --ui-canvas: #eef2f8;
+        }
+
+        .stApp {
+            background:
+                radial-gradient(
+                    circle at 78% -8%,
+                    rgba(56, 189, 248, 0.14),
+                    transparent 30rem
+                ),
+                var(--ui-canvas);
+            color: var(--ui-ink);
+        }
+
+        .block-container {
+            max-width: 1440px;
+            padding-top: 4.25rem;
+            padding-bottom: 5rem;
+        }
+
+        [data-testid="stSidebar"] {
+            background:
+                radial-gradient(
+                    circle at 10% 8%,
+                    rgba(59, 130, 246, 0.1),
+                    transparent 15rem
+                ),
+                #f4f7fb;
+            border-right: 1px solid #dbe3ef;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+        [data-testid="stSidebar"] label {
+            color: #526074 !important;
+        }
+
+        [data-testid="stSidebar"] h2 {
+            color: var(--ui-ink) !important;
+        }
+
+        [data-testid="stSidebar"] input {
+            color: var(--ui-navy) !important;
+            -webkit-text-fill-color: var(--ui-navy) !important;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+            color: #7a879b !important;
+        }
+
+        [data-testid="stSidebar"] button {
+            color: #526074 !important;
+        }
+
+        h1, h2, h3 {
+            color: var(--ui-ink);
+            letter-spacing: -0.025em;
+        }
+
+        h1 {
+            font-size: clamp(2rem, 3vw, 3.15rem) !important;
+            line-height: 1.04 !important;
+            margin-bottom: 0.35rem !important;
+        }
+
+        h2 {
+            margin-top: 1.4rem !important;
+        }
+
+        .ui-eyebrow {
+            color: #1d64d8;
+            font-size: 0.75rem;
+            font-weight: 750;
+            letter-spacing: 0.16em;
+            margin-bottom: -0.35rem;
+            text-transform: uppercase;
+        }
+
+        .ui-nav {
+            align-items: center;
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid var(--ui-border);
+            border-radius: 16px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.35rem;
+            margin: 1.2rem 0 2.2rem;
+            padding: 0.55rem;
+            position: sticky;
+            top: 2.8rem;
+            z-index: 20;
+            box-shadow: 0 14px 35px rgba(10, 23, 51, 0.14);
+        }
+
+        .ui-nav a {
+            border-radius: 9px;
+            color: #526074 !important;
+            font-size: 0.82rem;
+            font-weight: 650;
+            padding: 0.48rem 0.72rem;
+            text-decoration: none !important;
+        }
+
+        .ui-nav a:hover {
+            background: var(--ui-blue-soft);
+            color: #1d64d8 !important;
+        }
+
+        .st-key-company_hero {
+            background:
+                radial-gradient(
+                    circle at 88% 15%,
+                    rgba(56, 189, 248, 0.16),
+                    transparent 22rem
+                ),
+                linear-gradient(135deg, #ffffff, #edf5ff);
+            border: 1px solid #cfdced;
+            border-radius: 26px;
+            box-shadow: 0 22px 50px rgba(37, 99, 235, 0.11);
+            margin-bottom: 1.25rem;
+            overflow: hidden;
+            padding: clamp(1.4rem, 3vw, 2.4rem);
+        }
+
+        .st-key-company_hero h2,
+        .st-key-company_hero [data-testid="stCaptionContainer"] p {
+            color: var(--ui-ink) !important;
+        }
+
+        .st-key-company_hero h2 {
+            font-size: clamp(2rem, 3.3vw, 3.25rem) !important;
+            margin: 0.15rem 0 1rem !important;
+        }
+
+        .ui-hero-kicker {
+            color: #1d64d8;
+            font-size: 0.72rem;
+            font-weight: 800;
+            letter-spacing: 0.16em;
+            margin: 0;
+            text-transform: uppercase;
+        }
+
+        .st-key-company_hero [data-testid="stMetric"] {
+            background: rgba(255, 255, 255, 0.8);
+            border-color: #d5e0ef;
+            box-shadow: 0 8px 24px rgba(37, 99, 235, 0.06);
+        }
+
+        .st-key-company_hero [data-testid="stMetricLabel"],
+        .st-key-company_hero [data-testid="stMetricValue"] {
+            color: var(--ui-ink);
+        }
+
+        .st-key-valuation_primary [data-testid="stMetric"] {
+            border-top: 2px solid var(--ui-cyan);
+            min-height: 132px;
+        }
+
+        .st-key-valuation_primary [data-testid="stMetricValue"] {
+            font-size: clamp(2rem, 3.1vw, 2.85rem);
+        }
+
+        .st-key-valuation_context [data-testid="stMetric"] {
+            min-height: 94px;
+        }
+
+        .st-key-valuation_context [data-testid="stMetricValue"] {
+            font-size: clamp(1.2rem, 1.7vw, 1.55rem);
+        }
+
+        .st-key-research_profile_panel,
+        .st-key-fundamentals_panel,
+        .st-key-financial_trends_panel,
+        .st-key-dcf_panel,
+        .st-key-evidence_panel,
+        .st-key-limitations_panel,
+        .st-key-health_panel {
+            background: rgba(255, 255, 255, 0.92);
+            border: 1px solid var(--ui-border);
+            border-radius: 22px;
+            box-shadow: 0 12px 32px rgba(23, 32, 51, 0.06);
+            margin-bottom: 1.35rem;
+            padding: clamp(1.1rem, 2.4vw, 2rem);
+        }
+
+        .st-key-research_profile_panel,
+        .st-key-evidence_panel {
+            border-top: 4px solid var(--ui-blue);
+        }
+
+        .st-key-fundamentals_panel,
+        .st-key-health_panel {
+            border-top: 4px solid #0ea5a4;
+        }
+
+        .st-key-dcf_panel {
+            border-top: 4px solid #7c3aed;
+        }
+
+        .st-key-limitations_panel {
+            border-top: 4px solid #d97706;
+        }
+
+        .health-check-card {
+            align-items: center;
+            background: linear-gradient(110deg, #ffffff, #f7fbff);
+            border: 1px solid var(--ui-border);
+            border-left: 4px solid #0ea5a4;
+            border-radius: 16px;
+            box-sizing: border-box;
+            box-shadow: 0 8px 24px rgba(23, 32, 51, 0.04);
+            display: grid;
+            gap: 1rem 1.5rem;
+            grid-template-columns: 1.15fr 1.55fr 2.3fr;
+            height: 166px;
+            margin-top: 0.85rem;
+            padding: 1.15rem 1.3rem;
+        }
+
+        .health-check-summary,
+        .health-check-rule,
+        .health-check-evidence {
+            min-width: 0;
+        }
+
+        .health-check-card h3 {
+            font-size: 1.15rem;
+            line-height: 1.25;
+            margin: 0 0 0.65rem !important;
+        }
+
+        .health-check-status {
+            border-radius: 999px;
+            display: inline-flex;
+            font-size: 0.76rem;
+            font-weight: 750;
+            padding: 0.28rem 0.7rem;
+        }
+
+        .health-check-status--pass {
+            background: #e8f7ef;
+            color: #197044;
+        }
+
+        .health-check-status--review {
+            background: #fff4df;
+            color: #9a5b00;
+        }
+
+        .health-check-status--unknown {
+            background: #eaf2ff;
+            color: #285caa;
+        }
+
+        .health-check-label {
+            color: var(--ui-muted);
+            display: block;
+            font-size: 0.7rem;
+            font-weight: 750;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.42rem;
+            text-transform: uppercase;
+        }
+
+        .health-check-rule code {
+            background: #f0f4f9;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            color: #344258;
+            display: inline-block;
+            font-size: 0.78rem;
+            line-height: 1.45;
+            max-width: 100%;
+            overflow-wrap: anywhere;
+            padding: 0.48rem 0.62rem;
+            white-space: normal;
+        }
+
+        .health-check-evidence p {
+            color: var(--ui-ink);
+            line-height: 1.45;
+            margin: 0 0 0.34rem;
+            overflow-wrap: anywhere;
+        }
+
+        .health-check-evidence small {
+            color: var(--ui-muted);
+            display: block;
+            line-height: 1.35;
+            overflow-wrap: anywhere;
+        }
+
+        [data-testid="stMetric"] {
+            background: var(--ui-surface);
+            border: 1px solid var(--ui-border);
+            border-radius: 14px;
+            min-height: 116px;
+            padding: 1rem 1.05rem;
+            box-shadow: 0 8px 24px rgba(23, 32, 51, 0.035);
+        }
+
+        [data-testid="stMetricLabel"] {
+            color: var(--ui-muted);
+            font-weight: 650;
+        }
+
+        [data-testid="stMetricValue"] {
+            color: var(--ui-ink);
+            font-size: clamp(1.55rem, 2.1vw, 1.85rem);
+            font-variant-numeric: tabular-nums;
+            letter-spacing: -0.035em;
+        }
+
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            background: rgba(255, 255, 255, 0.82);
+            border-color: var(--ui-border) !important;
+            border-radius: 14px !important;
+        }
+
+        [data-testid="stExpander"] {
+            background: rgba(255, 255, 255, 0.74);
+            border-color: var(--ui-border);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        [data-testid="stDataFrame"] {
+            background: var(--ui-surface);
+            border: 1px solid var(--ui-border);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .stButton > button {
+            border-color: #cfd8e7;
+            border-radius: 10px;
+            font-weight: 700;
+            min-height: 2.65rem;
+        }
+
+        .stButton > button[kind="primary"] {
+            background: var(--ui-blue);
+            border-color: var(--ui-blue);
+        }
+
+        [data-testid="stAlert"] {
+            border-radius: 12px;
+        }
+
+        hr {
+            border-color: #e7ebf2 !important;
+            margin: 2.35rem 0 !important;
+        }
+
+        .js-plotly-plot {
+            border: 1px solid var(--ui-border);
+            border-radius: 14px;
+            overflow: hidden;
+        }
+
+        @media (max-width: 900px) {
+            [data-testid="stAppViewContainer"] > .main .block-container {
+                padding-left: 1rem;
+                padding-right: 1rem;
+            }
+            .ui-nav {
+                position: static;
+            }
+            [data-testid="stMetric"] {
+                min-height: 100px;
+            }
+            .health-check-card {
+                align-items: start;
+                grid-template-columns: 1fr;
+                height: auto;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    # 侧边栏：参数输入
+
+def render_section_navigation() -> None:
+    """Provide fast orientation through the long-form research workflow."""
+    st.markdown(
+        """
+        <nav class="ui-nav" aria-label="Research sections">
+            <a href="#key-fundamentals">Fundamentals</a>
+            <a href="#research-base-dcf">DCF</a>
+            <a href="#sensitivity-and-scenario-diagnostics">Sensitivity</a>
+            <a href="#reverse-dcf-market-implied-expectations">Reverse DCF</a>
+            <a href="#evidence-and-research-interpretation">Evidence</a>
+            <a href="#model-limitations">Risks</a>
+        </nav>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Stock Valuation Research Workstation",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    inject_research_workstation_theme()
+    st.markdown(
+        '<p class="ui-eyebrow">Independent equity research</p>',
+        unsafe_allow_html=True,
+    )
+    st.title("Stock Valuation Research Workstation")
+    st.caption(
+        "From operating fundamentals to intrinsic value and market-implied "
+        "expectations."
+    )
+    render_section_navigation()
+
     with st.sidebar:
-        st.header("⚙️ 参数设置")
-        ticker = st.text_input("股票代码 Ticker (如 AAPL, MSFT)", "AAPL").strip().upper()
+        st.header("Research Setup")
+        ticker = (
+            st.text_input(
+                "Ticker",
+                "AAPL",
+                help="Enter a listed ticker such as AAPL, MSFT or NVDA.",
+            )
+            .strip()
+            .upper()
+        )
 
         try:
             snapshot = load_company_snapshot(ticker)
             wacc_reference = fetch_wacc_reference(ticker, snapshot)
             wacc_audit = build_wacc_audit_result(ticker, wacc_reference)
-            annual_financials, quarterly_financials, health_checks = fetch_financial_overview(ticker, snapshot)
+            annual_financials, quarterly_financials, health_checks = (
+                fetch_financial_overview(ticker, snapshot)
+            )
             fundamental_history = build_company_fundamentals(snapshot)
-        except Exception as exc:
+        except (
+            AttributeError,
+            CurlRequestException,
+            IndexError,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            YFException,
+            pd.errors.ParserError,
+            requests.RequestException,
+        ) as exc:
             snapshot = None
             wacc_reference = {"wacc": None, "error": str(exc)}
             wacc_audit = build_wacc_audit_result(ticker, wacc_reference)
-            annual_financials, quarterly_financials, health_checks = pd.DataFrame(), pd.DataFrame(), []
+            annual_financials, quarterly_financials, health_checks = (
+                pd.DataFrame(),
+                pd.DataFrame(),
+                [],
+            )
             fundamental_history = None
-            st.warning("Company data could not be loaded. Valuation is unavailable until the data source recovers.")
+            st.warning(
+                "Company data could not be loaded. Valuation is unavailable until "
+                "the data source recovers."
+            )
             with st.expander("Technical details", expanded=False):
                 st.code(str(exc), language=None)
-        st.caption("Research assumptions and diagnostics are managed on the main page.")
+        st.caption(
+            "Research assumptions and diagnostics are managed in the main workspace."
+        )
 
-    header_slot = st.container()
-    profile_slot = st.container()
+    header_slot = st.container(key="company_overview")
+    profile_slot = st.container(key="research_profile_panel")
     statement_currency = snapshot.financial_currency if snapshot else None
-    st.divider()
-    render_fundamental_quality(
-        ticker, fundamental_history, statement_currency
-    )
-    st.divider()
-    render_financial_trends(
-        ticker,
-        annual_financials,
-        quarterly_financials,
-        statement_currency,
-    )
-    st.divider()
-    context = render_multistage_dcf_panel(
-        ticker,
-        snapshot,
-        fundamental_history,
-        wacc_audit,
-        header_container=header_slot,
-        profile_container=profile_slot,
-    )
-    st.divider()
+    with st.container(key="fundamentals_panel"):
+        render_fundamental_quality(ticker, fundamental_history, statement_currency)
+    with st.container(key="financial_trends_panel"):
+        render_financial_trends(
+            ticker,
+            annual_financials,
+            quarterly_financials,
+            statement_currency,
+        )
+    with st.container(key="dcf_panel"):
+        context = render_multistage_dcf_panel(
+            ticker,
+            snapshot,
+            fundamental_history,
+            wacc_audit,
+            header_container=header_slot,
+            profile_container=profile_slot,
+        )
     profile = context.get("profile") if context else None
     research_details = context.get("research_details") if context else None
-    render_final_evidence(profile, research_details)
-    st.divider()
-    render_final_model_limitations(profile)
-    st.divider()
-    render_health_checks(ticker, health_checks)
+    with st.container(key="evidence_panel"):
+        render_final_evidence(profile, research_details)
+    with st.container(key="limitations_panel"):
+        render_final_model_limitations(profile)
+    with st.container(key="health_panel"):
+        render_health_checks(ticker, health_checks)
+
 
 if __name__ == "__main__":
     main()
