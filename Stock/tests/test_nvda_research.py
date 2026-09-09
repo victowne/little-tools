@@ -417,6 +417,18 @@ def test_revenue_evidence_preserves_periods_dates_and_analyst_counts():
     assert len(result.period_reconciliation) >= 4
 
 
+def test_latest_nvidia_quarter_and_guidance_are_q2_fy27_evidence():
+    profile = research().lookup.profile
+    evidence = {item.evidence_id: item for item in profile.evidence_items}
+
+    assert evidence["q2_fy27_revenue"].value == pytest.approx(96.221e9)
+    assert evidence["q2_fy27_revenue"].period == "quarter ended 2026-07-26"
+    assert evidence["q2_fy27_data_center_revenue"].value == pytest.approx(89e9)
+    assert evidence["q3_fy27_revenue_guidance"].value == pytest.approx(108e9)
+    assert evidence["q3_fy27_gross_margin_guidance"].value == pytest.approx(.74)
+    assert evidence["fabless_and_working_capital"].source_date == "2026-08-26"
+
+
 def test_growth_ranges_are_context_only_and_match_candidate_centers():
     result = research()
     centers = {item.assumption_id: item.central for item in result.growth_ranges}

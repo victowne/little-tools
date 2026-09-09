@@ -39,10 +39,14 @@ from Stock.valuation import MultiStageDCFAssumptions
 from Stock.wacc_audit import WACCAuditResult
 
 
-NVIDIA_Q1_FY27_URL = (
+NVIDIA_Q2_FY27_URL = (
     "https://investor.nvidia.com/news/press-release-details/2026/"
-    "NVIDIA-Announces-Financial-Results-for-First-Quarter-Fiscal-2027/"
+    "NVIDIA-Announces-Financial-Results-for-Second-Quarter-Fiscal-2027/"
     "default.aspx"
+)
+NVIDIA_Q2_FY27_10Q_URL = (
+    "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/"
+    "nvda-20260726.htm"
 )
 NVIDIA_FY26_10K_URL = (
     "https://d18rn0p25nwr6d.cloudfront.net/CIK-0001045810/"
@@ -226,59 +230,58 @@ def _forward_evidence(
 def _dated_external_evidence(retrieved_at: str) -> tuple[ResearchEvidenceItem, ...]:
     return (
         ResearchEvidenceItem(
-            "q1_fy27_revenue", "management_guidance", "Q1 FY2027 Revenue",
-            81.615e9, "currency_amount", "quarter ended 2026-04-26",
-            NVIDIA_Q1_FY27_URL, "2026-05-20", retrieved_at,
-            notes="20% sequential and 85% year-over-year growth.",
+            "q2_fy27_revenue", "historical_financial", "Q2 FY2027 Revenue",
+            96.221e9, "currency_amount", "quarter ended 2026-07-26",
+            NVIDIA_Q2_FY27_URL, "2026-08-26", retrieved_at,
+            notes="Revenue increased 18% sequentially and 106% year over year.",
         ),
         ResearchEvidenceItem(
-            "q2_fy27_revenue_guidance", "management_guidance",
-            "Q2 FY2027 Revenue guidance midpoint", 91.0e9, "currency_amount",
-            "quarter ending July 2026", NVIDIA_Q1_FY27_URL, "2026-05-20",
+            "q2_fy27_data_center_revenue", "historical_financial",
+            "Q2 FY2027 Data Center Revenue", 89.0e9, "currency_amount",
+            "quarter ended 2026-07-26", NVIDIA_Q2_FY27_URL, "2026-08-26",
+            retrieved_at, notes="Data Center Revenue increased 18% sequentially and 117% year over year.",
+        ),
+        ResearchEvidenceItem(
+            "q3_fy27_revenue_guidance", "management_guidance",
+            "Q3 FY2027 Revenue guidance midpoint", 108.0e9, "currency_amount",
+            "quarter ending October 2026", NVIDIA_Q2_FY27_URL, "2026-08-26",
             retrieved_at, notes="Plus or minus 2%; no China Data Center compute Revenue assumed.",
         ),
         ResearchEvidenceItem(
-            "q2_fy27_sequential_growth", "management_guidance",
-            "Q2 FY2027 guidance implied sequential growth",
-            91.0 / 81.615 - 1, "ratio", "Q2 FY2027 vs Q1 FY2027",
-            NVIDIA_Q1_FY27_URL, "2026-05-20", retrieved_at,
+            "q3_fy27_guidance_sequential_growth", "management_guidance",
+            "Q3 FY2027 guidance implied sequential growth",
+            108.0 / 96.221 - 1, "ratio", "Q3 FY2027 vs Q2 FY2027",
+            NVIDIA_Q2_FY27_URL, "2026-08-26", retrieved_at,
         ),
         ResearchEvidenceItem(
-            "q2_fy27_yoy_growth", "management_guidance",
-            "Q2 FY2027 guidance implied year-over-year growth",
-            91.0 / 46.743 - 1, "ratio", "Q2 FY2027 vs Q2 FY2026",
-            NVIDIA_Q1_FY27_URL, "2026-05-20", retrieved_at,
-            notes="Uses the $91B midpoint and NVIDIA-reported Q2 FY2026 Revenue.",
-        ),
-        ResearchEvidenceItem(
-            "q1_fy27_gross_margin", "management_guidance",
-            "Q1 FY2027 GAAP Gross Margin", 0.749, "ratio",
-            "quarter ended 2026-04-26", NVIDIA_Q1_FY27_URL, "2026-05-20",
+            "q2_fy27_gross_margin", "historical_financial",
+            "Q2 FY2027 GAAP Gross Margin", 0.75, "ratio",
+            "quarter ended 2026-07-26", NVIDIA_Q2_FY27_URL, "2026-08-26",
             retrieved_at,
         ),
         ResearchEvidenceItem(
-            "q1_fy27_operating_margin", "historical_financial",
-            "Q1 FY2027 GAAP Operating Margin", 53.536 / 81.615, "ratio",
-            "quarter ended 2026-04-26", NVIDIA_Q1_FY27_URL, "2026-05-20",
+            "q2_fy27_operating_margin", "historical_financial",
+            "Q2 FY2027 GAAP Operating Margin", 63.734 / 96.221, "ratio",
+            "quarter ended 2026-07-26", NVIDIA_Q2_FY27_URL, "2026-08-26",
             retrieved_at, notes="Calculated from reported GAAP operating income and Revenue.",
         ),
         ResearchEvidenceItem(
-            "q2_fy27_gross_margin_guidance", "management_guidance",
-            "Q2 FY2027 GAAP Gross Margin guidance", 0.749, "ratio",
-            "quarter ending July 2026", NVIDIA_Q1_FY27_URL, "2026-05-20",
+            "q3_fy27_gross_margin_guidance", "management_guidance",
+            "Q3 FY2027 GAAP Gross Margin guidance", 0.74, "ratio",
+            "quarter ending October 2026", NVIDIA_Q2_FY27_URL, "2026-08-26",
             retrieved_at, notes="Plus or minus 50 basis points.",
         ),
         ResearchEvidenceItem(
             "fy27_tax_guidance", "management_guidance",
             "FY2027 GAAP tax-rate guidance midpoint", 0.17, "ratio",
-            "FY2027", NVIDIA_Q1_FY27_URL, "2026-05-20", retrieved_at,
+            "FY2027", NVIDIA_Q2_FY27_URL, "2026-08-26", retrieved_at,
             notes="Management range is 16% to 18%, excluding discrete items.",
         ),
         ResearchEvidenceItem(
             "rubin_product_cycle", "company_specific_research",
             "Blackwell-to-Rubin product-cycle evidence",
-            "Blackwell demand remains strong; Vera Rubin platform and networking broaden the ramp.",
-            None, "FY2027 product cycle", NVIDIA_Q1_FY27_URL, "2026-05-20",
+            "Blackwell systems remained the majority of Data Center Revenue; Vera Rubin production shipments began in Q3 FY2027.",
+            None, "FY2027 product cycle", NVIDIA_Q2_FY27_10Q_URL, "2026-08-26",
             retrieved_at,
         ),
         ResearchEvidenceItem(
@@ -323,15 +326,15 @@ def _dated_external_evidence(retrieved_at: str) -> tuple[ResearchEvidenceItem, .
         ResearchEvidenceItem(
             "export_restrictions", "company_specific_research",
             "Export-control exposure",
-            "Q2 FY2027 guidance assumes no China Data Center compute Revenue.",
-            None, "Q2 FY2027 guidance", NVIDIA_Q1_FY27_URL, "2026-05-20",
+            "Q3 FY2027 guidance assumes no China Data Center compute Revenue; Hopper shipments to China were less than 1% of Data Center Revenue in Q2.",
+            None, "Q3 FY2027 guidance", NVIDIA_Q2_FY27_URL, "2026-08-26",
             retrieved_at,
         ),
         ResearchEvidenceItem(
             "fabless_and_working_capital", "historical_financial",
             "Fabless model and working-capital evidence",
-            "NVIDIA is fabless, but inventory and receivables expanded during the systems ramp and supplier commitments remain economically relevant.",
-            None, "FY2026 to Q1 FY2027", NVIDIA_FY26_10K_URL, "2026-02-25",
+            "NVIDIA is fabless, but inventory, receivables and supplier capacity commitments remain economically relevant; commitments were $279B as of July 2026.",
+            None, "Q2 FY2027", NVIDIA_Q2_FY27_10Q_URL, "2026-08-26",
             retrieved_at,
         ),
     )
@@ -375,10 +378,10 @@ def _revenue_rows(
                 point.analyst_count,
                 "Fiscal consensus; period differs from the TTM-based DCF year.",
             ))
-    guidance = next(item for item in external if item.evidence_id == "q2_fy27_revenue_guidance")
+    guidance = next(item for item in external if item.evidence_id == "q3_fy27_revenue_guidance")
     rows.append(RevenueEvidenceRow(
         "Management next-quarter guidance", guidance.period,
-        _finite(guidance.value), 91.0 / 46.743 - 1, guidance.source,
+        _finite(guidance.value), 108.0 / 96.221 - 1, guidance.source,
         guidance.source_date, guidance.retrieved_at,
         notes="Growth is midpoint YoY; do not annualize one quarter.",
     ))
@@ -388,11 +391,11 @@ def _revenue_rows(
             "Historical Revenue CAGR 3Y", cagr.period, None,
             _finite(cagr.value), cagr.source, cagr.source_date, cagr.retrieved_at,
         ))
-    trend = next(item for item in external if item.evidence_id == "q1_fy27_revenue")
+    trend = next(item for item in external if item.evidence_id == "q2_fy27_revenue")
     rows.append(RevenueEvidenceRow(
-        "Latest reported quarter", trend.period, _finite(trend.value), 0.85,
+        "Latest reported quarter", trend.period, _finite(trend.value), 1.06,
         trend.source, trend.source_date, trend.retrieved_at,
-        notes="Reported 20% sequential growth and 85% YoY growth.",
+        notes="Reported 18% sequential growth and 106% YoY growth.",
     ))
     return tuple(rows)
 
@@ -405,7 +408,7 @@ def build_nvda_research_profile(
     wacc_audit: WACCAuditResult | None = None,
     beta_audit: BetaRobustnessAudit | None = None,
     bottom_up_beta: BottomUpBetaResult | None = None,
-    retrieved_at: str = "2026-08-17",
+    retrieved_at: str = "2026-09-09",
 ) -> NVDAResearchProfileResult:
     """Build the unreviewed NVDA candidate without mutating current assumptions."""
     annual_revenue = _latest_annual(
@@ -495,8 +498,8 @@ def build_nvda_research_profile(
 
     y1 = _assumption(
         "year1_growth", 0.60,
-        "A 55% TTM-to-DCF-Year-1 step produces a Revenue level close to the live FY2027 consensus, while recognizing that the DCF year ends three months later; Q1 results and Q2 guidance support a strong near-term run-rate without annualizing one quarter.",
-        ("ttm_revenue", "fy1_consensus_revenue", "q1_fy27_revenue", "q2_fy27_revenue_guidance", "rubin_product_cycle"),
+        "A 60% TTM-to-DCF-Year-1 step produces a Revenue level close to the live FY2027 consensus, while recognizing that the DCF year ends three months later; Q2 results and Q3 guidance support a strong near-term run-rate without annualizing one quarter.",
+        ("ttm_revenue", "fy1_consensus_revenue", "q2_fy27_revenue", "q3_fy27_revenue_guidance", "rubin_product_cycle"),
     )
     y2 = _assumption(
         "year2_growth", 0.45,
@@ -522,12 +525,12 @@ def build_nvda_research_profile(
     starting_margin = _assumption(
         "starting_operating_margin", starting_margin_value,
         "Starting margin is the current validated TTM operating margin, not a research override.",
-        ("ttm_operating_margin", "q1_fy27_operating_margin"),
+        ("ttm_operating_margin", "q2_fy27_operating_margin"),
     )
     mature_margin = _assumption(
         "mature_operating_margin", 0.45,
         "A 45% mature margin preserves durable CUDA/platform and fabless scale economics while allowing substantial normalization from current scarcity pricing and operating leverage as systems mix and competition broaden.",
-        ("ttm_operating_margin", "latest_annual_operating_margin", "q1_fy27_operating_margin", "q2_fy27_gross_margin_guidance", "amd_competition", "custom_silicon_competition"),
+        ("ttm_operating_margin", "latest_annual_operating_margin", "q2_fy27_operating_margin", "q3_fy27_gross_margin_guidance", "amd_competition", "custom_silicon_competition"),
     )
     starting_stc = _assumption(
         "starting_sales_to_capital", 1.35,
@@ -605,7 +608,7 @@ def build_nvda_research_profile(
             historical_gross_margin=_annual_items(history, GROSS_MARGIN, prefix="gross_margin", label="Gross Margin", unit="ratio"),
             starting_operating_margin=starting_margin,
             mature_operating_margin=mature_margin,
-            current_margin_rationale="Current TTM and Q1 FY2027 results show sustained mid-60s operating margin, but scarcity, mix and operating leverage are unusually favorable.",
+            current_margin_rationale="Current TTM and Q2 FY2027 results show sustained mid-60s operating margin, but scarcity, mix and operating leverage are unusually favorable.",
             mature_margin_rationale=mature_margin.rationale,
         ),
         capital_efficiency_framework=CapitalEfficiencyResearchFramework(
