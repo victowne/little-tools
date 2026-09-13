@@ -73,9 +73,9 @@ def test_amd_final_workstation_exposes_candidate_reverse_evidence_and_limitation
     assert "Evidence & Research Interpretation" in headings
     assert "Model Limitations" in headings
     metrics = {item.label: item.value for item in app.metric}
-    assert metrics["Profile State"] == "Research Candidate"
-    assert metrics["Base Source"] == "Research Candidate"
-    assert metrics["Model Risk"] == "High"
+    assert "Profile State" not in metrics
+    assert "Base Source" not in metrics
+    assert "Model Risk" not in metrics
     assert sum(
         item.label == "Review & Apply Research Profile" for item in app.button
     ) == 1

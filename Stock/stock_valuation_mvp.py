@@ -12,6 +12,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 from plotly.subplots import make_subplots
@@ -2753,14 +2754,6 @@ def render_final_company_header(
                 "DCF / Market Price",
                 f"{ratio:.2f}x" if ratio is not None else "N/A",
             )
-        with st.container(key="valuation_context"):
-            secondary_columns = st.columns(3)
-            secondary_columns[0].metric("Profile State", profile_state)
-            secondary_columns[1].metric("Base Source", base_source)
-            secondary_columns[2].metric(
-                "Model Risk",
-                profile.model_risk if profile and profile.model_risk else "N/A",
-            )
         st.caption(
             "Valuation gap is a neutral research diagnostic, not a recommendation "
             "or trading signal."
@@ -3705,6 +3698,8 @@ def render_multistage_dcf_panel(
     *,
     header_container=None,
     profile_container=None,
+    sensitivity_container=None,
+    reverse_container=None,
 ):
     """Collect assumptions, call pure engines, and render research diagnostics."""
     st.header("Research Base DCF")
@@ -4313,36 +4308,40 @@ def render_multistage_dcf_panel(
     render_final_forecast_chart(run, statement_currency)
     render_final_advanced_diagnostics(diagnostics, assumptions, statement_currency)
 
-    st.subheader("Sensitivity & Scenario Diagnostics")
-    render_multistage_sensitivity(run, assumptions, sensitivity)
-    render_scenario_analysis(ticker, history, assumptions, run, statement_currency)
+    with sensitivity_container or st.container():
+        with st.container(key="sensitivity_panel"):
+            st.header("Sensitivity & Scenario Diagnostics")
+            render_multistage_sensitivity(run, assumptions, sensitivity)
+            render_scenario_analysis(ticker, history, assumptions, run, statement_currency)
 
     reverse_analysis = None
-    if profile is None or profile.profile_status == "provisional":
-        st.header("Reverse DCF — Market-Implied Expectations")
-        st.info(
-            "Reverse DCF is unavailable because this ticker does not have a "
-            "researched Company Profile. The Manual Base remains available above."
-        )
-    else:
-        reverse_ranges = research_ranges_from_profile(profile)
-        range_items = tuple(
-            (variable, research_range.lower, research_range.upper)
-            for variable, research_range in sorted(reverse_ranges.items())
-        )
-        reverse_analysis = calculate_reverse_dcf_cached(
-            run.inputs,
-            assumptions,
-            snapshot.price,
-            ticker,
-            research_base_source,
-            range_items,
-        )
-        render_reverse_dcf(
-            reverse_analysis,
-            model_risk=profile.model_risk if profile is not None else None,
-            limitations=FINAL_MODEL_LIMITATIONS.get(ticker.strip().upper(), ()),
-        )
+    with reverse_container or st.container():
+        with st.container(key="reverse_dcf_panel"):
+            if profile is None or profile.profile_status == "provisional":
+                st.header("Reverse DCF — Market-Implied Expectations")
+                st.info(
+                    "Reverse DCF is unavailable because this ticker does not have a "
+                    "researched Company Profile. The Manual Base remains available above."
+                )
+            else:
+                reverse_ranges = research_ranges_from_profile(profile)
+                range_items = tuple(
+                    (variable, research_range.lower, research_range.upper)
+                    for variable, research_range in sorted(reverse_ranges.items())
+                )
+                reverse_analysis = calculate_reverse_dcf_cached(
+                    run.inputs,
+                    assumptions,
+                    snapshot.price,
+                    ticker,
+                    research_base_source,
+                    range_items,
+                )
+                render_reverse_dcf(
+                    reverse_analysis,
+                    model_risk=profile.model_risk if profile is not None else None,
+                    limitations=FINAL_MODEL_LIMITATIONS.get(ticker.strip().upper(), ()),
+                )
     return {
         "profile": (
             profile
@@ -4450,18 +4449,15 @@ def inject_research_workstation_theme() -> None:
         }
 
         .ui-nav {
-            align-items: center;
+            align-items: stretch;
             background: rgba(255, 255, 255, 0.9);
             border: 1px solid var(--ui-border);
             border-radius: 16px;
             display: flex;
-            flex-wrap: wrap;
+            flex-direction: column;
             gap: 0.35rem;
-            margin: 1.2rem 0 2.2rem;
+            margin: 1rem 0;
             padding: 0.55rem;
-            position: sticky;
-            top: 2.8rem;
-            z-index: 20;
             box-shadow: 0 14px 35px rgba(10, 23, 51, 0.14);
         }
 
@@ -4475,6 +4471,24 @@ def inject_research_workstation_theme() -> None:
         }
 
         .ui-nav a:hover {
+            background: var(--ui-blue-soft);
+            color: #1d64d8 !important;
+        }
+
+
+        .ui-nav a:focus-visible {
+            outline: 2px solid #1d64d8;
+            outline-offset: 2px;
+        }
+
+        #key-fundamentals, #research-base-dcf,
+        #sensitivity-and-scenario-diagnostics,
+        #reverse-dcf-market-implied-expectations,
+        #evidence-and-research-interpretation, #model-limitations {
+            scroll-margin-top: 110px;
+        }
+
+        .ui-nav a[aria-current="location"] {
             background: var(--ui-blue-soft);
             color: #1d64d8 !important;
         }
@@ -4544,8 +4558,9 @@ def inject_research_workstation_theme() -> None:
 
         .st-key-research_profile_panel,
         .st-key-fundamentals_panel,
-        .st-key-financial_trends_panel,
         .st-key-dcf_panel,
+        .st-key-sensitivity_panel,
+        .st-key-reverse_dcf_panel,
         .st-key-evidence_panel,
         .st-key-limitations_panel,
         .st-key-health_panel {
@@ -4557,19 +4572,22 @@ def inject_research_workstation_theme() -> None:
             padding: clamp(1.1rem, 2.4vw, 2rem);
         }
 
-        .st-key-research_profile_panel,
-        .st-key-evidence_panel {
+        .st-key-research_profile_panel {
             border-top: 4px solid var(--ui-blue);
         }
 
-        .st-key-fundamentals_panel,
-        .st-key-health_panel {
+        .st-key-fundamentals_panel {
             border-top: 4px solid #0ea5a4;
         }
 
         .st-key-dcf_panel {
             border-top: 4px solid #7c3aed;
         }
+
+        .st-key-sensitivity_panel { border-top: 4px solid #db2777; }
+        .st-key-reverse_dcf_panel { border-top: 4px solid #0891b2; }
+        .st-key-evidence_panel { border-top: 4px solid #64748b; }
+        .st-key-health_panel { border-top: 4px solid #16a34a; }
 
         .st-key-limitations_panel {
             border-top: 4px solid #d97706;
@@ -4579,7 +4597,7 @@ def inject_research_workstation_theme() -> None:
             align-items: center;
             background: linear-gradient(110deg, #ffffff, #f7fbff);
             border: 1px solid var(--ui-border);
-            border-left: 4px solid #0ea5a4;
+            border-left: 4px solid #16a34a;
             border-radius: 16px;
             box-sizing: border-box;
             box-shadow: 0 8px 24px rgba(23, 32, 51, 0.04);
@@ -4760,15 +4778,68 @@ def render_section_navigation() -> None:
     st.markdown(
         """
         <nav class="ui-nav" aria-label="Research sections">
-            <a href="#key-fundamentals">Fundamentals</a>
-            <a href="#research-base-dcf">DCF</a>
-            <a href="#sensitivity-and-scenario-diagnostics">Sensitivity</a>
-            <a href="#reverse-dcf-market-implied-expectations">Reverse DCF</a>
-            <a href="#evidence-and-research-interpretation">Evidence</a>
-            <a href="#model-limitations">Risks</a>
+            <a target="_self" href="#key-fundamentals">Fundamentals</a>
+            <a target="_self" href="#research-base-dcf">DCF</a>
+            <a target="_self" href="#sensitivity-and-scenario-diagnostics">Sensitivity</a>
+            <a target="_self" href="#reverse-dcf-market-implied-expectations">Reverse DCF</a>
+            <a target="_self" href="#evidence-and-research-interpretation">Evidence</a>
+            <a target="_self" href="#model-limitations">Risks</a>
         </nav>
         """,
         unsafe_allow_html=True,
+    )
+
+
+def enable_section_scroll_tracking() -> None:
+    """Highlight sidebar anchors without changing history or financial state."""
+    components.html(
+        """
+        <script>
+        (() => {
+            const host = window.parent;
+            const doc = host.document;
+            const cleanupKey = '__researchNavigationCleanup';
+            if (host[cleanupKey]) host[cleanupKey]();
+            let frame = 0;
+            const update = () => {
+                frame = 0;
+                const links = [...doc.querySelectorAll('.ui-nav a')];
+                let active = null;
+                for (const link of links) {
+                    const section = doc.getElementById(link.hash.slice(1));
+                    if (section && section.getBoundingClientRect().top <= 160) {
+                        active = link;
+                    }
+                }
+                for (const link of links) {
+                    if (link === active) link.setAttribute('aria-current', 'location');
+                    else link.removeAttribute('aria-current');
+                }
+            };
+            const schedule = () => {
+                if (!frame) frame = host.requestAnimationFrame(update);
+            };
+            doc.addEventListener('scroll', schedule, true);
+            host.addEventListener('resize', schedule);
+            host.addEventListener('hashchange', schedule);
+            // Streamlit reruns and expanded details can move section boundaries.
+            const observer = new MutationObserver(schedule);
+            observer.observe(doc.body, {childList: true, subtree: true});
+            const cleanup = () => {
+                doc.removeEventListener('scroll', schedule, true);
+                host.removeEventListener('resize', schedule);
+                host.removeEventListener('hashchange', schedule);
+                observer.disconnect();
+                host.cancelAnimationFrame(frame);
+                if (host[cleanupKey] === cleanup) delete host[cleanupKey];
+            };
+            host[cleanupKey] = cleanup;
+            window.addEventListener('pagehide', cleanup, {once: true});
+            schedule();
+        })();
+        </script>
+        """,
+        height=0,
     )
 
 
@@ -4788,19 +4859,17 @@ def main() -> None:
         "From operating fundamentals to intrinsic value and market-implied "
         "expectations."
     )
-    render_section_navigation()
-
     with st.sidebar:
-        st.header("Research Setup")
         ticker = (
             st.text_input(
                 "Ticker",
-                "AAPL",
+                "NVDA",
                 help="Enter a listed ticker such as AAPL, MSFT or NVDA.",
             )
             .strip()
             .upper()
         )
+        render_section_navigation()
 
         try:
             snapshot = load_company_snapshot(ticker)
@@ -4846,14 +4915,16 @@ def main() -> None:
     statement_currency = snapshot.financial_currency if snapshot else None
     with st.container(key="fundamentals_panel"):
         render_fundamental_quality(ticker, fundamental_history, statement_currency)
-    with st.container(key="financial_trends_panel"):
         render_financial_trends(
             ticker,
             annual_financials,
             quarterly_financials,
             statement_currency,
         )
-    with st.container(key="dcf_panel"):
+    dcf_slot = st.container(key="dcf_panel")
+    sensitivity_slot = st.container()
+    reverse_slot = st.container()
+    with dcf_slot:
         context = render_multistage_dcf_panel(
             ticker,
             snapshot,
@@ -4861,6 +4932,8 @@ def main() -> None:
             wacc_audit,
             header_container=header_slot,
             profile_container=profile_slot,
+            sensitivity_container=sensitivity_slot,
+            reverse_container=reverse_slot,
         )
     profile = context.get("profile") if context else None
     research_details = context.get("research_details") if context else None
@@ -4870,6 +4943,7 @@ def main() -> None:
         render_final_model_limitations(profile)
     with st.container(key="health_panel"):
         render_health_checks(ticker, health_checks)
+    enable_section_scroll_tracking()
 
 
 if __name__ == "__main__":

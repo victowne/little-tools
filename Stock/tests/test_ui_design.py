@@ -15,6 +15,10 @@ def test_research_theme_and_navigation_render() -> None:
     assert "--ui-canvas: #eef2f8" in markup
     assert 'class="ui-nav"' in markup
     assert "Reverse DCF" in markup
+    sidebar_markup = " ".join(str(item.value) for item in app.sidebar.markdown)
+    assert 'aria-label="Research sections"' in sidebar_markup
+    assert 'target="_self" href="#sensitivity-and-scenario-diagnostics"' in sidebar_markup
+    assert not any('class="ui-nav"' in str(item.value) for item in app.main.markdown)
 
 
 def test_health_checks_render_as_three_vertical_cards() -> None:
