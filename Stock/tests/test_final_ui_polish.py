@@ -72,10 +72,10 @@ def test_amd_final_workstation_exposes_candidate_reverse_evidence_and_limitation
     assert "Reverse DCF — Market-Implied Expectations" in headings
     assert "Evidence & Research Interpretation" in headings
     assert "Model Limitations" in headings
-    metrics = {item.label: item.value for item in app.metric}
-    assert metrics["Profile State"] == "Research Candidate"
-    assert metrics["Base Source"] == "Research Candidate"
-    assert metrics["Model Risk"] == "High"
+    context = " ".join(str(item.value) for item in app.markdown)
+    assert "Profile <strong>Research Candidate</strong>" in context
+    assert "Base source <strong>Research Candidate</strong>" in context
+    assert "Model risk <strong>High</strong>" in context
     assert sum(
         item.label == "Review & Apply Research Profile" for item in app.button
     ) == 1

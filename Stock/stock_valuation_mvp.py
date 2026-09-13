@@ -1,7 +1,7 @@
 import logging
 import re
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from html import escape
 from io import StringIO
@@ -1600,7 +1600,7 @@ def render_fundamental_quality(
     ]
     for start in range(0, len(annual_metrics), 4):
         batch = annual_metrics[start : start + 4]
-        columns = st.columns(len(batch))
+        columns = st.columns(4)
         for column, (label, metric, kind) in zip(columns, batch):
             column.metric(label, display_value(metric, kind))
 
@@ -1747,7 +1747,13 @@ def render_fundamental_quality(
             height=max(340, rows * 280),
             showlegend=False,
             margin={"t": 70, "b": 30},
+            font={"family": "Segoe UI, sans-serif", "color": "#243247", "size": 13},
+            paper_bgcolor="#FFFFFF",
+            plot_bgcolor="#FFFFFF",
         )
+        figure.update_traces(line={"color": "#2864C5", "width": 2})
+        figure.update_xaxes(showgrid=False, zeroline=False)
+        figure.update_yaxes(gridcolor="#E8EDF3", zeroline=False)
         st.plotly_chart(figure, width="stretch")
 
     st.caption(
@@ -2735,11 +2741,15 @@ def render_final_company_header(
     price = snapshot.price
     ratio = dcf_value / price if dcf_value is not None and price and price > 0 else None
     with st.container(key="company_hero"):
+        st.header(f"{name} · {ticker}", anchor="overview")
+        risk = profile.model_risk if profile and profile.model_risk else "N/A"
         st.markdown(
-            '<p class="ui-hero-kicker">Valuation snapshot · live market context</p>',
+            '<div class="research-context">'
+            f"<span>Profile <strong>{escape(profile_state)}</strong></span>"
+            f"<span>Base source <strong>{escape(base_source)}</strong></span>"
+            f"<span>Model risk <strong>{escape(risk)}</strong></span></div>",
             unsafe_allow_html=True,
         )
-        st.header(f"{name} · {ticker}")
         with st.container(key="valuation_primary"):
             primary_columns = st.columns(3)
             primary_columns[0].metric(
@@ -2752,14 +2762,6 @@ def render_final_company_header(
             primary_columns[2].metric(
                 "DCF / Market Price",
                 f"{ratio:.2f}x" if ratio is not None else "N/A",
-            )
-        with st.container(key="valuation_context"):
-            secondary_columns = st.columns(3)
-            secondary_columns[0].metric("Profile State", profile_state)
-            secondary_columns[1].metric("Base Source", base_source)
-            secondary_columns[2].metric(
-                "Model Risk",
-                profile.model_risk if profile and profile.model_risk else "N/A",
             )
         st.caption(
             "Valuation gap is a neutral research diagnostic, not a recommendation "
@@ -4376,13 +4378,7 @@ def inject_research_workstation_theme() -> None:
         }
 
         .stApp {
-            background:
-                radial-gradient(
-                    circle at 78% -8%,
-                    rgba(56, 189, 248, 0.14),
-                    transparent 30rem
-                ),
-                var(--ui-canvas);
+            background: #F5F7FA;
             color: var(--ui-ink);
         }
 
@@ -4393,14 +4389,9 @@ def inject_research_workstation_theme() -> None:
         }
 
         [data-testid="stSidebar"] {
-            background:
-                radial-gradient(
-                    circle at 10% 8%,
-                    rgba(59, 130, 246, 0.1),
-                    transparent 15rem
-                ),
-                #f4f7fb;
-            border-right: 1px solid #dbe3ef;
+            background: #F5F7FA;
+            border-right: 1px solid #DCE3EB;
+            font-family: "Segoe UI", sans-serif;
         }
 
         [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
@@ -4409,7 +4400,8 @@ def inject_research_workstation_theme() -> None:
         }
 
         [data-testid="stSidebar"] h2 {
-            color: var(--ui-ink) !important;
+            color: #243247 !important;
+            font-size: 22px;
         }
 
         [data-testid="stSidebar"] input {
@@ -4440,106 +4432,110 @@ def inject_research_workstation_theme() -> None:
             margin-top: 1.4rem !important;
         }
 
-        .ui-eyebrow {
-            color: #1d64d8;
-            font-size: 0.75rem;
-            font-weight: 750;
-            letter-spacing: 0.16em;
-            margin-bottom: -0.35rem;
-            text-transform: uppercase;
-        }
-
         .ui-nav {
-            align-items: center;
-            background: rgba(255, 255, 255, 0.9);
-            border: 1px solid var(--ui-border);
-            border-radius: 16px;
             display: flex;
-            flex-wrap: wrap;
-            gap: 0.35rem;
-            margin: 1.2rem 0 2.2rem;
-            padding: 0.55rem;
-            position: sticky;
-            top: 2.8rem;
-            z-index: 20;
-            box-shadow: 0 14px 35px rgba(10, 23, 51, 0.14);
+            flex-direction: column;
+            gap: 0.2rem;
+            padding: 1rem 0;
+            border-top: 1px solid #DCE3EB;
+            margin-top: 0.8rem;
         }
 
         .ui-nav a {
-            border-radius: 9px;
-            color: #526074 !important;
-            font-size: 0.82rem;
-            font-weight: 650;
-            padding: 0.48rem 0.72rem;
+            border-radius: 6px;
+            border-left: 3px solid transparent;
+            color: #5E6D80 !important;
+            font-size: 0.9rem;
+            padding: 0.55rem 0.7rem;
             text-decoration: none !important;
         }
 
         .ui-nav a:hover {
-            background: var(--ui-blue-soft);
-            color: #1d64d8 !important;
+            background: #edf2f8;
+            color: #2864C5 !important;
+        }
+
+        .ui-nav a:focus-visible {
+            outline: 2px solid #2864C5;
+            outline-offset: 2px;
+        }
+
+        body:has(:target[id="overview"]) .ui-nav a[href="#overview"],
+        body:has(:target[id="research-profile"]) .ui-nav a[href="#research-profile"],
+        body:has(:target[id="key-fundamentals"]) .ui-nav a[href="#key-fundamentals"],
+        body:has(:target[id="research-base-dcf"]) .ui-nav a[href="#research-base-dcf"],
+        body:has(:target[id="sensitivity-and-scenario-diagnostics"]) .ui-nav a[href="#sensitivity-and-scenario-diagnostics"],
+        body:has(:target[id="reverse-dcf-market-implied-expectations"]) .ui-nav a[href="#reverse-dcf-market-implied-expectations"],
+        body:has(:target[id="evidence-and-research-interpretation"]) .ui-nav a[href="#evidence-and-research-interpretation"],
+        body:has(:target[id="model-limitations"]) .ui-nav a[href="#model-limitations"],
+        body:has(:target[id="operating-health-checks"]) .ui-nav a[href="#operating-health-checks"] {
+            background: #e8eff9;
+            border-left-color: #2864C5;
+            color: #2864C5 !important;
+            font-weight: 600;
         }
 
         .st-key-company_hero {
-            background:
-                radial-gradient(
-                    circle at 88% 15%,
-                    rgba(56, 189, 248, 0.16),
-                    transparent 22rem
-                ),
-                linear-gradient(135deg, #ffffff, #edf5ff);
-            border: 1px solid #cfdced;
-            border-radius: 26px;
-            box-shadow: 0 22px 50px rgba(37, 99, 235, 0.11);
+            background: #FFFFFF;
+            border: 1px solid #DCE3EB;
+            border-radius: 12px;
+            padding: clamp(1.2rem, 3vw, 2rem);
             margin-bottom: 1.25rem;
-            overflow: hidden;
-            padding: clamp(1.4rem, 3vw, 2.4rem);
-        }
-
-        .st-key-company_hero h2,
-        .st-key-company_hero [data-testid="stCaptionContainer"] p {
-            color: var(--ui-ink) !important;
+            color: #243247;
+            font-family: "Segoe UI", sans-serif;
         }
 
         .st-key-company_hero h2 {
-            font-size: clamp(2rem, 3.3vw, 3.25rem) !important;
-            margin: 0.15rem 0 1rem !important;
+            color: #243247;
+            font-size: 32px !important;
+            font-weight: 650;
+            margin: 0 !important;
+            overflow-wrap: anywhere;
         }
 
-        .ui-hero-kicker {
-            color: #1d64d8;
-            font-size: 0.72rem;
-            font-weight: 800;
-            letter-spacing: 0.16em;
-            margin: 0;
-            text-transform: uppercase;
+        .research-context {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem 1.4rem;
+            color: #5E6D80;
+            font-size: 13px;
+            margin: 0.25rem 0 1.2rem;
         }
 
-        .st-key-company_hero [data-testid="stMetric"] {
-            background: rgba(255, 255, 255, 0.8);
-            border-color: #d5e0ef;
-            box-shadow: 0 8px 24px rgba(37, 99, 235, 0.06);
+        .research-context strong {
+            color: #243247;
+            font-weight: 600;
+            margin-left: 0.3rem;
+        }
+
+        .st-key-company_hero [data-testid="stMetric"],
+        .st-key-fundamentals_panel [data-testid="stMetric"] {
+            background: transparent;
+            border: 0;
+            border-top: 1px solid #DCE3EB;
+            border-radius: 0;
+            box-shadow: none;
+            min-height: 0;
+            padding: 1rem 0 0.5rem;
+        }
+
+        .st-key-company_hero [data-testid="stMetricValue"] {
+            font-size: 32px;
+            color: #243247;
+            font-weight: 600;
         }
 
         .st-key-company_hero [data-testid="stMetricLabel"],
-        .st-key-company_hero [data-testid="stMetricValue"] {
-            color: var(--ui-ink);
+        .st-key-fundamentals_panel [data-testid="stMetricLabel"] {
+            color: #5E6D80;
+            font-size: 13px;
         }
 
-        .st-key-valuation_primary [data-testid="stMetric"] {
-            border-top: 2px solid var(--ui-cyan);
-            min-height: 132px;
-        }
-
-        .st-key-valuation_primary [data-testid="stMetricValue"] {
-            font-size: clamp(2rem, 3.1vw, 2.85rem);
-        }
-
-        .st-key-valuation_context [data-testid="stMetric"] {
-            min-height: 94px;
-        }
-
-        .st-key-valuation_context [data-testid="stMetricValue"] {
-            font-size: clamp(1.2rem, 1.7vw, 1.55rem);
+        .st-key-company_hero [data-testid="stMetricValue"],
+        .st-key-fundamentals_panel [data-testid="stMetricValue"] {
+            font-variant-numeric: tabular-nums;
+            white-space: normal;
+            overflow-wrap: anywhere;
         }
 
         .st-key-research_profile_panel,
@@ -4732,6 +4728,80 @@ def inject_research_workstation_theme() -> None:
             overflow: hidden;
         }
 
+        .st-key-fundamentals_panel {
+            background: #FFFFFF;
+            border: 1px solid #DCE3EB;
+            border-radius: 12px;
+            box-shadow: none;
+            font-family: "Segoe UI", sans-serif;
+            color: #243247;
+        }
+
+        .st-key-fundamentals_panel h2 {
+            color: #243247;
+            font-size: 22px;
+            margin-top: 0 !important;
+        }
+
+        .st-key-fundamentals_panel h3 {
+            color: #243247;
+            font-size: 18px;
+            margin-top: 1.3rem;
+        }
+
+        .st-key-fundamentals_panel [data-testid="stMetricValue"] {
+            color: #243247;
+            font-size: 25px;
+            font-weight: 600;
+        }
+
+        .st-key-fundamentals_panel [data-testid="stCaptionContainer"] p,
+        .st-key-company_hero [data-testid="stCaptionContainer"] p {
+            color: #5E6D80;
+            font-size: 13px;
+            max-width: 78ch;
+        }
+
+        .st-key-fundamentals_panel [data-testid="stCaptionContainer"],
+        .st-key-company_hero [data-testid="stCaptionContainer"],
+        [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+            opacity: 1;
+        }
+
+        .st-key-fundamentals_panel .js-plotly-plot {
+            border: 0;
+            border-radius: 0;
+        }
+
+        @media (min-width: 769px) {
+            [data-testid="stSidebar"] {
+                width: 240px !important;
+                min-width: 240px !important;
+                max-width: 240px !important;
+            }
+        }
+
+        @media (max-width: 1100px) {
+            .st-key-fundamentals_panel [data-testid="stHorizontalBlock"] {
+                flex-wrap: wrap;
+            }
+            .st-key-fundamentals_panel [data-testid="stColumn"] {
+                min-width: min(100%, 180px);
+                flex: 1 1 40%;
+            }
+        }
+
+        @media (max-width: 640px) {
+            .st-key-company_hero [data-testid="stHorizontalBlock"] {
+                flex-wrap: wrap;
+            }
+            .st-key-company_hero [data-testid="stColumn"],
+            .st-key-fundamentals_panel [data-testid="stColumn"] {
+                min-width: 100%;
+                flex: 1 1 100%;
+            }
+        }
+
         @media (max-width: 900px) {
             [data-testid="stAppViewContainer"] > .main .block-container {
                 padding-left: 1rem;
@@ -4760,12 +4830,15 @@ def render_section_navigation() -> None:
     st.markdown(
         """
         <nav class="ui-nav" aria-label="Research sections">
-            <a href="#key-fundamentals">Fundamentals</a>
-            <a href="#research-base-dcf">DCF</a>
-            <a href="#sensitivity-and-scenario-diagnostics">Sensitivity</a>
-            <a href="#reverse-dcf-market-implied-expectations">Reverse DCF</a>
-            <a href="#evidence-and-research-interpretation">Evidence</a>
-            <a href="#model-limitations">Risks</a>
+            <a href="#overview" target="_self">Overview</a>
+            <a href="#research-profile" target="_self">Research Profile</a>
+            <a href="#key-fundamentals" target="_self">Fundamentals</a>
+            <a href="#research-base-dcf" target="_self">DCF</a>
+            <a href="#sensitivity-and-scenario-diagnostics" target="_self">Sensitivity</a>
+            <a href="#reverse-dcf-market-implied-expectations" target="_self">Reverse DCF</a>
+            <a href="#evidence-and-research-interpretation" target="_self">Evidence</a>
+            <a href="#model-limitations" target="_self">Risks</a>
+            <a href="#operating-health-checks" target="_self">Health Checks</a>
         </nav>
         """,
         unsafe_allow_html=True,
@@ -4776,22 +4849,13 @@ def main() -> None:
     st.set_page_config(
         page_title="Stock Valuation Research Workstation",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="auto",
     )
     inject_research_workstation_theme()
-    st.markdown(
-        '<p class="ui-eyebrow">Independent equity research</p>',
-        unsafe_allow_html=True,
-    )
-    st.title("Stock Valuation Research Workstation")
-    st.caption(
-        "From operating fundamentals to intrinsic value and market-implied "
-        "expectations."
-    )
-    render_section_navigation()
 
     with st.sidebar:
-        st.header("Research Setup")
+        st.header("Stock Research")
+        st.caption("Company valuation workspace")
         ticker = (
             st.text_input(
                 "Ticker",
@@ -4801,6 +4865,8 @@ def main() -> None:
             .strip()
             .upper()
         )
+
+        render_section_navigation()
 
         try:
             snapshot = load_company_snapshot(ticker)

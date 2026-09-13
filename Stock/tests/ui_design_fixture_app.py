@@ -9,7 +9,8 @@ from Stock.stock_valuation_mvp import (
 st.set_page_config(page_title="UI Design Fixture", layout="wide")
 inject_research_workstation_theme()
 st.title("UI Design Fixture")
-render_section_navigation()
+with st.sidebar:
+    render_section_navigation()
 render_health_checks(
     "TEST",
     [
