@@ -135,7 +135,8 @@ Other securities covered by Yahoo Finance can still expose historical data and a
 
 ### 2.1 Requirements
 
-- Python 3.10 or later is recommended.
+- Python 3.12 is the tested version. The pinned dependencies require Python 3.12
+  or later; newer Python versions have not been verified.
 - Internet access is required for live financial, market, and macro data.
 - Run all commands from the repository root—the directory that contains `Stock`.
 
@@ -148,6 +149,19 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 ```
+
+On Linux or macOS:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Core dependency versions are pinned to the tested environment. When updating an
+existing installation, rerun the install command and restart Streamlit. Use the
+same activated environment for installation and startup. These pins cover core
+direct dependencies, not a complete lock of all transitive dependencies.
 
 ### 2.3 Start the application
 

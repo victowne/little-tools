@@ -1,7 +1,9 @@
-streamlit
-yfinance
-pandas
-numpy
-plotly
+# Core dependencies pinned to the regression-tested Python 3.12 environment.
+# Update these versions together and rerun the deterministic and Streamlit tests.
+streamlit==1.61.1
+yfinance==0.2.66
+pandas==3.0.5
+numpy==2.5.2
+plotly==6.9.0
 requests
 lxml
