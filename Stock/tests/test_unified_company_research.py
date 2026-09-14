@@ -128,6 +128,23 @@ def test_broadcom_debt_equity_bridge_remains_separate_from_operating_profile():
     assert "Acquisition and segment complexity" in " ".join(profile.uncertainty_notes)
 
 
+def test_broadcom_q3_refresh_keeps_reported_data_and_guidance_distinct():
+    candidate = result("AVGO")
+    profile = candidate.lookup.profile
+    evidence = {item.evidence_id: item for item in profile.evidence_items}
+    assert evidence["latest_quarter"].value == pytest.approx(29.591e9)
+    assert evidence["latest_quarter"].period == "quarter ended 2026-08-02"
+    assert evidence["latest_quarter"].retrieved_at == "2026-09-13"
+    assert evidence["q4_guidance"].category == "management_guidance"
+    assert evidence["q4_guidance"].value == pytest.approx(34.8e9)
+    assert "q3_guidance" not in evidence
+    assert "q4_guidance" in profile.revenue_framework.year1_growth.evidence_references
+    assert evidence["q3_operating_margin"].value == pytest.approx(15.955 / 29.591)
+    assert "16.058" in evidence["q3_operating_margin"].notes
+    assert profile.margin_framework.mature_operating_margin.value == .46
+    assert initialize_profile_review(profile).reviewed_snapshot is None
+
+
 def test_amd_profile_preserves_gaap_non_gaap_distinction_and_official_growth_evidence():
     profile = result("AMD").lookup.profile
     evidence = {item.evidence_id: item for item in profile.evidence_items}

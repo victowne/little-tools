@@ -46,7 +46,7 @@ MU_Q3_2026 = "https://www.sec.gov/Archives/edgar/data/723125/000072312526000013/
 MU_Q3_2026_10Q = "https://www.sec.gov/Archives/edgar/data/723125/000072312526000015/mu-20260528.htm"
 AAPL_Q3_2026 = "https://www.apple.com/newsroom/2026/07/apple-reports-third-quarter-results/"
 AAPL_Q3_2026_10Q = "https://www.sec.gov/Archives/edgar/data/320193/000032019326000020/aapl-20260627.htm"
-AVGO_Q2_2026 = "https://investors.broadcom.com/news-releases/news-release-details/broadcom-inc-announces-second-quarter-fiscal-year-2026-financial"
+AVGO_Q3_2026 = "https://investors.broadcom.com/news-releases/news-release-details/broadcom-inc-announces-third-quarter-fiscal-year-2026-financial"
 AVGO_Q2_2026_10Q = "https://www.sec.gov/Archives/edgar/data/1730168/000173016826000054/avgo-20260503.htm"
 AMD_Q2_2026 = "https://ir.amd.com/news-events/press-releases/detail/1295/amd-reports-second-quarter-2026-financial-results"
 AMD_Q2_2026_10Q = "https://www.sec.gov/Archives/edgar/data/2488/000000248826000123/amd-20260627.htm"
@@ -203,11 +203,13 @@ def _aapl_spec(retrieved_at: str) -> _Spec:
 
 def _avgo_spec(retrieved_at: str) -> _Spec:
     evidence = (
-        _e("latest_quarter", "Fiscal Q2 2026 Revenue", 22.187e9, "currency_amount", "quarter ended 2026-05-03", AVGO_Q2_2026, "2026-06-03", retrieved_at, category="historical_financial", notes="Revenue increased 48% YoY."),
-        _e("ai_revenue", "Q2 AI semiconductor Revenue", 10.8e9, "currency_amount", "quarter ended 2026-05-03", AVGO_Q2_2026, "2026-06-03", retrieved_at, category="management_guidance", notes="Increased 143% YoY; Q3 AI revenue expected around $16B."),
-        _e("q3_guidance", "Fiscal Q3 2026 Revenue guidance", 29.4e9, "currency_amount", "quarter ending 2026-08-02", AVGO_Q2_2026, "2026-06-03", retrieved_at, category="management_guidance", notes="Approximately 84% YoY growth; non-GAAP operating income guidance approximately 67%."),
-        _e("business_mix", "Q2 semiconductor / infrastructure software Revenue", "15.009B / 7.178B", None, "quarter ended 2026-05-03", AVGO_Q2_2026, "2026-06-03", retrieved_at, notes="Semiconductor grew 79%; infrastructure software grew 9%."),
-        _e("debt_cash", "Q2 cash and gross debt context", "Cash 19.628B; debt remains material following VMware financing.", None, "2026-05-03", AVGO_Q2_2026_10Q, "2026-06-09", retrieved_at, category="historical_financial", notes="Equity bridge must use live net debt separately from operating assumptions."),
+        _e("latest_quarter", "Fiscal Q3 2026 Revenue", 29.591e9, "currency_amount", "quarter ended 2026-08-02", AVGO_Q3_2026, "2026-09-02", retrieved_at, category="historical_financial", notes="Revenue increased 86% YoY. Yahoo labels this quarter 2026-07-31; reported Revenue, net income and EPS reconcile to the release."),
+        _e("ai_revenue", "Q3 AI semiconductor Revenue", 16.7e9, "currency_amount", "quarter ended 2026-08-02", AVGO_Q3_2026, "2026-09-02", retrieved_at, category="historical_financial", notes="Increased 221% YoY and 54% sequentially; Q4 AI Revenue guidance is $21.7B."),
+        _e("q4_guidance", "Fiscal Q4 2026 Revenue guidance", 34.8e9, "currency_amount", "quarter ending 2026-11-01", AVGO_Q3_2026, "2026-09-02", retrieved_at, category="management_guidance", notes="Approximately 93% YoY growth; non-GAAP operating margin guidance 66%, not a GAAP margin forecast."),
+        _e("business_mix", "Q3 semiconductor / infrastructure software Revenue", "20.839B / 8.752B", None, "quarter ended 2026-08-02", AVGO_Q3_2026, "2026-09-02", retrieved_at, category="historical_financial", notes="Semiconductor grew 127%; infrastructure software grew 29%."),
+        _e("q3_operating_margin", "Q3 reported GAAP Operating Margin", 15.955 / 29.591, "ratio", "quarter ended 2026-08-02", AVGO_Q3_2026, "2026-09-02", retrieved_at, category="historical_financial", notes="Uses issuer GAAP operating income of $15.955B. Yahoo OperatingIncome is $16.058B; the provider-normalized historical series is not overwritten by this evidence."),
+        _e("cash_generation", "Q3 Free Cash Flow", 13.665e9, "currency_amount", "quarter ended 2026-08-02", AVGO_Q3_2026, "2026-09-02", retrieved_at, category="historical_financial", notes="Operating cash flow $14.197B less capex $0.532B; this reported FCF is not the model's FCFF."),
+        _e("debt_cash", "Q3 cash and gross debt context", "Cash approximately $24.0B; indebtedness remains a material risk.", None, "2026-08-02", AVGO_Q3_2026, "2026-09-02", retrieved_at, category="historical_financial", notes="Equity bridge must use live net debt separately from operating assumptions."),
         _e("capital_efficiency", "Economic S/C normalization", "Software is asset-light, semiconductors use outsourced manufacturing, while goodwill and acquired intangibles distort accounting capital.", None, "mature period", AVGO_Q2_2026_10Q, "2026-06-09", retrieved_at),
         _e("terminal_macro", "Mature mixed-business growth", "AI semiconductors and infrastructure software normalize toward long-run nominal growth.", None, "terminal period", "Research framework", "2026-08-23", retrieved_at, category="industry_reference"),
     )
@@ -220,7 +222,7 @@ def _avgo_spec(retrieved_at: str) -> _Spec:
     )
     confidence = (
         ConfidenceAssessment("Revenue Base", "High", "Validated statements provide the starting base."),
-        ConfidenceAssessment("Y1 Growth", "High", "Q3 guidance and AI revenue are issuer-provided."),
+        ConfidenceAssessment("Y1 Growth", "Medium", "Q3 actuals and Q4 guidance support strong growth; extending a quarterly run-rate to a rolling DCF year remains a research judgment."),
         ConfidenceAssessment("Y2 Growth", "Medium", "AI backlog supports growth but customer timing is concentrated."),
         ConfidenceAssessment("Y3 Growth", "Low", "AI and acquisition comparisons make duration uncertain."),
         ConfidenceAssessment("Mature Margin", "Low", "Long-run semiconductor/software mix and GAAP acquisition charges remain uncertain."),
@@ -232,14 +234,14 @@ def _avgo_spec(retrieved_at: str) -> _Spec:
         "AVGO", "Broadcom Inc.", (.80, .60, .25), .46, (.40, .52),
         .65, .75, (.55, .95), .15, .095, .03, "High", context, evidence,
         (
-            "35% recognizes Q3 guidance and AI growth while avoiding annualization of an 84% comparison.",
-            "22% retains custom accelerator, networking and VMware momentum as acquisition comparisons normalize.",
-            "15% begins normalization across AI and non-AI semiconductors without adding a separate acquisition architecture.",
+            "80% is retained as a rolling-year research assumption supported by 86% Q3 growth and 93% Q4 guidance; quarterly guidance does not directly determine the full DCF year.",
+            "60% assumes continued custom accelerator and networking expansion after the current ramp; customer concentration and the larger base limit confidence in its duration.",
+            "25% begins normalization across AI, non-AI semiconductors and software as the revenue base grows.",
         ),
         "46% is a consolidated GAAP-oriented mature margin reflecting high-margin software and semiconductors without copying non-GAAP guidance.",
         "0.65x is a normalized transition anchor because acquisition accounting obscures current invested capital.",
         "0.75x blends asset-light software and outsourced semiconductor economics while retaining acquisition and R&D capital needs.",
-        "Acquisition and segment complexity are represented through researched consolidated assumptions.",
+        "Acquisition and segment complexity are represented through researched consolidated assumptions. Quarterly guidance is not a rolling-year forecast; supplier and customer timing may alter the ramp. Yahoo-normalized operating income differs from issuer GAAP operating income; the evidence records the issuer measure separately.",
         confidence,
     )
 
@@ -447,7 +449,7 @@ def build_apple_research_profile(current_assumptions, history, *, revenue_anchor
     return _build("AAPL", current_assumptions, history, revenue_anchors=revenue_anchors, wacc_audit=wacc_audit, retrieved_at=retrieved_at)
 
 
-def build_broadcom_research_profile(current_assumptions, history, *, revenue_anchors=None, wacc_audit=None, retrieved_at="2026-08-23"):
+def build_broadcom_research_profile(current_assumptions, history, *, revenue_anchors=None, wacc_audit=None, retrieved_at="2026-09-13"):
     return _build("AVGO", current_assumptions, history, revenue_anchors=revenue_anchors, wacc_audit=wacc_audit, retrieved_at=retrieved_at)
 
 

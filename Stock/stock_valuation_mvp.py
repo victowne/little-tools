@@ -2063,10 +2063,31 @@ def mark_research_wacc_reviewed(
     state[keys["created_at"]] = created_at or pd.Timestamp.now(tz="UTC").isoformat()
 
 
+def preserve_base_input_state(state) -> None:
+    """Keep each ticker's Base inputs when Streamlit removes hidden widgets.
+
+    Explicit reassignment detaches retained values from widget cleanup. Preserve
+    current edits, rather than restoring the older applied profile snapshot.
+    Call before rendering widgets, including runs where live data is unavailable.
+    """
+    base_suffixes = tuple("_" + name for name in MULTISTAGE_GENERIC_DEFAULTS)
+    wacc_suffixes = ("_value", "_status", "_rationale", "_created_at")
+    for key in list(state):
+        # Buttons share these prefixes, but their transient state must never be
+        # assigned through session_state. Retain only known input fields.
+        if (
+            key.startswith("multistage_") and key.endswith(base_suffixes)
+        ) or (
+            key.startswith("research_wacc_") and key.endswith(wacc_suffixes)
+        ):
+            state[key] = state[key]
+
+
 def initialize_multistage_session_state(
     state, ticker: str, history: FundamentalHistory | None
 ) -> dict:
     """Initialize ticker operating inputs and issuer-level Research WACC state."""
+    preserve_base_input_state(state)
     normalized_ticker = ticker.strip().upper()
     defaults = multistage_initial_defaults(normalized_ticker, history)
     prefix = f"multistage_{normalized_ticker}_"
@@ -3406,7 +3427,7 @@ def _render_scenario_editor(
     label = scenario.title()
     keys = scenario_session_keys(ticker, scenario)
     status = st.session_state[keys["status"]]
-    with st.expander(f"{label} Case", expanded=True):
+    with st.expander(f"{label} Case", expanded=False):
         st.caption(
             "Status: Provisional scenario defaults"
             if status == "provisional"
@@ -3723,7 +3744,7 @@ def render_multistage_dcf_panel(
     initialize_multistage_session_state(st.session_state, ticker, history)
     prefix = f"multistage_{ticker.strip().upper()}_"
     research_keys = research_wacc_session_keys(ticker)
-    with st.expander("Manual Base Workspace", expanded=False):
+    with st.expander("Manual Base Workspace", expanded=True):
         st.caption(
             "Optional editable workspace. It is not labeled as the Research Candidate "
             "unless a reviewed profile is explicitly applied."
@@ -4844,6 +4865,7 @@ def enable_section_scroll_tracking() -> None:
 
 
 def main() -> None:
+    preserve_base_input_state(st.session_state)
     st.set_page_config(
         page_title="Stock Valuation Research Workstation",
         layout="wide",
